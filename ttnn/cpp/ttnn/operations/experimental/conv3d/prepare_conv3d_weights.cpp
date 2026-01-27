@@ -148,7 +148,7 @@ Tensor prepare_weights(
     ttnn::SmallVector<int64_t> dims_1 = {2, 3, 4, 1, 0};
     prepare_weights = ttnn::permute(prepare_weights, dims_1);
     uint32_t C = prepare_weights.logical_shape()[3];
-    uint32_t ALIGN_PAD = alignment - C % alignment;
+    uint32_t ALIGN_PAD = alignment - (C % alignment);
     if (C % alignment != 0) {
         ttnn::SmallVector<std::array<uint32_t, 2>> padding_shape({{0, 0}, {0, 0}, {0, 0}, {0, ALIGN_PAD}, {0, 0}});
         prepare_weights = ttnn::pad(prepare_weights, padding_shape, 0.0f);
