@@ -14,6 +14,29 @@ using namespace tt::tt_metal;
 
 namespace ttnn::operations::experimental::conv3d {
 
+static Tensor prepare_and_check_weight_tensor(
+    const Tensor& weight_tensor,
+    uint32_t groups_,
+    const ttnn::experimental::prim::Conv3dConfig& config,
+    ttnn::MeshDevice* device) {
+    Tensor prepared_weight_tensor = weight_tensor;
+    switch (prepared_weight_tensor.logical_shape().rank()) {
+        case 5:
+            TT_FATAL(prepared_weight_tensor.device() == nullptr, "Unprepared weight tensor must be on host");
+            prepared_weight_tensor = ttnn::operations::experimental::conv3d::prepare_weights(
+                prepared_weight_tensor, groups_, config.C_in_block, device);
+            break;
+        case 2: break;
+        default: TT_THROW("Unsupported weight tensor rank: {}", prepared_weight_tensor.logical_shape().rank());
+    }
+
+    if (prepared_weight_tensor.layout() != Layout::TILE) {
+        prepared_weight_tensor = ttnn::to_layout(prepared_weight_tensor, ttnn::Layout::TILE);
+    }
+
+    return prepared_weight_tensor;
+}
+
 ttnn::Tensor ExecuteConv3d::invoke(
     const ttnn::Tensor& input_tensor,
     const ttnn::Tensor& weight_tensor,
@@ -30,20 +53,7 @@ ttnn::Tensor ExecuteConv3d::invoke(
     uint32_t groups_,
     const std::optional<MemoryConfig>& memory_config,
     std::optional<DeviceComputeKernelConfig> compute_kernel_config) {
-    Tensor prepared_weight_tensor = weight_tensor;
-    switch (prepared_weight_tensor.logical_shape().rank()) {
-        case 5:
-            TT_FATAL(prepared_weight_tensor.device() == nullptr, "Unprepared weight tensor must be on host");
-            prepared_weight_tensor = ttnn::operations::experimental::conv3d::prepare_weights(
-                prepared_weight_tensor, groups_, config.C_in_block, device);
-            break;
-        case 2: break;
-        default: TT_THROW("Unsupported weight tensor rank: {}", prepared_weight_tensor.logical_shape().rank());
-    }
-
-    if (prepared_weight_tensor.layout() != Layout::TILE) {
-        prepared_weight_tensor = ttnn::to_layout(prepared_weight_tensor, ttnn::Layout::TILE);
-    }
+    Tensor prepared_weight_tensor = prepare_and_check_weight_tensor(weight_tensor, groups_, config, device);
     return ttnn::prim::conv3d(
         input_tensor,
         prepared_weight_tensor,

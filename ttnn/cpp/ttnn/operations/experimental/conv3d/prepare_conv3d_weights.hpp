@@ -7,7 +7,6 @@
 #include "ttnn/operations/core/core.hpp"
 #include "ttnn/operations/creation.hpp"
 #include "ttnn/operations/data_movement/permute/permute.hpp"
-// #include "ttnn/operations/data_movement/reshape/reshape.hpp"
 #include "ttnn/operations/data_movement/pad/pad.hpp"
 #include "ttnn/operations/data_movement/slice/slice.hpp"
 #include "ttnn/operations/data_movement/concat/concat.hpp"
