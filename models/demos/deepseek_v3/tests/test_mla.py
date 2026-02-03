@@ -11,10 +11,8 @@ from transformers.configuration_utils import PretrainedConfig
 
 import ttnn
 from models.common.utility_functions import comp_pcc
-from models.demos.deepseek_v3.conftest import PREFILL_SEQ_LENS
 from models.demos.deepseek_v3.reference.modeling_deepseek import DeepseekV3Attention
-from models.demos.deepseek_v3.tests.pytest_utils import build_test_cases_and_ids
-from models.demos.deepseek_v3.tt.mla.mla1d import MLA1D
+from models.demos.deepseek_v3.tests.pytest_utils import DEFAULT_PREFILL_SEQ_LEN, build_test_cases_and_ids
 from models.demos.deepseek_v3.tt.mla.mla2d import MLA2D
 from models.demos.deepseek_v3.utils.config_helpers import USERS_PER_ROW, sub_state_dict
 from models.demos.deepseek_v3.utils.run_config import create_run_config
@@ -312,7 +310,7 @@ def run_test_forward_pass_mla2d(
 
 TEST_CASES, TEST_IDS = build_test_cases_and_ids(
     USERS_PER_ROW,
-    PREFILL_SEQ_LENS[0:1],  # list of default prefill sequence lengths to test
+    DEFAULT_PREFILL_SEQ_LEN,  # default prefill sequence length to test
     include_decode_random_pos_ids=True,  # include decode random position_ids case
 )
 

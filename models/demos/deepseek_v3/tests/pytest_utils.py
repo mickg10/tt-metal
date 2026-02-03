@@ -6,6 +6,8 @@ import os
 
 import pytest
 
+DEFAULT_PREFILL_SEQ_LEN = 128
+
 
 def expand_test_cases_with_position_ids_ranges(base_cases):
     """
@@ -121,46 +123,45 @@ def build_expanded_test_ids(expanded_cases):
     return expanded_ids
 
 
-def get_base_test_cases(users_per_row, prefill_seq_lens, include_decode_random_pos_ids=True):
+def get_base_test_cases(users_per_row, prefill_seq_len, include_decode_random_pos_ids=True):
     """
     Build base test cases for decode and prefill paths.
 
-    Used by:
+    This helper is only exercised by these tests.:
         - models/demos/deepseek_v3/tests/test_mla.py
         - models/demos/deepseek_v3/tests/test_decoder_block.py
         - models/demos/deepseek_v3/tests/test_model.py
 
-    This helper is only exercised by these tests.
-
     Args:
         users_per_row: Number of users per row (USERS_PER_ROW).
-        prefill_seq_lens: Iterable of prefill sequence lengths.
+        prefill_seq_len: Prefill sequence length to use when DEEPSEEK_MAX_SEQ_LEN_OVERRIDE is not set.
         include_decode_random_pos_ids: If True, include ("decode", 1, users_per_row, None).
 
-    environment variable DEEPSEEK_MAX_SEQ_LEN is primarily a CI override to expand prefill and decode coverage.
-    When set, we add specific prefill and decode position_ids (0 and max_seq_len - 1) in
-    addition to the default random prefill and decode position_ids cases.
+    The environment variable DEEPSEEK_MAX_SEQ_LEN_OVERRIDE is primarily a CI override to expand
+    prefill and decode coverage.
 
     Behavior:
-        - Adds decode cases:
-          - random position_ids (optional)
-          - position_id 0
-          - position_id max_seq_len - 1 when DEEPSEEK_MAX_SEQ_LEN is set
-        - Adds prefill cases:
-          - a direct prefill at DEEPSEEK_MAX_SEQ_LEN when set
-          - the standard prefill seq lens with skip marks when DEEPSEEK_MAX_SEQ_LEN is not set
+        - Decode cases:
+          - when DEEPSEEK_MAX_SEQ_LEN_OVERRIDE is set, additionally includes:
+            - position_id 0
+            - position_id max_seq_len - 1
+        - Prefill cases:
+          - when DEEPSEEK_MAX_SEQ_LEN_OVERRIDE is not set, includes one prefill case using
+            prefill_seq_len: ("prefill", prefill_seq_len, 1, None)
+          - when DEEPSEEK_MAX_SEQ_LEN_OVERRIDE is set, replaces the prefill list with a single case:
+            ("prefill", max_seq_len, 1, None)
 
     """
     base_cases = []
     if include_decode_random_pos_ids:
         base_cases += [("decode", 1, users_per_row, None)]
 
-    max_seq_len_env = os.getenv("DEEPSEEK_MAX_SEQ_LEN")
+    max_seq_len_env = os.getenv("DEEPSEEK_MAX_SEQ_LEN_OVERRIDE")
     if max_seq_len_env is None:
-        # If DEEPSEEK_MAX_SEQ_LEN is not set, use the default prefill sequence length.
-        base_cases += [("prefill", seq_len, 1, None) for seq_len in prefill_seq_lens]
+        # If DEEPSEEK_MAX_SEQ_LEN_OVERRIDE is not set, use the default prefill sequence length.
+        base_cases += [("prefill", prefill_seq_len, 1, None)]
     else:
-        # If DEEPSEEK_MAX_SEQ_LEN is set, use it to expand prefill and decode coverage.
+        # If DEEPSEEK_MAX_SEQ_LEN_OVERRIDE is set, use it to expand prefill and decode coverage.
         max_seq_len = int(max_seq_len_env)
         base_cases += [
             ("decode", 1, users_per_row, 0),  # decode position_id 0
@@ -170,7 +171,7 @@ def get_base_test_cases(users_per_row, prefill_seq_lens, include_decode_random_p
     return base_cases
 
 
-def build_test_cases_and_ids(users_per_row, prefill_seq_lens, include_decode_random_pos_ids=True):
+def build_test_cases_and_ids(users_per_row, prefill_seq_len, include_decode_random_pos_ids=True):
     """
     Build base test cases and return expanded cases with matching pytest IDs.
 
@@ -179,7 +180,7 @@ def build_test_cases_and_ids(users_per_row, prefill_seq_lens, include_decode_ran
       - expand_test_cases_with_position_ids_ranges
       - build_expanded_test_ids
     """
-    base_cases = get_base_test_cases(users_per_row, prefill_seq_lens, include_decode_random_pos_ids)
+    base_cases = get_base_test_cases(users_per_row, prefill_seq_len, include_decode_random_pos_ids)
     expanded_cases = expand_test_cases_with_position_ids_ranges(base_cases)
     expanded_ids = build_expanded_test_ids(expanded_cases)
     return expanded_cases, expanded_ids

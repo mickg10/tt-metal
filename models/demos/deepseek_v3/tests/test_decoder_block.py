@@ -10,9 +10,8 @@ from loguru import logger
 from transformers.configuration_utils import PretrainedConfig
 
 import ttnn
-from models.demos.deepseek_v3.conftest import PREFILL_SEQ_LENS
 from models.demos.deepseek_v3.reference.modeling_deepseek import DeepseekV3DecoderLayer
-from models.demos.deepseek_v3.tests.pytest_utils import build_test_cases_and_ids
+from models.demos.deepseek_v3.tests.pytest_utils import DEFAULT_PREFILL_SEQ_LEN, build_test_cases_and_ids
 from models.demos.deepseek_v3.tt.decoder_block.decoder_block_2d import DecoderBlock2D
 from models.demos.deepseek_v3.tt.decoder_block.decoder_block_2d_base import DecoderBlock2DBase
 from models.demos.deepseek_v3.tt.decoder_block.moe_decoder_block_2d import MoEDecoderBlock2D
@@ -196,7 +195,7 @@ def run_test_forward_pass_decoder2d(
 
 TEST_CASES, TEST_IDS = build_test_cases_and_ids(
     USERS_PER_ROW,
-    PREFILL_SEQ_LENS[0:1],  # list of default prefill sequence lengths to test
+    DEFAULT_PREFILL_SEQ_LEN,  # default prefill sequence length to test
     include_decode_random_pos_ids=True,  # include decode random position_ids case
 )
 
