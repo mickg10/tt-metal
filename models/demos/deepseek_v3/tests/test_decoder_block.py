@@ -13,8 +13,6 @@ import ttnn
 from models.demos.deepseek_v3.conftest import PREFILL_SEQ_LENS
 from models.demos.deepseek_v3.reference.modeling_deepseek import DeepseekV3DecoderLayer
 from models.demos.deepseek_v3.tests.pytest_utils import build_test_cases_and_ids
-from models.demos.deepseek_v3.tt.decoder_block.decoder_block_1d import DecoderBlock1D
-from models.demos.deepseek_v3.tt.decoder_block.decoder_block_1d_base import DecoderBlock1DBase
 from models.demos.deepseek_v3.tt.decoder_block.decoder_block_2d import DecoderBlock2D
 from models.demos.deepseek_v3.tt.decoder_block.decoder_block_2d_base import DecoderBlock2DBase
 from models.demos.deepseek_v3.tt.decoder_block.moe_decoder_block_2d import MoEDecoderBlock2D

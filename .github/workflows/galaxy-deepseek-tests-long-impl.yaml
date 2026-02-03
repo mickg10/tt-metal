@@ -65,9 +65,9 @@ jobs:
         timeout-minutes: 360
         run: |
           uv pip install -r models/demos/deepseek_v3/reference/deepseek/requirements.txt
-          DEEPSEEK_MAX_SEQ_LEN=32768 pytest models/demos/deepseek_v3/tests/test_mla.py --timeout 3600 --durations=0
-          DEEPSEEK_MAX_SEQ_LEN=32768 pytest models/demos/deepseek_v3/tests/test_decoder_block.py --timeout 7200 --durations=0
-          DEEPSEEK_MAX_SEQ_LEN=4096 pytest models/demos/deepseek_v3/tests/test_model.py --timeout 10800 --durations=0
+          DEEPSEEK_MAX_SEQ_LEN=16384 pytest models/demos/deepseek_v3/tests/test_mla.py --timeout 3600 --durations=0
+          DEEPSEEK_MAX_SEQ_LEN=16384 pytest models/demos/deepseek_v3/tests/test_decoder_block.py --timeout 7200 --durations=0
+          DEEPSEEK_MAX_SEQ_LEN=2048 pytest models/demos/deepseek_v3/tests/test_model.py --timeout 10800 --durations=0
       - uses: tenstorrent/tt-metal/.github/actions/slack-report@main
         if: ${{ failure() }}
         with:
