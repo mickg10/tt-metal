@@ -59,6 +59,8 @@ void MAIN {
     constexpr uint32_t q_heads_parallel_factor = get_compile_time_arg_val(23);
     constexpr uint32_t q_tile_height = get_compile_time_arg_val(24);
     constexpr uint32_t scale_fp32 = get_compile_time_arg_val(25);
+    constexpr uint32_t num_tree_reduction_steps =
+        get_compile_time_arg_val(26);  // tree reduction steps (3 for 8 S blocks)
 
     // MLA decode is always causal, no attention mask, no attention sink, no sliding window
     constexpr bool is_causal = true;
@@ -112,6 +114,11 @@ void MAIN {
     const uint32_t core_num_in_reduce = get_arg_val<uint32_t>(arg_idx++);
     const uint32_t core_num_in_output = get_arg_val<uint32_t>(arg_idx++);
     const uint32_t cur_pos_arg = get_arg_val<uint32_t>(arg_idx++);
+    const bool is_sender_after_reduce =
+        get_arg_val<uint32_t>(arg_idx++) == 1;  // Intermediate nodes write to output CBs after reduction
+    // Tree reduction info: 3 steps × 2 values (role, partner_s_block_idx) = 6 values
+    tt_l1_ptr uint32_t* tree_reduction_info = (tt_l1_ptr uint32_t*)(get_arg_addr(arg_idx));
+    arg_idx += num_tree_reduction_steps * 2;
 
     // Idle core
     // get_arg_val<uint32_t>(0) can go from 0-63 for the core_num; for active cores 65 is out of range so 65 indicates
@@ -158,10 +165,21 @@ void MAIN {
         return;  // early exit because no computes needs to be done
     }
 
-    // Get number of worker cores to wait for
-    uint32_t num_cores_to_wait = num_cores_per_head - 1;
-    if (num_cores_per_head > k_num_chunks) {
-        num_cores_to_wait = k_num_chunks - 1;
+    // Calculate number of active S blocks based on k_num_chunks
+    // With strided distribution, core N gets chunks N, N+num_cores, N+2*num_cores, ...
+    // So active cores = min(k_num_chunks, num_cores_per_head)
+    uint32_t num_active_s_blocks = (k_num_chunks < num_cores_per_head) ? k_num_chunks : num_cores_per_head;
+
+    // Tree reduction: count actual reductions (only where partner is active)
+    // role_code: 0=idle, 1=sender, 2=receiver
+    uint32_t num_cores_to_wait = 0;
+    for (uint32_t step = 0; step < num_tree_reduction_steps; ++step) {
+        uint32_t role_code = tree_reduction_info[step * 2 + 0];
+        uint32_t partner_s_block_idx = tree_reduction_info[step * 2 + 1];
+        // Count this step only if we're a receiver AND partner is active
+        if (role_code == 2 && partner_s_block_idx < num_active_s_blocks) {
+            num_cores_to_wait++;
+        }
     }
 
     // We tilize input Q if it is in ROW MAJOR layout
@@ -477,15 +495,15 @@ void MAIN {
         }
         /* END OF FLASH ATTENTION LOOP */
 
-        // Perform reduction across intermediates from other cores if this is the reduction core
+        // Perform tree reduction across intermediates from other cores
+        // Tree reduction: this core receives from num_cores_to_wait partners across multiple steps
         if (do_reduce) {
             // cb_out_accumulate_im should contain o_1 (output from FA of itself's core)
             // cb_prev_max and cb_prev_sum should contain m_1 and l_1 (max and sum of logits of itself's core)
 
-            if (k_chunk_end - k_chunk_start < k_num_chunks) {
-                // This indicates that there are computes done by other workers.
-                // We need to wait for them and send to reducer's compute
-                // Iterate through each worker
+            if (num_cores_to_wait > 0) {
+                // Tree reduction: perform num_cores_to_wait reduction steps
+                // Writer kernel pushes data from each sender as it arrives
                 for (uint32_t i = 0; i < num_cores_to_wait; i++) {
                     move_block<true>(cb_l_in, cb_prev_sum_2, Sq_chunk_t);
 
@@ -527,6 +545,18 @@ void MAIN {
                     move_block<true>(cb_cur_max, cb_prev_max, Sq_chunk_t);
                     move_block<true>(cb_cur_sum, cb_prev_sum, Sq_chunk_t);
                 }
+            }
+
+            // For intermediate nodes (receivers that also send), write to output CBs
+            // before final normalization so the next receiver can reduce correctly
+            if (is_sender_after_reduce) {
+                // Write unnormalized result to output CBs for writer to send
+                // cb_out_accumulate_im has output, cb_prev_max has max, cb_prev_sum has sum
+                move_block<true>(cb_out_accumulate_im, cb_out_o, out_chunk_tiles);
+                move_block<true>(cb_prev_max, cb_out_m, Sq_chunk_t);
+                move_block<true>(cb_prev_sum, cb_out_l, Sq_chunk_t);
+                // Intermediate nodes exit after writing - don't do final normalization
+                return;
             }
 
             /* CUR_SUM = 1.0 / CUR_SUM */

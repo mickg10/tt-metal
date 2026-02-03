@@ -256,6 +256,8 @@ void kernel_main() {
     constexpr uint32_t k_page_size = get_compile_time_arg_val(22);     // page size for pipelining
     constexpr uint32_t k_num_pages = get_compile_time_arg_val(23);     // pages per K chunk
     constexpr bool kv_is_sharded = get_compile_time_arg_val(24) == 1;  // page-level vs chunk-level
+    constexpr uint32_t num_tree_reduction_steps =
+        get_compile_time_arg_val(25);  // tree reduction steps (3 for 8 S blocks)
 
     uint32_t arg_idx = 0;
     const uint32_t out_addr = get_arg_val<uint32_t>(arg_idx++);
@@ -310,6 +312,12 @@ void kernel_main() {
     arg_idx += num_reducer_cores;
     tt_l1_ptr uint32_t* all_reducer_noc_y = (tt_l1_ptr uint32_t*)(get_arg_addr(arg_idx));
     arg_idx += num_reducer_cores;
+
+    // Tree reduction info: 3 steps × 4 values (role, partner_s_block_idx, x, y) = 12 values
+    // role_code: 0=idle, 1=sender, 2=receiver
+    // partner_s_block_idx: S block index of partner (to check if partner is active)
+    tt_l1_ptr uint32_t* tree_reduction_info = (tt_l1_ptr uint32_t*)(get_arg_addr(arg_idx));
+    arg_idx += num_tree_reduction_steps * 4;
 
     uint32_t reduce_core_index = (cur_batch * num_cores_per_batch) / num_cores_per_head + cur_head_group;
     uint32_t reduce_core_noc_x = all_reducer_noc_x[reduce_core_index];
@@ -444,73 +452,125 @@ void kernel_main() {
     return;
 #endif
 
-    if (is_worker) {
-        DeviceZoneScopedN("writer-worker");
-        ASSERT(num_heads_per_core == 1);  // if there are workers, then head must be split across workers so there
-                                          // should not be more than one head per core
-        worker_compute<out_chunk_tiles, cb_out_worker, cb_out_m, cb_out_l, cb_intermed_out, PNHt>(
-            in0_sender_semaphore_noc_addr, worker_id_for_reduce, reduce_core_noc_x, reduce_core_noc_y);
-        noc_async_atomic_barrier();
-        return;
-    }
-
-    // *** Reducer Compute Below ***
-    constexpr uint32_t tile_bytes_intermed = get_tile_size(cb_intermed_out);
-
-    uint64_t intermed_l1_read_addr = get_noc_addr(get_read_ptr(cb_intermed_out));
-
-    volatile tt_l1_ptr uint32_t* in0_receiver_semaphore_addr_ptr =
-        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(reducer_semaphore_addr);
-
     // Generate causal mask (MLA decode is always causal)
     // Mask tiles use q_tile_height for proper tiny tile support
     generate_mask<cb_mask_in, PNHt, q_tile_height>(k_num_chunks, Sk_chunk_t_dynamic, cur_pos);
 
     noc_async_write_barrier();  // #19201 BH hang workaround
 
-    for (uint32_t cur_head = cur_head_group * num_heads_per_core;
-         cur_head < cur_head_group * num_heads_per_core + num_heads_per_core;
-         ++cur_head) {
-        DeviceZoneScopedN("writer-reducer-loop");
-        if (k_chunk_end - k_chunk_start < k_num_chunks) {
-            ASSERT(num_heads_per_core == 1);  // if there are workers, then head must be split across workers so there
-                                              // should not be more than one head per core
-            // This indicates that there are computes done by other workers. Needs to wait for them and send to
-            // reducer's compute Wait for compute to deliver output chunk, and write to compute again for reduction data
-            // in cb_intermed_out is arranged as [o,m,l,o,m,l,...] with size (out_chunk_tiles +
-            // 2*PNHt)*num_cores_to_wait wait on in0 semaphore value to become VALID (set by sender)
-            noc_semaphore_wait(in0_receiver_semaphore_addr_ptr, num_cores_to_wait);
-            // noc_semaphore_set(in0_receiver_semaphore_addr_ptr, 0);
+    // =========================================================================
+    // Tree Reduction: log2(num_cores_per_head) steps instead of num_cores_per_head-1 sequential steps
+    // Each step: senders write to receivers, receivers wait and do local reduction
+    // role_code: 0=idle, 1=sender, 2=receiver
+    // =========================================================================
+    constexpr uint32_t tile_bytes_intermed = get_tile_size(cb_intermed_out);
+    constexpr uint32_t o_write_size = out_chunk_tiles * tile_bytes_intermed;
+    constexpr uint32_t ml_write_size = PNHt * tile_bytes_intermed;
 
-            // cb_wait_front(cb_intermed_out, num_tiles_to_wait);
-            constexpr uint32_t q_read_size = out_chunk_tiles * tile_bytes_intermed;
-            constexpr uint32_t ml_read_size = PNHt * tile_bytes_intermed;
-            for (uint32_t block = 0; block < num_cores_to_wait; ++block) {
-                cb_reserve_back(cb_out_o, out_chunk_tiles);
+    volatile tt_l1_ptr uint32_t* in0_receiver_semaphore_addr_ptr =
+        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(reducer_semaphore_addr);
+
+    // Check if this core participates in reduction (has multiple chunks assigned across cores)
+    bool needs_reduction = (k_chunk_end - k_chunk_start < k_num_chunks);
+
+    // Compute number of active S blocks based on k_num_chunks
+    // With strided distribution, core N gets chunks N, N+num_cores, N+2*num_cores, ...
+    // So active cores = min(k_num_chunks, num_cores_per_head)
+    uint32_t num_active_s_blocks = (k_num_chunks < num_cores_per_head) ? k_num_chunks : num_cores_per_head;
+
+    if (needs_reduction) {
+        ASSERT(num_heads_per_core == 1);  // reduction only happens when head is split across workers
+
+        // Tree reduction: process each step
+        for (uint32_t step = 0; step < num_tree_reduction_steps; ++step) {
+            DeviceZoneScopedN("tree-reduction-step");
+            uint32_t role_code = tree_reduction_info[step * 4 + 0];
+            uint32_t partner_s_block_idx = tree_reduction_info[step * 4 + 1];
+            uint32_t partner_x = tree_reduction_info[step * 4 + 2];
+            uint32_t partner_y = tree_reduction_info[step * 4 + 3];
+
+            // Skip this step if partner S block is inactive
+            // Partner is inactive if partner_s_block_idx >= num_active_s_blocks
+            if (role_code != 0 && partner_s_block_idx >= num_active_s_blocks) {
+                // Partner is inactive, skip this step
+                // If we're a sender, we don't need to send (partner won't process)
+                // If we're a receiver, we don't need to wait (partner has no data)
+                continue;
+            }
+
+            if (role_code == 1) {
+                // SENDER: Send partial result to partner (receiver)
+                DeviceZoneScopedN("tree-reduction-sender");
+
+                // Wait for compute to deliver local output
+                cb_wait_front(cb_out_worker, out_chunk_tiles);
+                cb_wait_front(cb_out_m, PNHt);
+                cb_wait_front(cb_out_l, PNHt);
+
+                // Write to partner's cb_intermed_out (at offset 0, since only 1 sender per step)
+                uint64_t output_write_addr = get_noc_addr(partner_x, partner_y, get_write_ptr(cb_intermed_out));
+
+                // Send: m, l, output (same order as worker_compute)
+                noc_async_write(get_read_ptr(cb_out_m), output_write_addr, ml_write_size);
+                output_write_addr += ml_write_size;
+                noc_async_write(get_read_ptr(cb_out_l), output_write_addr, ml_write_size);
+                output_write_addr += ml_write_size;
+                noc_async_write(get_read_ptr(cb_out_worker), output_write_addr, o_write_size);
+
+                // Signal partner
+                noc_async_write_barrier();
+                uint64_t partner_semaphore_addr = get_noc_addr(partner_x, partner_y, reducer_semaphore_addr);
+                noc_semaphore_inc(partner_semaphore_addr, 1);
+
+                // Pop our CBs (we're done, won't participate further)
+                cb_pop_front(cb_out_worker, out_chunk_tiles);
+                cb_pop_front(cb_out_m, PNHt);
+                cb_pop_front(cb_out_l, PNHt);
+
+                // Sender exits after sending - doesn't participate in subsequent steps
+                noc_async_atomic_barrier();
+                return;
+
+            } else if (role_code == 2) {
+                // RECEIVER: Wait for sender and push data to compute for reduction
+                DeviceZoneScopedN("tree-reduction-receiver");
+
+                // Wait for sender to write data
+                noc_semaphore_wait(in0_receiver_semaphore_addr_ptr, 1);
+                noc_semaphore_set(in0_receiver_semaphore_addr_ptr, 0);  // Reset for next step
+
+                // Read from local cb_intermed_out (sender wrote here)
+                uint64_t intermed_l1_read_addr = get_noc_addr(get_read_ptr(cb_intermed_out));
+
+                // Push to compute CBs for reduction: m, l, output
                 cb_reserve_back(cb_m_in, PNHt);
-                cb_reserve_back(cb_l_in, PNHt);
-
                 uint32_t m_write_ptr = get_read_ptr(cb_m_in);
-                noc_async_read(intermed_l1_read_addr, m_write_ptr, ml_read_size);
-                intermed_l1_read_addr += ml_read_size;
+                noc_async_read(intermed_l1_read_addr, m_write_ptr, ml_write_size);
+                intermed_l1_read_addr += ml_write_size;
                 noc_async_read_barrier();
                 cb_push_back(cb_m_in, PNHt);
 
+                cb_reserve_back(cb_l_in, PNHt);
                 uint32_t l_write_ptr = get_read_ptr(cb_l_in);
-                noc_async_read(intermed_l1_read_addr, l_write_ptr, ml_read_size);
-                intermed_l1_read_addr += ml_read_size;
+                noc_async_read(intermed_l1_read_addr, l_write_ptr, ml_write_size);
+                intermed_l1_read_addr += ml_write_size;
                 noc_async_read_barrier();
                 cb_push_back(cb_l_in, PNHt);
 
-                uint32_t q_write_ptr = get_read_ptr(cb_out_o);
-                noc_async_read(intermed_l1_read_addr, q_write_ptr, q_read_size);
-                intermed_l1_read_addr += q_read_size;
+                cb_reserve_back(cb_out_o, out_chunk_tiles);
+                uint32_t o_write_ptr = get_read_ptr(cb_out_o);
+                noc_async_read(intermed_l1_read_addr, o_write_ptr, o_write_size);
                 noc_async_read_barrier();
                 cb_push_back(cb_out_o, out_chunk_tiles);
+
+                // Compute kernel will do the reduction and produce new cb_out_worker
+                // (triggered by cb_out_o, cb_m_in, cb_l_in being pushed)
             }
+            // role_code == 0 (idle): do nothing this step, continue to next
         }
-        // Output is always sharded, num_kv_heads == 1 for MLA
-        // Output is already in the sharded CB, nothing to do
-        noc_async_writes_flushed();
     }
+
+    // Output is always sharded, num_kv_heads == 1 for MLA
+    // Output is already in the sharded CB, nothing to do
+    noc_async_writes_flushed();
 }

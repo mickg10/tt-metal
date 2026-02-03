@@ -105,6 +105,93 @@ class FlashMLAOptimalGridNOC0:
     # Optimal DRAM bank order for KV cache sharding (matches S block work assignment)
     OPTIMAL_DRAM_BANK_ORDER = tuple(block[1] for block in BLOCKS)  # (1, 3, 2, 0, 5, 7, 6, 4)
 
+    # Tree reduction order for final tail reduction across S blocks
+    # Each step contains (dst_s_block_idx, src_s_block_idx) pairs that can run in parallel
+    # Using 0-indexed S block indices: S1=0, S2=1, ..., S8=7
+    # This reduces 8 S blocks to 1 in 3 steps (log2(8) = 3) instead of 7 sequential steps
+    TREE_REDUCTION_ORDER = (
+        # Step 1: Adjacent pairs reduce (4 parallel reductions)
+        ((0, 1), (2, 3), (4, 5), (6, 7)),  # S2→S1, S4→S3, S6→S5, S8→S7
+        # Step 2: Merge left pairs, merge right pairs (2 parallel reductions)
+        ((0, 2), (4, 6)),  # S3→S1, S7→S5
+        # Step 3: Final merge left and right (1 reduction)
+        ((0, 4),),  # S5→S1
+    )
+
+    NUM_TREE_REDUCTION_STEPS = len(TREE_REDUCTION_ORDER)  # 3
+
+    @classmethod
+    def get_tree_reduction_role(cls, s_block_idx: int) -> list:
+        """
+        Get the tree reduction role for a given S block across all steps.
+
+        Returns a list of (role, partner_s_block_idx) tuples for each step:
+        - role: 'sender' if this S block sends to partner
+                'receiver' if this S block receives from partner
+                'idle' if this S block doesn't participate in this step
+        - partner_s_block_idx: the S block index of the partner (-1 if idle)
+
+        Example for S block 0 (S1):
+        - Step 1: ('receiver', 1) - receives from S2
+        - Step 2: ('receiver', 2) - receives from S3
+        - Step 3: ('receiver', 4) - receives from S5
+        """
+        roles = []
+        for step in cls.TREE_REDUCTION_ORDER:
+            role = "idle"
+            partner = -1
+            for dst, src in step:
+                if s_block_idx == dst:
+                    role = "receiver"
+                    partner = src
+                    break
+                elif s_block_idx == src:
+                    role = "sender"
+                    partner = dst
+                    break
+            roles.append((role, partner))
+        return roles
+
+    @classmethod
+    def is_tree_reduction_receiver(cls, s_block_idx: int) -> bool:
+        """Check if this S block receives from any partner in tree reduction."""
+        for role, _ in cls.get_tree_reduction_role(s_block_idx):
+            if role == "receiver":
+                return True
+        return False
+
+    @classmethod
+    def is_tree_reduction_sender(cls, s_block_idx: int) -> bool:
+        """Check if this S block sends to any partner in tree reduction."""
+        for role, _ in cls.get_tree_reduction_role(s_block_idx):
+            if role == "sender":
+                return True
+        return False
+
+    @classmethod
+    def get_tree_reduction_partner_coords(cls, device, s_block_idx: int, batch_idx: int) -> list:
+        """
+        Get the physical NOC coordinates of tree reduction partners for a given S block and batch.
+
+        Returns a list of (role_code, partner_s_block_idx, partner_x, partner_y) tuples for each step:
+        - role_code: 0=idle, 1=sender, 2=receiver
+        - partner_s_block_idx: S block index of partner (for checking if partner is active)
+        - partner_x, partner_y: physical NOC coords of partner (0,0 if idle)
+        """
+        roles = cls.get_tree_reduction_role(s_block_idx)
+        result = []
+        for role, partner_s_block_idx in roles:
+            if role == "idle" or partner_s_block_idx < 0:
+                result.append((0, 0, 0, 0))  # idle: role=0, partner_idx=0, x=0, y=0
+            else:
+                # Get the partner core for this batch
+                partner_cores = cls.get_cores(partner_s_block_idx)
+                partner_x, partner_y = partner_cores[batch_idx]
+                partner_physical = device.worker_core_from_logical_core(ttnn.CoreCoord(partner_x, partner_y))
+                role_code = 1 if role == "sender" else 2
+                result.append((role_code, partner_s_block_idx, partner_physical.x, partner_physical.y))
+        return result
+
     @classmethod
     def optimal_dram_grid(cls) -> "ttnn.CoreRangeSet":
         """
@@ -515,8 +602,12 @@ class FlashMLADecode:
         mask_tile_size = mask_tile.get_tile_size(im_df)
         col_identity_tile_size = full_tile.get_tile_size(scalar_df)
 
-        # Intermediate output tiles (C++ line 427)
-        intermed_output_tiles = (out0_t + 2 * PNHt) * (num_cores_per_head - 1)
+        # Intermediate output tiles for tree reduction
+        # With tree reduction, each core only receives from 1 source at a time (not all workers)
+        # Each transfer contains: output tiles (out0_t) + max stats (PNHt) + sum stats (PNHt)
+        # Linear reduction would need: (out0_t + 2 * PNHt) * (num_cores_per_head - 1)
+        # Tree reduction only needs: (out0_t + 2 * PNHt) * 1
+        intermed_output_tiles = out0_t + 2 * PNHt
 
         # =========================================================================
         # DRAM Streaming Optimization: Calculate page size for K chunk reads
@@ -639,6 +730,7 @@ class FlashMLADecode:
             k_page_size,  # 22: page size for page-level pipelining
             k_num_pages,  # 23: number of pages per K chunk
             1 if kv_is_sharded else 0,  # 24: kv_is_sharded (enables page-level pipelining)
+            grid.NUM_TREE_REDUCTION_STEPS,  # 25: number of tree reduction steps (3 for 8 S blocks)
         ]
 
         # Compute compile time args (simplified)
@@ -669,6 +761,7 @@ class FlashMLADecode:
             B,  # 23: q_heads_parallel_factor = num Q shards (maps cur_batch to actual batch)
             Q_TILE_HEIGHT,  # 24: Q tile height for vector mode selection
             scale_uint32,  # 25
+            grid.NUM_TREE_REDUCTION_STEPS,  # 26: number of tree reduction steps (3 for 8 S blocks)
         ]
 
         # Compute defines (C++ lines 844-892)
@@ -987,9 +1080,6 @@ class FlashMLADecode:
             # Calculate per-core values (matching C++ lines 932-954)
             worker_id_for_reduce = (i % num_cores_per_head) - 1
             worker_id_for_output = (i % num_cores_per_batch) - 1
-            # Handle unsigned comparison: -1 becomes 0xFFFFFFFF
-            do_reduce = 1 if (worker_id_for_reduce & 0xFFFFFFFF) == 0xFFFFFFFF else 0
-            do_output = 1 if (worker_id_for_output & 0xFFFFFFFF) == 0xFFFFFFFF else 0
 
             cur_head = (i % num_cores_per_batch) // num_cores_per_head
             cur_batch = i // num_cores_per_batch
@@ -1003,6 +1093,13 @@ class FlashMLADecode:
             # s_block_idx = i % num_s_blocks determines which S block this core belongs to
             # is_mcast_sender = 1 for first core of each S block (i < num_s_blocks)
             s_block_idx = i % num_s_blocks
+
+            # Tree reduction: do_reduce is true for any S block that receives from others
+            # S1, S3, S5, S7 are receivers (do_reduce = 1)
+            # S2, S4, S6, S8 are pure senders (do_reduce = 0)
+            do_reduce = 1 if grid.is_tree_reduction_receiver(s_block_idx) else 0
+            # do_output is true only for S1 (the final reducer that writes to output tensor)
+            do_output = 1 if (worker_id_for_output & 0xFFFFFFFF) == 0xFFFFFFFF else 0
             is_mcast_sender = 1 if i < num_s_blocks else 0
 
             # Get multicast coordinates for this core's S block (physical NOC coords)
@@ -1040,6 +1137,12 @@ class FlashMLADecode:
             reader_runtime_args.extend(output_core_physical_xs)
             reader_runtime_args.extend(output_core_physical_ys)
 
+            # Tree reduction partner coordinates for this core
+            # Returns list of (role_code, partner_s_block_idx, partner_x, partner_y) for each reduction step
+            # role_code: 0=idle, 1=sender, 2=receiver
+            # partner_s_block_idx: needed to check if partner is active at runtime
+            tree_reduction_info = grid.get_tree_reduction_partner_coords(device, s_block_idx, cur_batch)
+
             # Writer runtime args (simplified, num_kv_heads=1)
             writer_runtime_args = [
                 out_addr,
@@ -1058,6 +1161,13 @@ class FlashMLADecode:
             ]
             writer_runtime_args.extend(reduce_core_physical_xs)
             writer_runtime_args.extend(reduce_core_physical_ys)
+            # Tree reduction info: 3 steps × 4 values (role, partner_idx, x, y) = 12 values
+            for role_code, partner_s_block_idx, partner_x, partner_y in tree_reduction_info:
+                writer_runtime_args.extend([role_code, partner_s_block_idx, partner_x, partner_y])
+
+            # Is this core a sender after receiving? (intermediate node in tree reduction)
+            # S3, S5, S7 are both receivers and senders - they need to write to output CBs after reduction
+            is_sender_after_reduce = 1 if (do_reduce and grid.is_tree_reduction_sender(s_block_idx)) else 0
 
             # Compute runtime args (matching C++ lines 994-995)
             compute_runtime_args = [
@@ -1068,7 +1178,12 @@ class FlashMLADecode:
                 core_num_in_reduce,
                 core_num_in_output,
                 cur_pos,
+                is_sender_after_reduce,  # Whether to write to output CBs after reduction
             ]
+            # Tree reduction info: 3 steps × 2 values (role, partner_idx) = 6 values
+            # Compute kernel uses this to determine actual number of reductions at runtime
+            for role_code, partner_s_block_idx, partner_x, partner_y in tree_reduction_info:
+                compute_runtime_args.extend([role_code, partner_s_block_idx])
 
             # Append to single RuntimeArgs objects
             reader_rtargs.append(core, reader_runtime_args)
@@ -1087,9 +1202,13 @@ class FlashMLADecode:
             idle_writer_runtime_args = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
             idle_writer_runtime_args.extend([0] * len(reduce_core_physical_xs))
             idle_writer_runtime_args.extend([0] * len(reduce_core_physical_ys))
+            # Tree reduction info placeholders: 3 steps × 4 values = 12
+            idle_writer_runtime_args.extend([0] * (grid.NUM_TREE_REDUCTION_STEPS * 4))
 
             # Compute idle runtime args (do_reduce=65 signals idle)
-            idle_compute_runtime_args = [65, 0, 0, 0, 0, 0, 0]
+            # 8 base args + 6 tree reduction args (3 steps × 2 values) = 14
+            idle_compute_runtime_args = [65, 0, 0, 0, 0, 0, 0, 0]
+            idle_compute_runtime_args.extend([0] * (grid.NUM_TREE_REDUCTION_STEPS * 2))
 
             reader_rtargs.append(core, idle_reader_runtime_args)
             writer_rtargs.append(core, idle_writer_runtime_args)
