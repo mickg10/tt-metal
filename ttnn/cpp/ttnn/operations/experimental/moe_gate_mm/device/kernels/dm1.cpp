@@ -47,6 +47,9 @@ void kernel_main() {
     constexpr auto cb_w2c_in5 = tt::CBIndex::c_7;
     constexpr auto cb_w2c_in6 = tt::CBIndex::c_8;
 
+    // Aliases
+    constexpr auto cb_w2c_in8 = tt::CBIndex::c_6;
+
     // Tile sizes
     constexpr uint32_t in_tile_size = get_tile_size(cb_s2c_in);
     constexpr uint32_t w_tile_size = get_tile_size(cb_r2c_w);
@@ -81,12 +84,16 @@ void kernel_main() {
     //-------------------------------------------------------------------------
     constexpr uint32_t COLLECTOR_CORE_ID = 7;
 
-    const uint32_t local_collector_addr = get_write_ptr(cb_w2c_in3);
+    const uint32_t local_collector_addr = get_write_ptr(cb_w2c_in4);
     const uint64_t collector_dst_base_addr =
         get_noc_addr(collector_physical_x, collector_physical_y, local_collector_addr);
     const uint32_t collector_offset = core_id * out_tile_size;
 
     constexpr uint32_t group_score_size = tt::constants::FACE_WIDTH * sizeof(uint16_t);
+
+    //-------------------------------------------------------------------------
+    // Group scores (7 cores -> 1 collector core)
+    //-------------------------------------------------------------------------
 
     // Group scores: data exists in 1st and 4th row of the first face of the bfloat16 tile
     constexpr uint32_t group_score_offset1 = 0;
@@ -102,14 +109,28 @@ void kernel_main() {
         get_noc_addr(collector_physical_x, collector_physical_y, semaphore_addr);
 
     //-------------------------------------------------------------------------
-    // Group masks
+    // Group masks (1 collector core -> 7 cores)
     //-------------------------------------------------------------------------
-    const uint32_t local_group_masks_addr = get_write_ptr(cb_w2c_in6);
+    const uint32_t local_group_masks_addr = get_write_ptr(cb_w2c_in5);
     const uint64_t group_masks_noc_addr = get_noc_multicast_addr(
         first_physical_x, first_physical_y, collector_physical_x, collector_physical_y, local_group_masks_addr);
     const uint64_t group_semaphore_noc_addr = get_noc_multicast_addr(
         first_physical_x, first_physical_y, collector_physical_x, collector_physical_y, semaphore_addr);
     //-------------------------------------------------------------------------
+
+    //-------------------------------------------------------------------------
+    // Top8 partials (7 cores -> 1 collector core)
+    //-------------------------------------------------------------------------
+    constexpr uint32_t partials_size = 2 * tt::constants::FACE_HW * sizeof(uint16_t);  // values and indices
+
+    // Top8 partials: data exists in first 16 rows
+    const uint32_t local_top8_partials_src_addr = get_write_ptr(cb_w2c_in8);
+
+    const uint32_t local_top8_dst_base_addr = get_write_ptr(cb_w2c_in6);
+    const uint32_t local_top8_dst_addr = local_top8_dst_base_addr + core_id * partials_size;
+
+    //-------------------------------------------------------------------------
+    *my_semaphore_ptr = 0;
 
     if (is_send_core) {
         // Since neighbor2 is farther, we send it first.
@@ -183,13 +204,30 @@ void kernel_main() {
         // We are done with the group scores
         cb_pop_front(cb_c2w_rdy, 1);
 
-        cb_reserve_back(cb_w2c_in6, 1);
+        cb_reserve_back(cb_w2c_in5, 1);
 
         // Wait for the group mask to be ready in the collector core
         noc_semaphore_wait_min(my_semaphore_ptr, 8);
 
         // Let compute know we got the group masks
-        cb_push_back(cb_w2c_in6, 1);
+        cb_push_back(cb_w2c_in5, 1);
+
+        // Wait for compute to send the top-8 values and indices
+        cb_wait_front(cb_w2c_in8, 1);
+
+        noc_async_write_one_packet_set_state</*posted=*/true>(
+            local_top8_dst_base_addr, partials_size, /*noc=*/1, vchannel);
+
+        // Send them over to the collector core
+        noc_async_write_one_packet_with_state</*posted=*/true>(local_top8_partials_src_addr, local_top8_dst_addr);
+
+        // Signal the collector core that data is ready (increment their semaphore)
+        noc_semaphore_inc</*posted=*/true>(collector_semaphore_noc_addr, /*incr=*/1, /*noc_id=*/1, /*vc=*/vchannel);
+
+        // Ensure write and semaphore have left the core before continuing
+        noc_async_posted_atomic_barrier();
+
+        cb_pop_front(cb_w2c_in8, 1);
     }
 
     //-------------------------------------------------------------------------
@@ -213,18 +251,18 @@ void kernel_main() {
         // We are done with the group scores
         cb_pop_front(cb_c2w_rdy, 1);
 
-        cb_reserve_back(cb_w2c_in3, 1);
+        cb_reserve_back(cb_w2c_in4, 1);
 
         // I am collecting, let us wait for everyone else to finish sending their data to me
         noc_semaphore_wait_min(my_semaphore_ptr, 1 + 7);
 
         // Let compute know that we got the group scores
-        cb_push_back(cb_w2c_in3, 1);
+        cb_push_back(cb_w2c_in4, 1);
 
         //-----------------------------------------------------------------
         // Get the group masks
         //-----------------------------------------------------------------
-        cb_wait_front(cb_w2c_in6, 1);
+        cb_wait_front(cb_w2c_in5, 1);
         // Multicast this data to all the cores
         noc_async_write_multicast_one_packet(
             local_group_masks_addr, group_masks_noc_addr, /*size=*/2048, /*num_dests=*/7);
@@ -232,6 +270,15 @@ void kernel_main() {
         // Set the semaphore to let the clients know they got the data
         noc_semaphore_set_multicast(
             semaphore_addr, group_semaphore_noc_addr, /*num_dests=*/7, /*linked=*/false, /*noc=*/1);
-        cb_pop_front(cb_w2c_in6, 1);
+
+        cb_pop_front(cb_w2c_in5, 1);
+
+        cb_reserve_back(cb_w2c_in6, 4);
+
+        // Wait for the top8 partials to be ready in the collector core
+        // noc_semaphore_wait_min(my_semaphore_ptr, 1 + 7 + 7);
+
+        // Let compute know that we got the top8 partials
+        cb_push_back(cb_w2c_in6, 4);
     }
 }

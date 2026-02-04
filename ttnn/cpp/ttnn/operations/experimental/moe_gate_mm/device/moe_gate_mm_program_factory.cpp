@@ -39,10 +39,10 @@ MoEGateMMProgramFactory::cached_program_t MoEGateMMProgramFactory::create(
         | cb_c2w_rdy     | CBIndex::c_2  | Float32    | false |    1     |      4          |
         | cb_w2c_in2     | CBIndex::c_3  | Float32    | true  |    1     |      2048       |
         | cb_s2c_out(sh) | CBIndex::c_4  | Float16_b  | true  |    1     |      2048       |
-        | cb_w2c_in3     | CBIndex::c_5  | Float16_b  | true  |    8     |      16384      |
-        | cb_w2c_in4     | CBIndex::c_6  | Float16_b  | true  |    7     |      14336      |
+        | cb_w2c_in3     | CBIndex::c_5  | Float16_b  | true  |    1     |      2048       |
+        | cb_w2c_in4     | CBIndex::c_6  | Float16_b  | true  |    1     |      2048       |
         | cb_w2c_in5     | CBIndex::c_7  | Float16_b  | true  |    1     |      2048       |
-        | cb_w2c_in6     | CBIndex::c_8  | Float16_b  | true  |    1     |      2048       |
+        | cb_w2c_in6     | CBIndex::c_8  | Float16_b  | true  |    4     |      8192       |
         ------------------------------------------------------------------------------------
     */
 
@@ -51,10 +51,10 @@ MoEGateMMProgramFactory::cached_program_t MoEGateMMProgramFactory::create(
         {"cb_r2c_w", tt::CBIndex::c_0, tt::DataFormat::Float16_b, true, 32 * 3},
         {"cb_c2w_rdy", tt::CBIndex::c_2, tt::DataFormat::Float32, false, 1},
         {"cb_w2c_in2", tt::CBIndex::c_3, tt::DataFormat::Float32, true, 1},
-        {"cb_w2c_in3", tt::CBIndex::c_5, tt::DataFormat::Float16_b, true, 8},
-        {"cb_w2c_in4", tt::CBIndex::c_6, tt::DataFormat::Float16_b, true, 7},
+        {"cb_w2c_in3", tt::CBIndex::c_5, tt::DataFormat::Float16_b, true, 1},
+        {"cb_w2c_in4", tt::CBIndex::c_6, tt::DataFormat::Float16_b, true, 1},
         {"cb_w2c_in5", tt::CBIndex::c_7, tt::DataFormat::Float16_b, true, 1},
-        {"cb_w2c_in6", tt::CBIndex::c_8, tt::DataFormat::Float16_b, true, 1},
+        {"cb_w2c_in6", tt::CBIndex::c_8, tt::DataFormat::Float16_b, true, 4},
     };
 
     [[maybe_unused]] std::map<std::string, tt::tt_metal::CBHandle> cb_handles, cb_handles_sharded;

@@ -337,16 +337,16 @@ inline void _calculate_top8_tile_(uint32_t tile_index) {
     _merge_sorted_8_<0, 1, 0>();
     _merge_sorted_8_<0, 1, 1>();
 
-    // Write the indices to the first 8 rows of the output tile
-    constexpr uint32_t index_base = 8;
+    // Write the indices from row 16 onwards, tile 1
+    constexpr uint32_t index_base = 64 + 16;
     TT_SFPSTORE(p_sfpu::LREG0, InstrModLoadStore::LO16_ONLY, ADDR_MOD_0, index_base + 0);
     TT_SFPSTORE(p_sfpu::LREG1, InstrModLoadStore::LO16_ONLY, ADDR_MOD_0, index_base + 2);
-    TT_SFPSTORE(p_sfpu::LREG2, InstrModLoadStore::LO16_ONLY, ADDR_MOD_0, index_base + 16);
-    TT_SFPSTORE(p_sfpu::LREG3, InstrModLoadStore::LO16_ONLY, ADDR_MOD_0, index_base + 18);
-    TT_SFPSTORE(p_sfpu::LREG4, InstrModLoadStore::LO16_ONLY, ADDR_MOD_0, index_base + 4);
-    TT_SFPSTORE(p_sfpu::LREG5, InstrModLoadStore::LO16_ONLY, ADDR_MOD_0, index_base + 6);
-    TT_SFPSTORE(p_sfpu::LREG6, InstrModLoadStore::LO16_ONLY, ADDR_MOD_0, index_base + 20);
-    TT_SFPSTORE(p_sfpu::LREG7, InstrModLoadStore::LO16_ONLY, ADDR_MOD_0, index_base + 22);
+    TT_SFPSTORE(p_sfpu::LREG2, InstrModLoadStore::LO16_ONLY, ADDR_MOD_0, index_base + 4);
+    TT_SFPSTORE(p_sfpu::LREG3, InstrModLoadStore::LO16_ONLY, ADDR_MOD_0, index_base + 6);
+    TT_SFPSTORE(p_sfpu::LREG4, InstrModLoadStore::LO16_ONLY, ADDR_MOD_0, index_base + 8);
+    TT_SFPSTORE(p_sfpu::LREG5, InstrModLoadStore::LO16_ONLY, ADDR_MOD_0, index_base + 10);
+    TT_SFPSTORE(p_sfpu::LREG6, InstrModLoadStore::LO16_ONLY, ADDR_MOD_0, index_base + 12);
+    TT_SFPSTORE(p_sfpu::LREG7, InstrModLoadStore::LO16_ONLY, ADDR_MOD_0, index_base + 14);
 
     //-------------------------------------------------------------------------
     // PHASE 3: Mask the values for lanes where the group is not selected
@@ -382,10 +382,11 @@ inline void _calculate_top8_tile_(uint32_t tile_index) {
     }
 
     TTI_SFPTRANSP(0, 0, 0, 0);
-    TT_SFPSTORE(p_sfpu::LREG0, InstrModLoadStore::FP16B, ADDR_MOD_0, 0);
-    TT_SFPSTORE(p_sfpu::LREG1, InstrModLoadStore::FP16B, ADDR_MOD_0, 2);
-    TT_SFPSTORE(p_sfpu::LREG2, InstrModLoadStore::FP16B, ADDR_MOD_0, 16);
-    TT_SFPSTORE(p_sfpu::LREG3, InstrModLoadStore::FP16B, ADDR_MOD_0, 18);
+    constexpr uint32_t value_base = 64;
+    TT_SFPSTORE(p_sfpu::LREG0, InstrModLoadStore::FP16B, ADDR_MOD_0, value_base + 0);
+    TT_SFPSTORE(p_sfpu::LREG1, InstrModLoadStore::FP16B, ADDR_MOD_0, value_base + 2);
+    TT_SFPSTORE(p_sfpu::LREG2, InstrModLoadStore::FP16B, ADDR_MOD_0, value_base + 4);
+    TT_SFPSTORE(p_sfpu::LREG3, InstrModLoadStore::FP16B, ADDR_MOD_0, value_base + 6);
 
     TT_SFPLOAD(p_sfpu::LREG0, InstrModLoadStore::FP16B, ADDR_MOD_0, 4);
     TT_SFPLOAD(p_sfpu::LREG1, InstrModLoadStore::FP16B, ADDR_MOD_0, 6);
@@ -402,10 +403,10 @@ inline void _calculate_top8_tile_(uint32_t tile_index) {
     }
 
     TTI_SFPTRANSP(0, 0, 0, 0);
-    TT_SFPLOAD(p_sfpu::LREG0, InstrModLoadStore::FP16B, ADDR_MOD_0, 4);
-    TT_SFPLOAD(p_sfpu::LREG1, InstrModLoadStore::FP16B, ADDR_MOD_0, 6);
-    TT_SFPLOAD(p_sfpu::LREG2, InstrModLoadStore::FP16B, ADDR_MOD_0, 20);
-    TT_SFPLOAD(p_sfpu::LREG3, InstrModLoadStore::FP16B, ADDR_MOD_0, 22);
+    TT_SFPLOAD(p_sfpu::LREG0, InstrModLoadStore::FP16B, ADDR_MOD_0, value_base + 8);
+    TT_SFPLOAD(p_sfpu::LREG1, InstrModLoadStore::FP16B, ADDR_MOD_0, value_base + 10);
+    TT_SFPLOAD(p_sfpu::LREG2, InstrModLoadStore::FP16B, ADDR_MOD_0, value_base + 12);
+    TT_SFPLOAD(p_sfpu::LREG3, InstrModLoadStore::FP16B, ADDR_MOD_0, value_base + 14);
 }
 
 }  // namespace sfpu
