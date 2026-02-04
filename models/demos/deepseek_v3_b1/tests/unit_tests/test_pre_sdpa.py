@@ -446,6 +446,39 @@ def test_pre_sdpa(device, epsilon, use_fp32):
         tile=tile,
     )
 
+    # KV Cache tensor in DRAM sharded
+    # Shape: [max_seq_len, kv_dim] where kv_dim = 512 (nope) + 64 (rope) = 576
+    dram_grid_size = device.dram_grid_size()
+    kv_cache_seq_len = (
+        dram_grid_size.x * dram_grid_size.y
+    )  # For simplicity, just test up to number of DRAM banks, with one shard per bank
+    assert (
+        position_id < kv_cache_seq_len
+    ), f"Position ID {position_id} must be less than KV cache sequence length {kv_cache_seq_len}"
+    kv_cache_dim = 576  # 512 (nope) + 64 (rope)
+    kv_cache_shape = (1, 1, kv_cache_seq_len, kv_cache_dim)
+    torch_kv_cache = torch.zeros(kv_cache_shape, dtype=torch.bfloat16)
+    # Get device DRAM grid size
+    kv_cache_shard_spec = ttnn.ShardSpec(
+        ttnn.CoreRangeSet(
+            {ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(dram_grid_size.x - 1, dram_grid_size.y - 1))}
+        ),
+        [1, kv_cache_dim],
+        ttnn.ShardOrientation.ROW_MAJOR,
+    )
+    kv_cache_mem_config = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.DRAM, kv_cache_shard_spec
+    )
+    # Create tensor with DRAM sharded memory config
+    ttnn_kv_cache = ttnn.from_torch(
+        torch_kv_cache,
+        dtype=ttnn.bfloat16,
+        device=device,
+        layout=ttnn.TILE_LAYOUT,
+        memory_config=kv_cache_mem_config,
+        tile=tile,
+    )
+
     # ========================================================================
     # Run pre-SDPA operation
     # ========================================================================
@@ -464,6 +497,8 @@ def test_pre_sdpa(device, epsilon, use_fp32):
         ttnn_krope_sin,
         ttnn_dkv_matmul_weights,
         ttnn_dkv_rmsnorm_gamma,
+        ttnn_kv_cache,
+        position_id,
         ttnn_sdpa_input_output,
         epsilon=epsilon,
         fp32_dest_acc_en=use_fp32,
@@ -503,16 +538,32 @@ def test_pre_sdpa(device, epsilon, use_fp32):
     # ========================================================================
     # Verify final output (SDPA Input)
     # ========================================================================
-    logger.info("Verifying SDPA Input interleaved results...")
+    logger.info("Verifying SDPA Input results...")
     # Golden SDPA Input shape: [8, 8, 576] -> reshape to [8, 4608] to match device output
     # The 4×2 grid with ROW_MAJOR orientation gives indices 0-7 matching source rows 0-7
     # Each combined head is (qnope[512], qrope[64]) where qrope has been processed by RoPE
     torch_sdpa_input_expected_flat = torch_sdpa_expected.reshape(SDPA_INPUT_NUM_CORES, SDPA_INPUT_ELEMENTS_PER_CORE)
 
+    max_diff = torch.max(torch.abs(torch_sdpa_input_expected_flat - sdpa_input_output_torch)).item()
+    mean_diff = torch.mean(torch.abs(torch_sdpa_input_expected_flat - sdpa_input_output_torch)).item()
+    logger.info(f"SDPA Q absolute difference: {max_diff}")
+    logger.info(f"SDPA Q mean absolute difference: {mean_diff}")
     sdpa_input_passing, sdpa_input_pcc_message = comp_pcc(torch_sdpa_input_expected_flat, sdpa_input_output_torch, 0.98)
-    logger.info(f"SDPA Input PCC: {sdpa_input_pcc_message}")
+    logger.info(f"SDPA Q PCC: {sdpa_input_pcc_message}")
 
     # Assert final output passes
-    assert sdpa_input_passing, f"SDPA Input verification failed: {sdpa_input_pcc_message}"
+    assert sdpa_input_passing, f"SDPA Q verification failed: {sdpa_input_pcc_message}"
+
+    # Read back from kv cache tensor in DRAM to check PCC
+    torch_kv_cache = ttnn.to_torch(ttnn_kv_cache)
+    compare_kv_cache = torch_kv_cache[:, :, position_id, :]
+    max_diff = torch.max(torch.abs(torch_kv_cache_expected - compare_kv_cache)).item()
+    mean_diff = torch.mean(torch.abs(torch_kv_cache_expected - compare_kv_cache)).item()
+    logger.info(f"KV Cache absolute difference: {max_diff}")
+    logger.info(f"KV Cache mean absolute difference: {mean_diff}")
+
+    passing, pcc_message = comp_pcc(compare_kv_cache, torch_kv_cache_expected, 0.98)
+    logger.info(f"KV Cache PCC: {pcc_message}")
+    assert passing, pcc_message
 
     logger.info("✓ PreSDPA test passed!")

@@ -159,6 +159,8 @@ class PreSDPA:
         krope_sin_tensor,
         dkv_matmul_weights_tensor,
         dkv_rmsnorm_gamma_tensor,
+        kv_cache_tensor,
+        kv_cache_write_index,
         output_tensor,
         epsilon=1e-6,
         fp32_dest_acc_en=False,
@@ -1202,7 +1204,7 @@ class PreSDPA:
             buffer_index=krope_output_cb,
             data_format=data_format,
             page_size=krope_tile_size,
-            tile=tile_descriptor,
+            tile=ttnn.TileDescriptor(TILE_1x32),
         )
         krope_output_cb_descriptor = ttnn.CBDescriptor(
             total_size=1 * krope_tile_size,
@@ -1292,6 +1294,11 @@ class PreSDPA:
             + dkv_gather_receiver_named_compile_time_args
             + kv_rmsnorm_brisc_named_compile_time_args
             + krope_brisc_named_compile_time_args,
+            # BRISC common runtime args: KV cache buffer address and write position
+            brisc_common_runtime_args=[
+                kv_cache_tensor.buffer_address(),
+                kv_cache_write_index,
+            ],
             # TRISC named compile-time args: rmsnorm compute + matmul + rmsnorm2 + matmul2 + matmul3 + dkv_matmul + kv_rmsnorm
             trisc_named_compile_time_args=rmsnorm_compute_named_compile_time_args
             + matmul_trisc_named_compile_time_args

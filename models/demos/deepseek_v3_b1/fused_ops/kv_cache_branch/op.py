@@ -125,7 +125,6 @@ class KVCacheBranch:
         # KV Cache tensor setup
         # Tile size is now derived from output CB in kernel using get_tile_size()
         kv_cache_buffer_addr = kv_cache_tensor.buffer_address()
-        kv_cache_tile = kv_cache_tensor.get_tile()
         # Calculate starting tile ID based on write index
         # KV cache shape is [1, 1, seq_len, kv_dim], tiles are [32, 32]
 
@@ -518,7 +517,6 @@ class KVCacheBranch:
             cos_tensor,
             sin_tensor,
             trans_mat_tensor,
-            kv_cache_tensor,
             output_tensor,
         ]
         output = ttnn.generic_op(io_tensors, program_descriptor)
