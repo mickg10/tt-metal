@@ -624,7 +624,7 @@ ReduceScatterProgramArtifacts build_ring_reduce_scatter_minimal_async_program_ar
 
     const auto [all_core_range, all_cores] =
         choose_worker_cores(num_links, num_cores_per_link, mesh_device, sub_device_id, core_grid_offset);
-
+    log_info(tt::LogOp, "Using cores: {}, with offset {}", all_core_range, core_grid_offset);
     const auto mux_connection_valid = [&backward_coord, &forward_coord](const uint32_t dir) {
         return (!dir && backward_coord.has_value()) || (dir && forward_coord.has_value());
     };

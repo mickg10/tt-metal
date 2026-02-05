@@ -112,6 +112,13 @@ MinimalMatmulReduceScatterAsyncProgramFactory::create_at(
         ttnn::experimental::ccl::MinimalMatmulFusedOpSignaler(
             ttnn::experimental::ccl::MatmulFusedOpSignalerType::REDUCE_SCATTER);
 
+    log_debug(
+        tt::LogOp,
+        "fused_op_recv cores = {}, semaphores = {}, mode = {}",
+        reduce_scatter_fused_op_signaler->fused_op_receiver_cores_noc,
+        reduce_scatter_fused_op_signaler->fused_op_receiver_signal_semaphores,
+        reduce_scatter_fused_op_signaler->fused_op_signaler_mode);
+
     matmul_fused_op_signaler->init_reduce_scatter(
         reduce_scatter_fused_op_signaler->fused_op_receiver_cores_noc,
         reduce_scatter_fused_op_signaler->fused_op_receiver_signal_semaphores,

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "minimal_matmul_reduce_scatter_async.hpp"
+#include <optional>
 #include "ttnn/operations/ccl/ccl_common.hpp"
 #include "ttnn/operations/experimental/ccl/minimal_matmul_reduce_scatter_async/device/minimal_matmul_reduce_scatter_async_device_operation.hpp"
 
@@ -23,6 +24,7 @@ std::vector<ttnn::Tensor> ExecuteMinimalMatmulReduceScatterAsync::invoke(
     const std::optional<ttnn::MemoryConfig>& intermediate_memory_config_rs,
     const tt::tt_fabric::Topology topology,
     std::optional<tt::tt_metal::SubDeviceId> sub_device_id,
+    std::optional<uint32_t> cluster_axis,
     const std::optional<ttnn::MemoryConfig>& memory_config_mm,
     const std::optional<const DataType> dtype,
     const std::optional<const ::ttnn::experimental::prim::MinimalMatmulConfig>& program_config,
@@ -44,6 +46,7 @@ std::vector<ttnn::Tensor> ExecuteMinimalMatmulReduceScatterAsync::invoke(
         intermediate_memory_config_rs,
         usable_topology,
         sub_device_id,
+        cluster_axis,
         memory_config_mm,
         dtype,
         program_config,

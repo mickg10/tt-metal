@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include <tt-logger/tt-logger.hpp>
 #include <tt-metalium/core_coord.hpp>
 #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
 #include "ttnn/operations/experimental/minimal_matmul/device/minimal_matmul_device_operation.hpp"
@@ -140,6 +141,7 @@ ttnn::operations::experimental::ccl::minimal_matmul_reduce_scatter_async::
         const std::optional<ttnn::MemoryConfig>& intermediate_memory_config_rs,
         const ttnn::ccl::Topology topology,
         std::optional<tt::tt_metal::SubDeviceId> sub_device_id,
+        std::optional<uint32_t> cluster_axis,
         const std::optional<ttnn::MemoryConfig>& memory_config_mm,
         const std::optional<const DataType> dtype,
         const std::optional<const ::ttnn::experimental::prim::MinimalMatmulConfig>& program_config,
@@ -175,7 +177,7 @@ ttnn::operations::experimental::ccl::minimal_matmul_reduce_scatter_async::
         reduce_scatter_params{
             .dim = dim,
             .num_links = num_links,
-            .ring_size = static_cast<uint32_t>(devices.size()),
+            .ring_size = ::ttnn::ccl::get_topological_dimension(input_tensor, cluster_axis),
             .output_mem_config = memory_config_rs.value_or(input_tensor.memory_config()),
             .optional_intermediate_mem_config = intermediate_memory_config_rs.value_or(input_tensor.memory_config()),
             .topology = topology,
@@ -183,12 +185,14 @@ ttnn::operations::experimental::ccl::minimal_matmul_reduce_scatter_async::
             .barrier_semaphore = barrier_semaphore,
             .using_persistent_buffers = using_persistent_buffers,
             .sub_device_id = sub_device_id,
-            .cluster_axis = std::nullopt,
+            .cluster_axis = cluster_axis,
             .chunks_per_sync = std::nullopt,
             .num_workers_per_link = DEFAULT_WORKERS_PER_LINK,
             .num_buffers_per_channel = std::nullopt,
         };
 
+    log_debug(tt::LogOp, "Reduce Scatter Params = {}", reduce_scatter_params);
+    log_debug(tt::LogOp, "Matmul Params = {}", matmul_struct);
     auto operation_attributes = OperationType::operation_attributes_t(
         reduce_scatter_params, matmul_struct, reduce_scatter_core_grid_offset, devices);
     auto tensor_args = OperationType::tensor_args_t{

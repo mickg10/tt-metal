@@ -229,9 +229,10 @@ class TtLlamaMLP(LightweightModule):
             w1_out_reduced = self.tt_ccl.line_reduce_scatter(
                 w1_out, cluster_axis=1, num_links=3, memory_config=w1_out.memory_config(), buffer_key="FF1", dim=3
             )
+            print("Reduce scatter input = ", w1_out.shape, "output = ", w1_out_reduced.shape)
             ttnn.deallocate(w1_out)
         else:
-            w1_out = self.tt_ccl.minimal_matmul_reduce_scatter(
+            w1_out_reduced = self.tt_ccl.minimal_matmul_reduce_scatter(
                 matmul_input=x,
                 matmul_weight=self.w1_interleaved if use_w1_w3_interleaved else self.w1,
                 cluster_axis=1,
@@ -256,28 +257,40 @@ class TtLlamaMLP(LightweightModule):
                 program_config=short_lens_pc_1_3,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
-        else:
-            w3_out = ttnn.experimental.minimal_matmul(
-                input_tensor=x,
-                weight_tensor=self.w3_interleaved if use_w1_w3_interleaved else self.w3,
-                config=minimal_pc_1_3,
-                compute_kernel_config=self.args.compute_kernel_config_lofi,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            ttnn.deallocate(x)
+            print("Reduce scatter input = ", w3_out.shape, "output = ", w3_out_reduced.shape)
+            w3_out_reduced = self.tt_ccl.line_reduce_scatter(
+                w3_out, cluster_axis=1, num_links=3, memory_config=w3_out.memory_config(), buffer_key="FF3", dim=3
             )
-        ttnn.deallocate(x)
-        w3_out_reduced = self.tt_ccl.line_reduce_scatter(
-            w3_out, cluster_axis=1, num_links=3, memory_config=w3_out.memory_config(), buffer_key="FF3", dim=3
-        )
-        ttnn.deallocate(w3_out)
+            ttnn.deallocate(w3_out)
+        else:
+            w3_out_reduced = self.tt_ccl.minimal_matmul_reduce_scatter(
+                matmul_input=x,
+                matmul_weight=self.w3_interleaved if use_w1_w3_interleaved else self.w3,
+                cluster_axis=1,
+                num_links=3,
+                reduce_dim=3,
+                buffer_key="FF3",
+                matmul_config=minimal_pc_1_3,
+                compute_kernel_config=self.args.compute_kernel_config_lofi,
+            )
+            # w3_out = ttnn.experimental.minimal_matmul(
+            #     input_tensor=x,
+            #     weight_tensor=self.w3_interleaved if use_w1_w3_interleaved else self.w3,
+            #     config=minimal_pc_1_3,
+            #     compute_kernel_config=self.args.compute_kernel_config_lofi,
+            #     memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            # )
+
         w2_in = ttnn.mul(
             w1_out_reduced,
             w3_out_reduced,
             input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
             dtype=ttnn.bfloat8_b,
-            memory_config=w1_out.memory_config(),
+            memory_config=w1_out_reduced.memory_config(),
         )
         w2_in_gathered = self.tt_ccl.line_all_gather(
-            w2_in, cluster_axis=1, num_links=3, memory_config=w3_out.memory_config(), buffer_key="FF3", dim=3
+            w2_in, cluster_axis=1, num_links=3, memory_config=w3_out_reduced.memory_config(), buffer_key="FF3", dim=3
         )
         ttnn.deallocate(w2_in)
 

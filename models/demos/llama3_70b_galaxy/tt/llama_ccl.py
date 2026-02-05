@@ -981,7 +981,7 @@ class TT_CCL:
         print(
             "Using minimal_matmul_reduce_scatter with input = ", matmul_input.shape, " weight = ", matmul_weight.shape
         )
-        matmul_config.compute_with_storage_grid_size = (4, 4)
+        matmul_config.compute_with_storage_grid_size = (7, 5)
         seqlen = matmul_input.shape[-2]
         persistent_buffers = (
             self.persistent_buffers[seqlen].get(buffer_key, None) if seqlen in self.persistent_buffers else None
@@ -997,7 +997,8 @@ class TT_CCL:
             dim=reduce_dim,
             multi_device_global_semaphore=self.reduce_semaphore_handles[cluster_axis][self.gather_idx[cluster_axis]],
             barrier_semaphore=self.get_and_cycle_barrier_semaphore_handle(cluster_axis),
-            reduce_scatter_core_grid_offset=(0, 4),
+            reduce_scatter_core_grid_offset=(0, 5),
+            cluster_axis=cluster_axis,
             num_links=num_links,
             memory_config_rs=ttnn.DRAM_MEMORY_CONFIG,
             topology=ttnn.Topology.Ring,
