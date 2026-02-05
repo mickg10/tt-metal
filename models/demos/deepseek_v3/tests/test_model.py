@@ -245,7 +245,6 @@ def run_test_forward_pass_dpmodel(
 TEST_CASES, TEST_IDS = build_test_cases_and_ids(
     USERS_PER_ROW,
     DEFAULT_PREFILL_SEQ_LEN,  # default prefill sequence length to test
-    include_decode_random_pos_ids=False,  # TODO: Remove include_decode_random_pos_ids=False once non-zero position_ids case is working.
 )
 
 
