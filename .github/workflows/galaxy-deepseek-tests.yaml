@@ -11,6 +11,7 @@ on:
           - all
           - unit
           - module
+          - long-seq-len-module
         default: 'all'
       platform:
         required: false
@@ -51,6 +52,18 @@ jobs:
       platform: ${{ inputs.platform || 'Ubuntu 22.04' }}
       enable-lto: ${{ inputs.enable-lto || false }}
   Galaxy-DeepSeek-tests:
+    needs: build-artifact
+    secrets: inherit
+    uses: ./.github/workflows/galaxy-deepseek-tests-impl.yaml
+    with:
+      docker-image: ${{ needs.build-artifact.outputs.dev-docker-image }}
+      build-artifact-name: ${{ needs.build-artifact.outputs.build-artifact-name }}
+      wheel-artifact-name: ${{ needs.build-artifact.outputs.wheel-artifact-name }}
+      topology: topology-6u
+      test-type: ${{ inputs.test-type || 'all' }}
+
+  Galaxy-DeepSeek-tests-long-seq:
+    if: ${{ inputs.test-type == 'long-seq-len-module' }}
     needs: build-artifact
     secrets: inherit
     uses: ./.github/workflows/galaxy-deepseek-tests-impl.yaml
