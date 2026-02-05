@@ -18,12 +18,14 @@ import ttnn
 from models.common.utility_functions import comp_pcc
 from models.demos.deepseek_v3.tt.rope import get_rot_transformation_mat
 from models.demos.deepseek_v3_b1.fused_ops.pre_sdpa.op import PreSDPA
+from models.demos.deepseek_v3_b1.micro_ops.flash_mla.op import FlashMLADecode
 from models.demos.deepseek_v3_b1.utils import shuffle_weights_for_interleaved_qnope_qrope
 
 
 @pytest.mark.parametrize("epsilon", [1e-6])
 @pytest.mark.parametrize("use_fp32", [True])
-def test_pre_sdpa(device, epsilon, use_fp32):
+@pytest.mark.parametrize("position_id", [0, 257, 513, 2048])
+def test_pre_sdpa(device, epsilon, use_fp32, position_id):
     """Test TTNN pre-SDPA fused operation with full Qnope/Qrope pipeline"""
 
     # ========================================================================
@@ -140,7 +142,6 @@ def test_pre_sdpa(device, epsilon, use_fp32):
     # Create RoPE tensors (sin, cos, trans_mat)
     # ========================================================================
     max_seq_len = 8192
-    position_id = 0  # Decode mode: first token
     position_ids = torch.tensor([position_id])  # [batch]
 
     # Create cos/sin matrices in Meta-style format
@@ -447,35 +448,42 @@ def test_pre_sdpa(device, epsilon, use_fp32):
     )
 
     # KV Cache tensor in DRAM sharded
-    # Shape: [max_seq_len, kv_dim] where kv_dim = 512 (nope) + 64 (rope) = 576
-    dram_grid_size = device.dram_grid_size()
-    kv_cache_seq_len = (
-        dram_grid_size.x * dram_grid_size.y
-    )  # For simplicity, just test up to number of DRAM banks, with one shard per bank
-    assert (
-        position_id < kv_cache_seq_len
-    ), f"Position ID {position_id} must be less than KV cache sequence length {kv_cache_seq_len}"
-    kv_cache_dim = 576  # 512 (nope) + 64 (rope)
-    kv_cache_shape = (1, 1, kv_cache_seq_len, kv_cache_dim)
-    torch_kv_cache = torch.zeros(kv_cache_shape, dtype=torch.bfloat16)
-    # Get device DRAM grid size
-    kv_cache_shard_spec = ttnn.ShardSpec(
-        ttnn.CoreRangeSet(
-            {ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(dram_grid_size.x - 1, dram_grid_size.y - 1))}
-        ),
-        [1, kv_cache_dim],
-        ttnn.ShardOrientation.ROW_MAJOR,
+    # Create KV cache (non-paged) based on max seq len
+    program_config = FlashMLADecode.ProgramConfig(
+        k_chunk_size=256,
+        exp_approx_mode=False,  # Use exact exp for higher precision
     )
-    kv_cache_mem_config = ttnn.MemoryConfig(
-        ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.DRAM, kv_cache_shard_spec
+    logger.info(f"Creating KV cache with seq_len={max_seq_len}...")
+    kvpe_dim = KNOPE_DIM + KROPE_DIM
+    cache_shape = (1, 1, max_seq_len, kvpe_dim)
+    torch_kv_cache = torch.zeros(cache_shape, dtype=torch.bfloat16)
+
+    # ND sharding with ROUND_ROBIN_1D distribution across DRAM banks
+    # Each shard = one k_chunk (k_chunk_size x kvpe_dim), distributed round-robin
+    # Use optimal DRAM bank order matching S block work assignment for locality
+    grid = program_config.grid
+    kv_nd_shard_spec = ttnn.NdShardSpec(
+        shard_shape=[1, 1, program_config.k_chunk_size, kvpe_dim],
+        grid=grid.optimal_dram_grid(),
+        orientation=ttnn.ShardOrientation.ROW_MAJOR,
+        shard_distribution_strategy=ttnn.ShardDistributionStrategy.ROUND_ROBIN_1D,
     )
-    # Create tensor with DRAM sharded memory config
+    kv_mem_config = ttnn.MemoryConfig(
+        buffer_type=ttnn.BufferType.DRAM,
+        nd_shard_spec=kv_nd_shard_spec,
+    )
+    num_chunks = max_seq_len // program_config.k_chunk_size
+    num_banks = len(grid.OPTIMAL_DRAM_BANK_ORDER)
+    logger.info(
+        f"KV cache: ND sharded, DRAM banks: {num_banks} (optimal order: {grid.OPTIMAL_DRAM_BANK_ORDER}), chunks: {num_chunks}, shard_shape: [1, 1, {program_config.k_chunk_size}, {kvpe_dim}]"
+    )
+
     ttnn_kv_cache = ttnn.from_torch(
         torch_kv_cache,
         dtype=ttnn.bfloat16,
-        device=device,
         layout=ttnn.TILE_LAYOUT,
-        memory_config=kv_cache_mem_config,
+        device=device,
+        memory_config=kv_mem_config,
         tile=tile,
     )
 
@@ -557,6 +565,7 @@ def test_pre_sdpa(device, epsilon, use_fp32):
     # Read back from kv cache tensor in DRAM to check PCC
     torch_kv_cache = ttnn.to_torch(ttnn_kv_cache)
     compare_kv_cache = torch_kv_cache[:, :, position_id, :]
+    print(" compare kv cache ", compare_kv_cache)
     max_diff = torch.max(torch.abs(torch_kv_cache_expected - compare_kv_cache)).item()
     mean_diff = torch.mean(torch.abs(torch_kv_cache_expected - compare_kv_cache)).item()
     logger.info(f"KV Cache absolute difference: {max_diff}")

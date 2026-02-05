@@ -160,7 +160,7 @@ class PreSDPA:
         dkv_matmul_weights_tensor,
         dkv_rmsnorm_gamma_tensor,
         kv_cache_tensor,
-        kv_cache_write_index,
+        position_id,
         output_tensor,
         epsilon=1e-6,
         fp32_dest_acc_en=False,
@@ -1254,7 +1254,8 @@ class PreSDPA:
             core_ranges=full_device_grid,
             initial_value=0,
         )
-
+        kv_cache_tensor_accessor_args = ttnn.TensorAccessorArgs(kv_cache_tensor)
+        brisc_compile_time_args = kv_cache_tensor_accessor_args.get_compile_time_args()
         # ========================================================================
         # Kernel descriptors
         # ========================================================================
@@ -1262,6 +1263,8 @@ class PreSDPA:
         unified_kernel = UnifiedKernelDescriptor(
             kernel_source="models/demos/deepseek_v3_b1/fused_ops/pre_sdpa/kernels/pre_sdpa_kernel.cpp",
             core_ranges=full_device_grid,
+            # Brisc compile time args: KV cache tensor accessor args
+            brisc_compile_time_args=brisc_compile_time_args,
             # NCRISC named compile-time args: rmsnorm reader + mcast receiver + matmul + gather sender + rmsnorm2 + matmul2 + mcast2 + matmul3 + unicast receiver + dkv_matmul + dkv_gather_sender + kv_rmsnorm
             ncrisc_named_compile_time_args=rmsnorm_reader_named_compile_time_args
             + mcast_receiver_named_compile_time_args
@@ -1297,7 +1300,7 @@ class PreSDPA:
             # BRISC common runtime args: KV cache buffer address and write position
             brisc_common_runtime_args=[
                 kv_cache_tensor.buffer_address(),
-                kv_cache_write_index,
+                position_id,
             ],
             # TRISC named compile-time args: rmsnorm compute + matmul + rmsnorm2 + matmul2 + matmul3 + dkv_matmul + kv_rmsnorm
             trisc_named_compile_time_args=rmsnorm_compute_named_compile_time_args

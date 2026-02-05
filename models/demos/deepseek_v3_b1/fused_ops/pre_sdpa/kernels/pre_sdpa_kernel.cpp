@@ -732,16 +732,24 @@ void kernel_main() {
         // KNOPE writes to first 512x2 bytes, each KROPE core writes to the remaining 64x2 bytes.
         DeviceZoneScopedN("KV_CACHE_UPDATE");
         // Get runtime args: buffer address and starting tile ID
-        uint32_t kv_cache_buffer_addr = get_common_arg_val<uint32_t>(0);
-        uint32_t kv_cache_start_tile_id = get_common_arg_val<uint32_t>(1);
+        uint32_t kv_cache_buffer_base_addr = get_common_arg_val<uint32_t>(0);
+        uint32_t position_id = get_common_arg_val<uint32_t>(1);
+        constexpr uint32_t CHUNK_SIZE = 256;      // Entries per shard
+        constexpr uint32_t ENTRY_SIZE = 576 * 2;  // kvpe_dim in bytes (BFLOAT16) * 2 bytes per element
+        constexpr uint32_t SHARD_SIZE = CHUNK_SIZE * ENTRY_SIZE;
+        constexpr uint32_t NUM_BANKS = 8;
+        constexpr uint32_t TILE_SIZE = 1 * 32 * 2;
 
-        // Create TensorAccessor for DRAM interleaved tensor
-        auto kv_cache_addr_gen = TensorAccessor(
-            tensor_accessor::make_interleaved_dspec</*is_dram=*/true>(),
-            kv_cache_buffer_addr,
-            576 * 2  // page_size
-        );
-        // Actual calculations will differ in deepseek fused kernel, depending on the sharding scheme
+        constexpr auto k_args = TensorAccessorArgs<0>();
+        auto k_writer = TensorAccessor(k_args, kv_cache_buffer_base_addr, TILE_SIZE);
+
+        // Calculate which shard this position belongs to
+        uint32_t shard_id = position_id / CHUNK_SIZE;
+
+        // Calculate offset within the shard
+        uint32_t position_in_shard = position_id % CHUNK_SIZE;
+        uint32_t offset_in_shard = position_in_shard * ENTRY_SIZE;
+        uint32_t rope_offset_in_shard = offset_in_shard + 512 * 2;
         // Write RMSNorm output (nope portion) to KV cache
         if constexpr (Core::is_kv_rmsnorm_core) {
             constexpr uint32_t kv_rmsnorm_output_cb = get_named_compile_time_arg_val("kv_rmsnorm_output_cb");
@@ -754,15 +762,11 @@ void kernel_main() {
             DPRINT << TSLICE(kv_rmsnorm_output_cb, 0, SliceRange::h0_w0_32(), TSLICE_INPUT_CB, TSLICE_RD_PTR) << ENDL();
             uint32_t l1_read_addr = get_read_ptr(kv_rmsnorm_output_cb);
 
-            for (uint32_t tile_idx = 0; tile_idx < kv_rmsnorm_num_tiles; tile_idx++) {
-                uint32_t tile_id = kv_cache_start_tile_id + tile_idx;
-                noc_async_write_page(tile_id, kv_cache_addr_gen, l1_read_addr, tile_size, 0);
-                l1_read_addr += tile_size;
-            }
+            uint64_t kv_write_addr = k_writer.get_shard_noc_addr(shard_id) + offset_in_shard;
+            noc_async_write(l1_read_addr, kv_write_addr, tile_size);
             noc_async_write_barrier();
             cb_pop_front(kv_rmsnorm_output_cb, kv_rmsnorm_num_tiles);
         }
-
         // Write Rope output to KV cache (after nope tiles)
         if constexpr (Core::is_krope_core) {
             constexpr uint32_t krope_output_cb = get_named_compile_time_arg_val("krope_output_cb");
@@ -775,14 +779,13 @@ void kernel_main() {
             DPRINT << TSLICE(krope_output_cb, 0, SliceRange::h0_w0_32(), TSLICE_INPUT_CB, TSLICE_RD_PTR) << ENDL();
             uint32_t l1_read_addr = get_read_ptr(krope_output_cb);
 
-            uint32_t rope_offset = get_absolute_logical_y() - 8;  // yea...
-            for (uint32_t tile_idx = 0; tile_idx < krope_Wt; tile_idx++) {
-                // Rope tiles come after nope tiles
-                uint32_t tile_id = kv_cache_start_tile_id + tile_idx;
-                noc_async_write_page(
-                    tile_id, kv_cache_addr_gen, l1_read_addr, tile_size, 512 * 2 + tile_size * rope_offset);
-                l1_read_addr += tile_size;
-            }
+            uint32_t core_based_rope_offset = get_absolute_logical_y() - 8;  // yea...
+            // Rope tiles come after nope tiles
+
+            uint64_t kv_write_addr =
+                k_writer.get_shard_noc_addr(shard_id) + rope_offset_in_shard + tile_size * core_based_rope_offset;
+            DPRINT << "kv_write_addr: " << kv_write_addr << ENDL();
+            noc_async_write(l1_read_addr, kv_write_addr, tile_size);
             noc_async_write_barrier();
             cb_pop_front(krope_output_cb, krope_Wt);
         }
