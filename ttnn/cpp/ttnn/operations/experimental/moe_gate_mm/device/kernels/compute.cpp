@@ -12,6 +12,7 @@
 #include "top2.h"
 #include "top4.h"
 #include "top8.h"
+#include "enumerate.h"
 
 #include "compute_kernel_api/eltwise_unary/fill.h"
 #include "api/debug/dprint_tensix.h"
@@ -376,9 +377,15 @@ void kernel_main() {
     transpose_wh_init_short(cb_s2c_out);
     transpose_wh_tile(cb_s2c_out, 0, 0);
 
+    enumerate_tile_init();
+    enumerate_tile(0, false, 1.0f, 0.0f);
+    dprint_tensix_dest_reg(0);
+
     // Sum the top-2 of the output
     sum_top2_tile_init();
     sum_top2_tile(0);
+
+    dprint_tensix_dest_reg(0);
 
     tile_regs_commit();
 
@@ -408,6 +415,8 @@ void kernel_main() {
         // Get the group masks
         copy_tile_init(cb_w2c_in5);
         copy_tile(cb_w2c_in5, 0, 2);
+
+        dprint_tensix_dest_reg(2);
 
         // Get top 8 from adjusted scores, and mask them
         top8_tile_init();
@@ -439,8 +448,12 @@ void kernel_main() {
         //-------------------------------------------------------------------------
         // Top 4 groups for each token
         //-------------------------------------------------------------------------
+        dprint_tensix_dest_reg(0);
+
         top4_tile_init();
         top4_tile(0);
+
+        dprint_tensix_dest_reg(0);
 
         // Pack this out for other cores to get the group masks
         tile_regs_commit();

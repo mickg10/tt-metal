@@ -61,10 +61,7 @@ def create_torch_bias(L, N):
     """
     Create torch bias tensor.
     """
-    # torch_bias = torch.rand((L, N), dtype=torch.bfloat16) - 0.5
-    torch_bias = torch.rand((L, N), dtype=torch.bfloat16) - 5
-    # Add 1 for each "N" dimension.
-    torch_bias = torch_bias + 1 + 1 / 256 * torch.arange(N, dtype=torch.bfloat16).view(1, -1)
+    torch_bias = torch.rand((L, N), dtype=torch.bfloat16)
     return torch_bias
 
 

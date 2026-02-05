@@ -20,47 +20,39 @@ namespace ckernel {
 namespace sfpu {
 
 inline void _top2_configure_addrmod_() {
+    // TODO: No idea why we need this offset only when programming, but it works.
+    constexpr uint32_t ADDRMOD_OFFSET = 4;
+
     addr_mod_t{
-        .srca = {.incr = 0},
-        .srcb = {.incr = 0},
         .dest = {.incr = 0, .clr = 0, .cr = 0, .c_to_cr = 0},
     }
-        .set(ADDR_MOD_0);
+        .set(ADDRMOD_OFFSET + ADDR_MOD_0);
 
     addr_mod_t{
-        .srca = {.incr = 0},
-        .srcb = {.incr = 0},
-        .dest = {.incr = 2},
+        .dest = {.incr = 2, .clr = 0, .cr = 0, .c_to_cr = 0},
     }
-        .set(ADDR_MOD_1);
+        .set(ADDRMOD_OFFSET + ADDR_MOD_1);
 
     addr_mod_t{
-        .srca = {.incr = 0},
-        .srcb = {.incr = 0},
-        .dest = {.incr = 14},
+        .dest = {.incr = 14, .clr = 0, .cr = 0, .c_to_cr = 0},
     }
-        .set(ADDR_MOD_2);
+        .set(ADDRMOD_OFFSET + ADDR_MOD_2);
 
     addr_mod_t{
-        .srca = {.incr = 0},
-        .srcb = {.incr = 0},
-        .dest = {.incr = -14},
+        .dest = {.incr = -14, .clr = 0, .cr = 0, .c_to_cr = 0},
     }
-        .set(ADDR_MOD_3);
+        .set(ADDRMOD_OFFSET + ADDR_MOD_3);
 }
 
 inline void _top2_calculate_top2_() {
-    constexpr uint32_t NEG_INF_FP32 = 0xFF800000;
+    constexpr uint16_t NEG_INF_BF16 = 0xFF80;
 
     // Reset Dst RWC to 0
     TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
 
     // Initialize LREG0/1 with -infinity
-    TT_SFPLOADI(ckernel::p_sfpu::LREG0, sfpi::SFPLOADI_MOD0_UPPER, NEG_INF_FP32 >> 16);
-    TT_SFPLOADI(ckernel::p_sfpu::LREG0, sfpi::SFPLOADI_MOD0_LOWER, NEG_INF_FP32 & 0xFFFF);
-
-    TT_SFPLOADI(ckernel::p_sfpu::LREG1, sfpi::SFPLOADI_MOD0_UPPER, NEG_INF_FP32 >> 16);
-    TT_SFPLOADI(ckernel::p_sfpu::LREG1, sfpi::SFPLOADI_MOD0_LOWER, NEG_INF_FP32 & 0xFFFF);
+    TTI_SFPLOADI(ckernel::p_sfpu::LREG0, sfpi::SFPLOADI_MOD0_FLOATB, NEG_INF_BF16);
+    TTI_SFPLOADI(ckernel::p_sfpu::LREG1, sfpi::SFPLOADI_MOD0_FLOATB, NEG_INF_BF16);
 
     //-------------------------------------------------------------------------
     // Group 0
@@ -69,9 +61,9 @@ inline void _top2_calculate_top2_() {
     TTI_SFPTRANSP(0, 0, 0, 0);
     // Load 4 tile rows into LREG4-7
     TTI_SFPLOAD(p_sfpu::LREG4, InstrModLoadStore::FP16B, ADDR_MOD_1, 0);
-    TTI_SFPLOAD(p_sfpu::LREG5, InstrModLoadStore::FP16B, ADDR_MOD_2, 2);
-    TTI_SFPLOAD(p_sfpu::LREG6, InstrModLoadStore::FP16B, ADDR_MOD_1, 16);
-    TTI_SFPLOAD(p_sfpu::LREG7, InstrModLoadStore::FP16B, ADDR_MOD_3, 18);
+    TTI_SFPLOAD(p_sfpu::LREG5, InstrModLoadStore::FP16B, ADDR_MOD_2, 0);
+    TTI_SFPLOAD(p_sfpu::LREG6, InstrModLoadStore::FP16B, ADDR_MOD_1, 0);
+    TTI_SFPLOAD(p_sfpu::LREG7, InstrModLoadStore::FP16B, ADDR_MOD_3, 0);
     TTI_SFPTRANSP(0, 0, 0, 0);
 
     // Tournament on LREG4-7 to find top-2 of this batch
@@ -85,17 +77,21 @@ inline void _top2_calculate_top2_() {
     // Merge batch top-2 (LREG4/5) with running top-2 (LREG0/1)
     // After: LREG0 = max, LREG1 = 2nd max
     TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG4, p_sfpswap::ALL_ROWS_MAX);
-    TTI_SFPSWAP(0, p_sfpu::LREG1, p_sfpu::LREG4, p_sfpswap::ALL_ROWS_MAX);
     TTI_SFPSWAP(0, p_sfpu::LREG1, p_sfpu::LREG5, p_sfpswap::ALL_ROWS_MAX);
+    TTI_SFPSWAP(0, p_sfpu::LREG1, p_sfpu::LREG4, p_sfpswap::ALL_ROWS_MAX);
 
     //-------------------------------------------------------------------------
     lltt::replay(0, 14);  // Group 1
     lltt::replay(0, 14);  // Group 2
     lltt::replay(0, 14);  // Group 3
     //-------------------------------------------------------------------------
-    // Group 4
+    // We are now reading in bottom two faces
+    TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
+    TTI_STALLWAIT(p_stall::STALL_MATH, p_stall::WAIT_SFPU);
+
     lltt::record<lltt::Exec>(14, 6);
 
+    // Group 4
     TTI_SFPTRANSP(0, 0, 0, 0);
     // Load 4 tile rows into LREG4-7
     TTI_SFPLOAD(p_sfpu::LREG4, InstrModLoadStore::FP16B, ADDR_MOD_1, 32);

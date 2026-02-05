@@ -84,7 +84,7 @@ void kernel_main() {
     //-------------------------------------------------------------------------
     constexpr uint32_t COLLECTOR_CORE_ID = 7;
 
-    const uint32_t local_collector_addr = get_write_ptr(cb_w2c_in4);
+    const uint32_t local_collector_addr = 1024 + get_write_ptr(cb_w2c_in4);
     const uint64_t collector_dst_base_addr =
         get_noc_addr(collector_physical_x, collector_physical_y, local_collector_addr);
     const uint32_t collector_offset = core_id * out_tile_size;
@@ -234,7 +234,7 @@ void kernel_main() {
     // Collector core
     //-------------------------------------------------------------------------
     if (core_id == COLLECTOR_CORE_ID) {
-        // Rejig the group scores to be in the correct location -> where everyone else also puts it
+        // // Rejig the group scores to be in the correct location -> where everyone else also puts it
         auto src_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(local_group_score_src_addr1);
         auto dst_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(local_group_scores_dst_addr1);
         for (uint32_t i = 0; i < 8; i++) {

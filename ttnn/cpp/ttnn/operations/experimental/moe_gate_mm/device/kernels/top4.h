@@ -20,12 +20,28 @@ namespace ckernel {
 namespace sfpu {
 
 inline void _top4_configure_addrmod_() {
+    // TODO: No idea why we need this offset only when programming, but it works.
+    constexpr uint32_t ADDRMOD_OFFSET = 4;
+
     addr_mod_t{
-        .srca = {.incr = 0},
-        .srcb = {.incr = 0},
         .dest = {.incr = 0, .clr = 0, .cr = 0, .c_to_cr = 0},
     }
-        .set(ADDR_MOD_0);
+        .set(ADDRMOD_OFFSET + ADDR_MOD_0);
+
+    addr_mod_t{
+        .dest = {.incr = 2, .clr = 0, .cr = 0, .c_to_cr = 0},
+    }
+        .set(ADDRMOD_OFFSET + ADDR_MOD_1);
+
+    addr_mod_t{
+        .dest = {.incr = 6, .clr = 0, .cr = 0, .c_to_cr = 0},
+    }
+        .set(ADDRMOD_OFFSET + ADDR_MOD_2);
+
+    addr_mod_t{
+        .dest = {.incr = -6, .clr = 0, .cr = 0, .c_to_cr = 0},
+    }
+        .set(ADDRMOD_OFFSET + ADDR_MOD_3);
 }
 
 inline void _calculate_top4_() {
@@ -35,37 +51,37 @@ inline void _calculate_top4_() {
     //-------------------------------------------------------------------------
     // Step 1: Load BF16 values to HI 16 bits from offsets 0, 2, 8, 10 -> 4-3
     //-------------------------------------------------------------------------
-    TTI_SFPLOAD(p_sfpu::LREG0, InstrModLoadStore::FP16B, ADDR_MOD_0, 0);   // offset 0
-    TTI_SFPLOAD(p_sfpu::LREG1, InstrModLoadStore::FP16B, ADDR_MOD_0, 2);   // offset 2
-    TTI_SFPLOAD(p_sfpu::LREG2, InstrModLoadStore::FP16B, ADDR_MOD_0, 8);   // offset 8
-    TTI_SFPLOAD(p_sfpu::LREG3, InstrModLoadStore::FP16B, ADDR_MOD_0, 10);  // offset 10
+    TTI_SFPLOAD(p_sfpu::LREG0, InstrModLoadStore::FP16B, ADDR_MOD_1, 32);  // offset 0
+    TTI_SFPLOAD(p_sfpu::LREG1, InstrModLoadStore::FP16B, ADDR_MOD_2, 32);  // offset 2
+    TTI_SFPLOAD(p_sfpu::LREG2, InstrModLoadStore::FP16B, ADDR_MOD_1, 32);  // offset 8
+    TTI_SFPLOAD(p_sfpu::LREG3, InstrModLoadStore::FP16B, ADDR_MOD_3, 32);  // offset 10
 
     //-------------------------------------------------------------------------
     // Step 2: Load BF16 values to HI 16 bits from offsets 4, 6, 12, 14 -> LREG4-7
     //-------------------------------------------------------------------------
-    TTI_SFPLOAD(p_sfpu::LREG4, InstrModLoadStore::FP16B, ADDR_MOD_0, 4);   // offset 4
-    TTI_SFPLOAD(p_sfpu::LREG5, InstrModLoadStore::FP16B, ADDR_MOD_0, 6);   // offset 6
-    TTI_SFPLOAD(p_sfpu::LREG6, InstrModLoadStore::FP16B, ADDR_MOD_0, 12);  // offset 12
-    TTI_SFPLOAD(p_sfpu::LREG7, InstrModLoadStore::FP16B, ADDR_MOD_0, 14);  // offset 14
+    TTI_SFPLOAD(p_sfpu::LREG4, InstrModLoadStore::FP16B, ADDR_MOD_1, 32);  // offset 4
+    TTI_SFPLOAD(p_sfpu::LREG5, InstrModLoadStore::FP16B, ADDR_MOD_2, 32);  // offset 6
+    TTI_SFPLOAD(p_sfpu::LREG6, InstrModLoadStore::FP16B, ADDR_MOD_1, 32);  // offset 12
+    TTI_SFPLOAD(p_sfpu::LREG7, InstrModLoadStore::FP16B, ADDR_MOD_3, 32);  // offset 14
 
     //-------------------------------------------------------------------------
     // Step 3: Transpose
     // After transpose: each LREG has 32 lanes with data from 32 different tokens
-    // Now all lanes in LREG0 are from group 0, LREG1 from group 1, etc.
+    // Now all lanes in LREG0 are from core 0, LREG1 from core 1, etc.
     //-------------------------------------------------------------------------
     TTI_SFPTRANSP(0, 0, 0, 0);
 
     //-------------------------------------------------------------------------
-    // Step 4: Fuse expert indices (0-7) into LO 16 bits of each LREG
+    // Step 4: Fuse core indices (0-7) into LO 16 bits of each LREG
     //-------------------------------------------------------------------------
-    TT_SFPLOADI(ckernel::p_sfpu::LREG0, sfpi::SFPLOADI_MOD0_LOWER, 0);  // Expert index 0
-    TT_SFPLOADI(ckernel::p_sfpu::LREG1, sfpi::SFPLOADI_MOD0_LOWER, 1);  // Expert index 1
-    TT_SFPLOADI(ckernel::p_sfpu::LREG2, sfpi::SFPLOADI_MOD0_LOWER, 2);  // Expert index 2
-    TT_SFPLOADI(ckernel::p_sfpu::LREG3, sfpi::SFPLOADI_MOD0_LOWER, 3);  // Expert index 3
-    TT_SFPLOADI(ckernel::p_sfpu::LREG4, sfpi::SFPLOADI_MOD0_LOWER, 4);  // Expert index 4
-    TT_SFPLOADI(ckernel::p_sfpu::LREG5, sfpi::SFPLOADI_MOD0_LOWER, 5);  // Expert index 5
-    TT_SFPLOADI(ckernel::p_sfpu::LREG6, sfpi::SFPLOADI_MOD0_LOWER, 6);  // Expert index 6
-    TT_SFPLOADI(ckernel::p_sfpu::LREG7, sfpi::SFPLOADI_MOD0_LOWER, 7);  // Expert index 7
+    TTI_SFPLOADI(ckernel::p_sfpu::LREG0, sfpi::SFPLOADI_MOD0_LOWER, 0);  // core index 0
+    TTI_SFPLOADI(ckernel::p_sfpu::LREG1, sfpi::SFPLOADI_MOD0_LOWER, 1);  // core index 1
+    TTI_SFPLOADI(ckernel::p_sfpu::LREG2, sfpi::SFPLOADI_MOD0_LOWER, 2);  // core index 2
+    TTI_SFPLOADI(ckernel::p_sfpu::LREG3, sfpi::SFPLOADI_MOD0_LOWER, 3);  // core index 3
+    TTI_SFPLOADI(ckernel::p_sfpu::LREG4, sfpi::SFPLOADI_MOD0_LOWER, 4);  // core index 4
+    TTI_SFPLOADI(ckernel::p_sfpu::LREG5, sfpi::SFPLOADI_MOD0_LOWER, 5);  // core index 5
+    TTI_SFPLOADI(ckernel::p_sfpu::LREG6, sfpi::SFPLOADI_MOD0_LOWER, 6);  // core index 6
+    TTI_SFPLOADI(ckernel::p_sfpu::LREG7, sfpi::SFPLOADI_MOD0_LOWER, 7);  // core index 7
 
     //-------------------------------------------------------------------------
     // Step 5: Bubble sort to extract top 4 values into LREG0-3

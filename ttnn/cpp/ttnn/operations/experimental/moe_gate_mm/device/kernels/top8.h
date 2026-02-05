@@ -34,12 +34,28 @@ namespace sfpu {
 //-----------------------------------------------------------------------------
 
 inline void _top8_configure_addrmod_() {
+    // TODO: No idea why we need this offset only when programming, but it works.
+    constexpr uint32_t ADDRMOD_OFFSET = 4;
+
     addr_mod_t{
-        .srca = {.incr = 0},
-        .srcb = {.incr = 0},
-        .dest = {.incr = 0},
+        .dest = {.incr = 0, .clr = 0, .cr = 0, .c_to_cr = 0},
     }
-        .set(ADDR_MOD_0);
+        .set(ADDRMOD_OFFSET + ADDR_MOD_0);
+
+    addr_mod_t{
+        .dest = {.incr = 2, .clr = 0, .cr = 0, .c_to_cr = 0},
+    }
+        .set(ADDRMOD_OFFSET + ADDR_MOD_1);
+
+    addr_mod_t{
+        .dest = {.incr = 14, .clr = 0, .cr = 0, .c_to_cr = 0},
+    }
+        .set(ADDRMOD_OFFSET + ADDR_MOD_2);
+
+    addr_mod_t{
+        .dest = {.incr = -14, .clr = 0, .cr = 0, .c_to_cr = 0},
+    }
+        .set(ADDRMOD_OFFSET + ADDR_MOD_3);
 }
 
 inline void _bitonic_sort_8_swaps_() {
@@ -127,14 +143,14 @@ inline void _load_input_group_(uint32_t tile, uint32_t half, uint32_t grp) {
 
     // Fuse expert indices into LO16 bits
     uint32_t idx = tile * 32 + half * 16 + grp * 8;
-    TT_SFPLOADI(p_sfpu::LREG0, sfpi::SFPLOADI_MOD0_LOWER, idx + 0);
-    TT_SFPLOADI(p_sfpu::LREG1, sfpi::SFPLOADI_MOD0_LOWER, idx + 1);
-    TT_SFPLOADI(p_sfpu::LREG2, sfpi::SFPLOADI_MOD0_LOWER, idx + 2);
-    TT_SFPLOADI(p_sfpu::LREG3, sfpi::SFPLOADI_MOD0_LOWER, idx + 3);
-    TT_SFPLOADI(p_sfpu::LREG4, sfpi::SFPLOADI_MOD0_LOWER, idx + 4);
-    TT_SFPLOADI(p_sfpu::LREG5, sfpi::SFPLOADI_MOD0_LOWER, idx + 5);
-    TT_SFPLOADI(p_sfpu::LREG6, sfpi::SFPLOADI_MOD0_LOWER, idx + 6);
-    TT_SFPLOADI(p_sfpu::LREG7, sfpi::SFPLOADI_MOD0_LOWER, idx + 7);
+    TT_SFPLOADI(p_sfpu::LREG0, sfpi::SFPLOADI_MOD0_FLOATB, idx + 0);
+    TT_SFPLOADI(p_sfpu::LREG1, sfpi::SFPLOADI_MOD0_FLOATB, idx + 1);
+    TT_SFPLOADI(p_sfpu::LREG2, sfpi::SFPLOADI_MOD0_FLOATB, idx + 2);
+    TT_SFPLOADI(p_sfpu::LREG3, sfpi::SFPLOADI_MOD0_FLOATB, idx + 3);
+    TT_SFPLOADI(p_sfpu::LREG4, sfpi::SFPLOADI_MOD0_FLOATB, idx + 4);
+    TT_SFPLOADI(p_sfpu::LREG5, sfpi::SFPLOADI_MOD0_FLOATB, idx + 5);
+    TT_SFPLOADI(p_sfpu::LREG6, sfpi::SFPLOADI_MOD0_FLOATB, idx + 6);
+    TT_SFPLOADI(p_sfpu::LREG7, sfpi::SFPLOADI_MOD0_FLOATB, idx + 7);
 }
 
 // Store sorted group back to tile layout
