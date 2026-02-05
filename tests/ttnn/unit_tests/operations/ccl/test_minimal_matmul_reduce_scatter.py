@@ -435,6 +435,8 @@ def run_reduce_scatter_galaxy_impl(
     num_devices,
     mesh_shape,
     rs_input_shape,
+    height_shard_dim,
+    width_shard_dim,
     mm_shard_dim,
     rs_scatter_dim,
     num_links,
@@ -458,6 +460,11 @@ def run_reduce_scatter_galaxy_impl(
 
     tile = (32, 32)
 
+    width_axis = 1
+    height_axis = 0
+
+    width_devices = mesh_shape[width_axis]
+    height_devices = mesh_shape[height_axis]
     # Set the default config
     if mem_config_weights is None:
         mem_config_weights = mem_config_rs
@@ -498,7 +505,7 @@ def run_reduce_scatter_galaxy_impl(
         for _ in range(num_iters)
     ]
     rs_output_shape = rs_input_shape[:]
-    rs_output_shape[3] //= num_devices
+    rs_output_shape[3] //= width_devices
     persistent_output_buffers = [None for _ in range(num_iters)]
     logger.info("Done creating persistent buffers")
 
@@ -515,7 +522,7 @@ def run_reduce_scatter_galaxy_impl(
         memory_config=mem_config_weights,
         mesh_mapper=ttnn.ShardTensor2dMesh(
             mesh_device,
-            dims=(None, mm_shard_dim),
+            dims=(height_shard_dim, mm_shard_dim),
             mesh_shape=mesh_shape,
         ),
     )
@@ -536,22 +543,8 @@ def run_reduce_scatter_galaxy_impl(
         bias_tt = None
 
     ##### Configs for ttnn.matmul #####
-    core_grid = (8, 6)
-    in0_block_w = min(max_in0_block_w, mm_weights_shape[2] // num_devices // 32 // core_grid[0])
-    per_core_M = max(1, math.ceil(rs_input_shape[2] / 32 / core_grid[1]))
-    per_core_N = max(1, math.ceil(rs_input_shape[3] / 32 / core_grid[0]))
-    program_config = ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
-        compute_with_storage_grid_size=core_grid,
-        in0_block_w=in0_block_w,
-        out_subblock_h=1,
-        out_subblock_w=1,
-        per_core_M=per_core_M,
-        per_core_N=per_core_N,
-        out_block_w=per_core_N // 2,
-        transpose_mcast=False,
-        fused_activation=None,
-        fuse_batch=False,
-    )
+    core_grid = (7, 5)
+
     compute_kernel_config = ttnn.WormholeComputeKernelConfig(
         math_fidelity=ttnn.MathFidelity.HiFi2,
         math_approx_mode=True,
@@ -590,7 +583,7 @@ def run_reduce_scatter_galaxy_impl(
             memory_config=mem_config_input,
             mesh_mapper=ttnn.ShardTensor2dMesh(
                 mesh_device,
-                dims=(None, 3),
+                dims=(height_shard_dim, width_shard_dim),
                 mesh_shape=mesh_shape,
             ),
         )
@@ -725,7 +718,7 @@ def run_reduce_scatter_galaxy_impl(
 
 
 @pytest.mark.parametrize(
-    "num_devices, mesh_shape, num_links, mm_weights_shape, rs_input_shape, mm_shard_dim, rs_scatter_dim, layout, max_in0_block_w, matmul_weights_dtype, rs_input_dtype, use_bias",
+    "num_devices, mesh_shape, num_links, mm_weights_shape, rs_input_shape, height_shard_dim, width_shard_dim, rs_scatter_dim, layout, max_in0_block_w, matmul_weights_dtype, rs_input_dtype, use_bias",
     [
         (
             32,
@@ -745,22 +738,8 @@ def run_reduce_scatter_galaxy_impl(
             32,
             (8, 4),
             1,
-            [1, 1, 10240, 2560],
-            [1, 1, 4096, 2560],
-            2,
-            3,
-            ttnn.TILE_LAYOUT,
-            5,
-            ttnn.bfloat16,
-            ttnn.bfloat16,
-            True,
-        ),
-        (
-            32,
-            (8, 4),
-            1,
             [1, 1, 2048, 1024],
-            [1, 1, 32768, 1024],
+            [8, 1, 32768, 1024],
             2,
             3,
             ttnn.TILE_LAYOUT,
@@ -770,7 +749,7 @@ def run_reduce_scatter_galaxy_impl(
             True,
         ),
     ],
-    ids=["10240_batch_8_galaxy", "10240_batch_1_galaxy", "32768_batch_1_galaxy"],
+    ids=["10240_batch_8_galaxy", "32768_batch_8_galaxy"],
 )
 @pytest.mark.parametrize(
     "mem_config_input, mem_config_mm, mem_config_rs",
@@ -808,7 +787,8 @@ def test_reduce_scatter_async_galaxy(
     num_links,
     mm_weights_shape,
     rs_input_shape,
-    mm_shard_dim,
+    height_shard_dim,
+    width_shard_dim,
     rs_scatter_dim,
     layout,
     use_bias,
@@ -827,7 +807,8 @@ def test_reduce_scatter_async_galaxy(
         num_devices,
         mesh_shape,
         rs_input_shape,
-        mm_shard_dim,
+        height_shard_dim,
+        width_shard_dim,
         rs_scatter_dim,
         num_links,
         mm_weights_shape,
