@@ -480,11 +480,10 @@ def test_pre_sdpa(device, epsilon, use_fp32, position_id):
 
     ttnn_kv_cache = ttnn.from_torch(
         torch_kv_cache,
-        dtype=ttnn.bfloat16,
+        dtype=ttnn.bfloat8_b,
         layout=ttnn.TILE_LAYOUT,
         device=device,
         memory_config=kv_mem_config,
-        tile=tile,
     )
 
     # ========================================================================
@@ -565,14 +564,34 @@ def test_pre_sdpa(device, epsilon, use_fp32, position_id):
     # Read back from kv cache tensor in DRAM to check PCC
     torch_kv_cache = ttnn.to_torch(ttnn_kv_cache)
     compare_kv_cache = torch_kv_cache[:, :, position_id, :]
-    print(" compare kv cache ", compare_kv_cache)
-    max_diff = torch.max(torch.abs(torch_kv_cache_expected - compare_kv_cache)).item()
-    mean_diff = torch.mean(torch.abs(torch_kv_cache_expected - compare_kv_cache)).item()
-    logger.info(f"KV Cache absolute difference: {max_diff}")
-    logger.info(f"KV Cache mean absolute difference: {mean_diff}")
 
-    passing, pcc_message = comp_pcc(compare_kv_cache, torch_kv_cache_expected, 0.98)
-    logger.info(f"KV Cache PCC: {pcc_message}")
-    assert passing, pcc_message
+    # Split into nope (first 512 elements) and rope (last 64 elements)
+    nope_dim = 512
+    rope_dim = 64
+
+    compare_nope = compare_kv_cache[..., :nope_dim]
+    compare_rope = compare_kv_cache[..., nope_dim:]
+    expected_nope = torch_kv_cache_expected[..., :nope_dim]
+    expected_rope = torch_kv_cache_expected[..., nope_dim:]
+
+    # Check nope portion
+    nope_max_diff = torch.max(torch.abs(expected_nope - compare_nope)).item()
+    nope_mean_diff = torch.mean(torch.abs(expected_nope - compare_nope)).item()
+    logger.info(f"KV Cache NOPE absolute difference: {nope_max_diff}")
+    logger.info(f"KV Cache NOPE mean absolute difference: {nope_mean_diff}")
+    nope_passing, nope_pcc_message = comp_pcc(compare_nope, expected_nope, 0.98)
+    logger.info(f"KV Cache NOPE PCC: {nope_pcc_message}")
+
+    # Check rope portion
+    rope_max_diff = torch.max(torch.abs(expected_rope - compare_rope)).item()
+    rope_mean_diff = torch.mean(torch.abs(expected_rope - compare_rope)).item()
+    logger.info(f"KV Cache ROPE absolute difference: {rope_max_diff}")
+    logger.info(f"KV Cache ROPE mean absolute difference: {rope_mean_diff}")
+    rope_passing, rope_pcc_message = comp_pcc(compare_rope, expected_rope, 0.98)
+    logger.info(f"KV Cache ROPE PCC: {rope_pcc_message}")
+    print(compare_kv_cache)
+
+    assert nope_passing, f"KV Cache NOPE verification failed: {nope_pcc_message}"
+    assert rope_passing, f"KV Cache ROPE verification failed: {rope_pcc_message}"
 
     logger.info("✓ PreSDPA test passed!")
