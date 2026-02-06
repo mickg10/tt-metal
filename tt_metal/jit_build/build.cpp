@@ -465,6 +465,7 @@ void JitBuildState::compile_one(
     }
 
     std::string log_file = out_dir + obj + ".log";
+    log_info(tt::LogMetal, "log_file: {}", log_file);
     fs::remove(log_file);
     if (!tt::jit_build::utils::run_command(cmd, log_file, false)) {
         build_failure(this->target_name_, "compile", cmd, log_file);
@@ -479,9 +480,13 @@ bool JitBuildState::need_compile(const string& out_dir, const string& obj) const
 
 size_t JitBuildState::compile(const string& out_dir, const JitBuildSettings* settings) const {
     // ZoneScoped;
+    log_info(tt::LogMetal, "compile() out_dir: {}", out_dir);
     std::vector<std::shared_future<void>> events;
     for (size_t i = 0; i < this->srcs_.size(); ++i) {
         if (need_compile(out_dir, this->objs_[i])) {
+            log_info(tt::LogMetal, "i: {}", i);
+            log_info(tt::LogMetal, "srcs_[i]: {}", this->srcs_[i]);
+            log_info(tt::LogMetal, "objs_[i]: {}", this->objs_[i]);
             launch_build_step(
                 [this, &out_dir, settings, i] { this->compile_one(out_dir, settings, this->srcs_[i], this->objs_[i]); },
                 events);
@@ -675,6 +680,7 @@ void jit_build(const JitBuildState& build, const JitBuildSettings* settings) {
 }
 
 void jit_build_subset(JitBuildStateSubset build_subset, const JitBuildSettings* settings) {
+    log_info(tt::LogMetal, "jit_build_subset()");
     std::vector<std::shared_future<void>> events;
     for (const auto& build : build_subset) {
         // Capture the necessary objects by reference

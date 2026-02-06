@@ -102,6 +102,7 @@ void write_dependency_hashes(
 }
 
 void write_dependency_hashes(const std::string& out_dir, const std::string& obj) {
+    log_info(tt::LogMetal, "write_dependency_hashes() out_dir: {} obj: {}", out_dir, obj);
     std::filesystem::path obj_path = std::filesystem::path(out_dir) / obj;
     std::filesystem::path dep_path = obj_path;
     dep_path.replace_extension(".d");
