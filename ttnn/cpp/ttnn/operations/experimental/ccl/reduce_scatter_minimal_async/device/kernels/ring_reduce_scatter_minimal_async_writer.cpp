@@ -475,6 +475,7 @@ void kernel_main() {
         noc_semaphore_inc(dest_addr, 1);
         noc_async_atomic_barrier();
     }
+    DPRINT << " Finished reduce scatter matmul " << ENDL();
 
     noc_async_write_barrier();
 }

@@ -292,12 +292,10 @@ void kernel_main() {
                 }
             }
         }
-        DPRINT << " Completed all N blocks for M block iteration " << m_block_iter << ENDL();
 #ifdef FUSE_RS
         noc_async_write_barrier();
         op_signaler.synchronize_workers_and_signal_op(0);
 #endif
-        DPRINT << " Signalled workers in iter " << m_block_iter << ENDL();
     }
 
     noc_async_write_barrier();

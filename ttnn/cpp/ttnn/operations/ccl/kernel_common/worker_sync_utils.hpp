@@ -30,14 +30,14 @@ FORCE_INLINE void master_sync_slaves(
     if (num_workers_to_sync > 1) {
         master_l1_semaphore_addr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(worker_sync_sem_addr);
         noc_semaphore_wait(master_l1_semaphore_addr, num_workers_to_sync - 1);
-        DPRINT << "MASTER SYNCED WITH SLAVES" << ENDL();
+        // DPRINT << "MASTER SYNCED WITH SLAVES" << ENDL();
     }
 
     // Send signal to op
     if (mcast_signal_op_cores) {
         for (uint32_t i = 0; i < num_fused_op_cores_to_signal; i++) {
-            DPRINT << "MASTER SIGNALING REMOTE Core " << fused_op_cores_noc_coords[i * 2] << " ,"
-                   << fused_op_cores_noc_coords[i * 2 + 1] << " at sem addr " << fused_op_sem_addr << ENDL();
+            // DPRINT << "MASTER SIGNALING REMOTE Core " << fused_op_cores_noc_coords[i * 2] << " ,"
+            //        << fused_op_cores_noc_coords[i * 2 + 1] << " at sem addr " << fused_op_sem_addr << ENDL();
             uint64_t remote_fused_op_l1_semaphore_addr =
                 get_noc_addr(fused_op_cores_noc_coords[i * 2], fused_op_cores_noc_coords[i * 2 + 1], fused_op_sem_addr);
             noc_semaphore_inc(remote_fused_op_l1_semaphore_addr, 1);
@@ -49,7 +49,7 @@ FORCE_INLINE void master_sync_slaves(
             fused_op_sem_addr);
         noc_semaphore_inc(remote_fused_op_l1_semaphore_addr, 1);
     }
-    DPRINT << "MASTER SIGNALED REMOTE OP" << ENDL();
+    // DPRINT << "MASTER SIGNALED REMOTE OP" << ENDL();
 
     if (num_workers_to_sync > 1) {
         // Clear the master semaphore, so that it can be used again

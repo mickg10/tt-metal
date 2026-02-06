@@ -52,7 +52,6 @@ void kernel_main() {
     const uint32_t start_row_offset = get_arg_val<uint32_t>(arg_idx++);
 
     constexpr uint32_t ct_idx = 16;
-    DPRINT << "Ring Reduce Scatter Minimal Async Reader Kernel Started on Chip " << my_chip_id << ENDL();
 #ifdef INPUT_IS_SHARDED
     constexpr uint32_t ct_offset = 7;
 
@@ -111,17 +110,13 @@ void kernel_main() {
     for (uint32_t b = 0; b < input_tensor_B; b++) {
         if constexpr (fuse_op) {
 #ifdef FUSED_MINIMAL_MATMUL
-            DPRINT << "Waiting for minimal matmul batch " << b << ENDL();
+            int max_b_blocks = FUSED_MINIMAL_MATMUL_M_NUM_BLOCKS;
             // Minimal matmul does deferred writes on the output. So we need to wait for an extra batch to be completed
             // before reading, to ensure that the entire input to reduce_scatter has been written.
-            matmul_receiver.wait_for_matmul_batch(std::min(b + 1, input_tensor_B - 1));
-            DPRINT << "Got minimal matmul batch " << b << ENDL();
+            matmul_receiver.wait_for_matmul_batch(std::min<int>(b + 1, max_b_blocks - 1));
 
 #else
-            DPRINT << "Waiting for matmul batch " << b << ENDL();
             matmul_receiver.wait_for_matmul_batch(b);
-            DPRINT << "Got matmul batch " << b << ENDL();
-
 #endif
         }
         int slice_idx = direction ? my_chip_id - 1 : my_chip_id + 1;
@@ -133,6 +128,7 @@ void kernel_main() {
         // Then reduce those two CB's, and push that to cb_output_id
         // If slices_forwarded in writer is 7, we don't forward anymore and write it to output_buffer
         // Otherwise, the writer will write cb_output_id to the next chip in the forward direction
+
         for (uint32_t i = 0; i < ring_size; ++i) {
             const bool do_reduce = i != 0;
             uint32_t cb_in0 = do_reduce ? cb_input_id : cb_reader_output_id;
@@ -158,6 +154,7 @@ void kernel_main() {
             } else {
                 ASSERT(false);
             }
+
             chunk_count = 0;
             for (uint32_t c = 0; c < slice_C; ++c) {
                 uint32_t input_pages_read_in_row = start_pages_read_in_row;
