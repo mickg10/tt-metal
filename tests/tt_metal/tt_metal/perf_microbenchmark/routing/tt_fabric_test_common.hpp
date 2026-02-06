@@ -23,6 +23,7 @@
 #include <tt-metalium/tt_metal.hpp>
 #include <tt-metalium/distributed.hpp>
 #include <tt-metalium/system_mesh.hpp>
+#include "cluster.hpp"
 #include "tt_align.hpp"
 #include "tt_metal/test_utils/env_vars.hpp"
 
@@ -32,6 +33,7 @@
 #include "tt_fabric_test_common_types.hpp"
 #include "tt_metal/distributed/fd_mesh_command_queue.hpp"
 #include "tt_metal/distributed/mesh_device_impl.hpp"
+#include "tt_stl/assert.hpp"
 
 using MeshDevice = tt::tt_metal::distributed::MeshDevice;
 using MeshCoordinate = tt::tt_metal::distributed::MeshCoordinate;
@@ -845,35 +847,28 @@ public:
         const auto device_ids = get_global_node_ids();
         std::vector<std::pair<FabricNodeId, FabricNodeId>> pairs;
 
-        // To support device meshes that do not have wraparound connections, Ring topology is handled separately
-        if (topology_ != Topology::Ring) {
-            // Handle mesh, torus, neighbor exchange and linear topologies with directional neighbors
-            const std::vector<RoutingDirection> directions = {
-                RoutingDirection::N, RoutingDirection::S, RoutingDirection::E, RoutingDirection::W};
+        const auto& cluster = tt::tt_metal::MetalContext::instance().get_cluster().get_cluster_type();
+        // Galaxy machines support Ring/Torus topologies
+        if (cluster == tt::tt_metal::ClusterType::GALAXY || cluster == tt::tt_metal::ClusterType::BLACKHOLE_GALAXY) {
+            if (topology_ == Topology::Ring || topology_ == Topology::Torus) {
+                // Handle mesh, torus, neighbor exchange and linear topologies with directional neighbors
+                const std::vector<RoutingDirection> directions = {
+                    RoutingDirection::N, RoutingDirection::S, RoutingDirection::E, RoutingDirection::W};
 
-            for (const auto& src_node : device_ids) {
-                for (const auto& direction : directions) {
-                    // Check if neighbor exists in this direction
-                    const auto& neighbors =
-                        tt::tt_metal::MetalContext::instance().get_control_plane().get_chip_neighbors(
-                            src_node, direction);
+                for (const auto& src_node : device_ids) {
+                    for (const auto& direction : directions) {
+                        const auto src_coord = get_device_coord(src_node);
+                        const auto& neighbor_coord = src_coord.get_neighbor(
+                            mesh_shape_,
+                            get_step_for_direction(direction),
+                            get_dim_for_direction(direction),
+                            get_boundary_mode_for_dimension(get_dim_for_direction(direction)));
 
-                    if (!neighbors.empty()) {
-                        // Get the first (and should be only) neighbor mesh
-                        auto neighbor_mesh_it = neighbors.begin();
-                        const auto& neighbor_chips = neighbor_mesh_it->second;
-
-                        if (!neighbor_chips.empty()) {
-                            // Get the first (and should be only) neighbor chip
-                            FabricNodeId neighbor(neighbor_mesh_it->first, neighbor_chips[0]);
+                        if (neighbor_coord.has_value()) {
+                            FabricNodeId neighbor = get_fabric_node_id(neighbor_coord.value());
 
                             // Only add if neighbor exists and is different from source
                             bool is_valid_neighbor = (neighbor != src_node);
-
-                            // For linear topology, also check if devices are on the same line
-                            if (topology_ == Topology::Linear) {
-                                is_valid_neighbor &= are_devices_linear({src_node, neighbor});
-                            }
 
                             if (is_valid_neighbor) {
                                 pairs.emplace_back(src_node, neighbor);
@@ -881,25 +876,103 @@ public:
                         }
                     }
                 }
-            }
-        } else {
-            // If a Ring topology is used, only the devices on the perimeter of a mesh participate in the test.
-            // Instead of using physical wraparound connections, a large "ring" is formed with the perimeter devices, as
-            // is enforced by the get_wrap_around_mesh_ring_neighbors function.
-            for (const auto& src_node : device_ids) {
-                auto ring_neighbors = get_wrap_around_mesh_ring_neighbors(src_node, device_ids);
-                if (ring_neighbors.has_value()) {
-                    auto [forward_neighbor, backward_neighbor] = ring_neighbors.value();
-                    if (forward_neighbor != src_node) {
-                        pairs.emplace_back(src_node, forward_neighbor);
-                    }
-                    if (backward_neighbor != src_node) {
-                        pairs.emplace_back(src_node, backward_neighbor);
+            } else {
+                // Handle mesh, torus, neighbor exchange and linear topologies with directional neighbors
+                const std::vector<RoutingDirection> directions = {
+                    RoutingDirection::N, RoutingDirection::S, RoutingDirection::E, RoutingDirection::W};
+
+                for (const auto& src_node : device_ids) {
+                    for (const auto& direction : directions) {
+                        // Check if neighbor exists in this direction
+                        const auto& neighbors =
+                            tt::tt_metal::MetalContext::instance().get_control_plane().get_chip_neighbors(
+                                src_node, direction);
+
+                        if (!neighbors.empty()) {
+                            // Get the first (and should be only) neighbor mesh
+                            auto neighbor_mesh_it = neighbors.begin();
+                            const auto& neighbor_chips = neighbor_mesh_it->second;
+
+                            if (!neighbor_chips.empty()) {
+                                // Get the first (and should be only) neighbor chip
+                                FabricNodeId neighbor(neighbor_mesh_it->first, neighbor_chips[0]);
+
+                                // Only add if neighbor exists and is different from source
+                                bool is_valid_neighbor = (neighbor != src_node);
+
+                                // For linear topology, also check if devices are on the same line
+                                if (topology_ == Topology::Linear) {
+                                    is_valid_neighbor &= are_devices_linear({src_node, neighbor});
+                                }
+
+                                if (is_valid_neighbor) {
+                                    pairs.emplace_back(src_node, neighbor);
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
+        // Use special 1D ring for T3K which does not support 2D Ring/Torus
+        else if (cluster == tt::tt_metal::ClusterType::T3K) {
+            // To support device meshes that do not have wraparound connections, Ring topology is handled separately
+            if (topology_ != Topology::Ring) {
+                // Handle mesh, torus, neighbor exchange and linear topologies with directional neighbors
+                const std::vector<RoutingDirection> directions = {
+                    RoutingDirection::N, RoutingDirection::S, RoutingDirection::E, RoutingDirection::W};
 
+                for (const auto& src_node : device_ids) {
+                    for (const auto& direction : directions) {
+                        // Check if neighbor exists in this direction
+                        const auto& neighbors =
+                            tt::tt_metal::MetalContext::instance().get_control_plane().get_chip_neighbors(
+                                src_node, direction);
+
+                        if (!neighbors.empty()) {
+                            // Get the first (and should be only) neighbor mesh
+                            auto neighbor_mesh_it = neighbors.begin();
+                            const auto& neighbor_chips = neighbor_mesh_it->second;
+
+                            if (!neighbor_chips.empty()) {
+                                // Get the first (and should be only) neighbor chip
+                                FabricNodeId neighbor(neighbor_mesh_it->first, neighbor_chips[0]);
+
+                                // Only add if neighbor exists and is different from source
+                                bool is_valid_neighbor = (neighbor != src_node);
+
+                                // For linear topology, also check if devices are on the same line
+                                if (topology_ == Topology::Linear) {
+                                    is_valid_neighbor &= are_devices_linear({src_node, neighbor});
+                                }
+
+                                if (is_valid_neighbor) {
+                                    pairs.emplace_back(src_node, neighbor);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // If a Ring topology is used, only the devices on the perimeter of a mesh participate in the test.
+                // Instead of using physical wraparound connections, a large "ring" is formed with the perimeter
+                // devices, as is enforced by the get_wrap_around_mesh_ring_neighbors function.
+                for (const auto& src_node : device_ids) {
+                    auto ring_neighbors = get_wrap_around_mesh_ring_neighbors(src_node, device_ids);
+                    if (ring_neighbors.has_value()) {
+                        auto [forward_neighbor, backward_neighbor] = ring_neighbors.value();
+                        if (forward_neighbor != src_node) {
+                            pairs.emplace_back(src_node, forward_neighbor);
+                        }
+                        if (backward_neighbor != src_node) {
+                            pairs.emplace_back(src_node, backward_neighbor);
+                        }
+                    }
+                }
+            }
+        } else {
+            TT_THROW("Unsupported metal context {}", cluster);
+        }
         return pairs;
     }
 

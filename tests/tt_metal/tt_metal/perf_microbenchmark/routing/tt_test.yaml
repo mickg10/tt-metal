@@ -1,0 +1,19 @@
+Tests:
+  - name: "SequentialNeighborExchangeLatency"
+    latency_test_mode: true
+
+    fabric_setup:
+      # topology: Linear
+      topology: Ring
+      torus_config: XY
+
+
+
+    defaults:
+      ftype: unicast
+      num_packets: 1
+      size: 4096
+      ntype: unicast_write
+
+    patterns:
+      - type: sequential_neighbor_exchange

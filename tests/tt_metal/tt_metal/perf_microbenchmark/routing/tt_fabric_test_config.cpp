@@ -1121,7 +1121,6 @@ std::vector<TestConfig> TestConfigBuilder::expand_high_level_patterns(ParsedTest
                     num_pairs,
                     p_config.name);
             }
-
         }
     }
 
