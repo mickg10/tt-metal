@@ -7,6 +7,8 @@ from __future__ import annotations
 from types import NoneType
 from typing import TYPE_CHECKING, Any
 
+from loguru import logger
+
 import ttnn
 
 if TYPE_CHECKING:
@@ -40,17 +42,17 @@ class Tracer:
         """Capture or execute trace.
 
         On the first call, runs the wrapped function twice, once to compile, and once to capture the
-        trace. On subsequent calls, executes the captured trace.
+        trace. On subsequent calls, executes the captured trace. On the first call, inputs are used
+        to initialize the trace inputs. On subsequent calls, they are used to update the trace
+        inputs. Only tensor inputs can be changed. Aside from omitting positional inputs to reuse
+        previous values, a value of `None` can be passed to reuse the previous value for tensor
+        inputs as well.
 
         Args:
             tracer_cq_id: Command queue id.
             tracer_blocking_execution: Whether `ttnn.execute_trace` should block.
-            *args: Positional inputs to pass to the wrapped function. On the first call, these are
-                   used to initialize the trace inputs. On subsequent calls, these are used to
-                   update the trace inputs. Only tensor inputs can be changed.
-            **kwargs: Named inputs to pass to the wrapped function. On the first call, these are
-                      used to initialize the trace inputs. On subsequent calls, these are optional
-                      and used to update the trace inputs. Only tensor inputs can be changed.
+            *args: Positional inputs to pass to the wrapped function.
+            **kwargs: Named inputs to pass to the wrapped function. Optional on subsequent calls.
 
         Returns:
             The outputs of the wrapped function.
@@ -68,7 +70,12 @@ class Tracer:
             # compile
             self._function(*self._args, **self._kwargs)
 
+            # Run once more before capture. "Stable Diffusion 3.5 Large" produces completely
+            # glitched pictures if this is not done.
+            self._function(*self._args, **self._kwargs)
+
             # capture trace
+            logger.debug("capturing trace...")
             trace_id = ttnn.begin_trace_capture(self._device, cq_id=tracer_cq_id)
             try:
                 try:
@@ -122,6 +129,9 @@ class Tracer:
         raise ValueError(msg)
 
     def _update_input(self, prev: Any, new: Any, *, path_label: str) -> None:
+        if new is None and isinstance(prev, ttnn.Tensor):
+            return
+
         if type(new) is not type(prev):
             msg = f"input '{path_label}' type {type(new)} does not match the initial type {type(prev)}"
             raise TypeError(msg)
@@ -152,7 +162,7 @@ def _verify_value(value: Any, *, path_label: str) -> Any:
     return value
 
 
-def _tree_map(f: Callable, x: Any, /, *xs: Any, path_label: str) -> Any:
+def _tree_map(f: Callable[..., Any], x: Any, /, *xs: Any, path_label: str) -> Any:
     """Apply a function to leaves of nested data structures.
 
     Recursively traverses nested structures (tuples, lists, dicts) and applies
@@ -174,13 +184,7 @@ def _tree_map(f: Callable, x: Any, /, *xs: Any, path_label: str) -> Any:
         ValueError: If the input structures don't have matching types at
             corresponding positions, or if dicts have different keys.
     """
-    tx = type(x)
-    for y in xs:
-        if type(y) is not tx:
-            msg = f"types of '{path_label}' should be the same: {tx} != {type(y)}"
-            raise ValueError(msg)
-
-    if isinstance(x, tuple):
+    if isinstance(x, tuple) and all(isinstance(y, tuple) for y in xs):
         for y in xs:
             if len(x) != len(y):
                 msg = f"tuple lengths of '{path_label}' should be the same: {len(x)} != {len(y)}"
@@ -190,7 +194,7 @@ def _tree_map(f: Callable, x: Any, /, *xs: Any, path_label: str) -> Any:
             _tree_map(f, *elts, path_label=f"{path_label}[{i}]") for i, elts in enumerate(zip(x, *xs, strict=True))
         )
 
-    if isinstance(x, list):
+    if isinstance(x, list) and all(isinstance(y, list) for y in xs):
         for y in xs:
             if len(x) != len(y):
                 msg = f"list lengths of '{path_label}' should be the same: {len(x)} != {len(y)}"
@@ -198,7 +202,7 @@ def _tree_map(f: Callable, x: Any, /, *xs: Any, path_label: str) -> Any:
 
         return [_tree_map(f, *elts, path_label=f"{path_label}[{i}]") for i, elts in enumerate(zip(x, *xs, strict=True))]
 
-    if isinstance(x, dict):
+    if isinstance(x, dict) and all(isinstance(y, dict) for y in xs):
         for y in xs:
             if x.keys() != y.keys():
                 msg = f"dict keys of '{path_label}' should be the same: {x.keys()} != {y.keys()}"
