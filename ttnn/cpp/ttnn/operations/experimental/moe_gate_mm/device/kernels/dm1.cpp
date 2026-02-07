@@ -177,6 +177,7 @@ void kernel_main() {
 
     // Wait for the data from sender cores to be ready
     noc_semaphore_wait_min(my_semaphore_ptr, 1);
+    *my_semaphore_ptr = 0;
     cb_push_back(cb_w2c_in2, 1);
 
     // Wait for group scores to be ready from compute
@@ -207,7 +208,8 @@ void kernel_main() {
         cb_reserve_back(cb_w2c_in5, 1);
 
         // Wait for the group mask to be ready in the collector core
-        noc_semaphore_wait_min(my_semaphore_ptr, 8);
+        noc_semaphore_wait_min(my_semaphore_ptr, 1);
+        *my_semaphore_ptr = 0;
 
         // Let compute know we got the group masks
         cb_push_back(cb_w2c_in5, 1);
@@ -216,7 +218,7 @@ void kernel_main() {
         cb_wait_front(cb_w2c_in8, 1);
 
         noc_async_write_one_packet_set_state</*posted=*/true>(
-            local_top8_dst_base_addr, partials_size, /*noc=*/1, vchannel);
+            collector_dst_base_addr, partials_size, /*noc=*/1, vchannel);
 
         // Send them over to the collector core
         noc_async_write_one_packet_with_state</*posted=*/true>(local_top8_partials_src_addr, local_top8_dst_addr);
@@ -234,7 +236,7 @@ void kernel_main() {
     // Collector core
     //-------------------------------------------------------------------------
     if (core_id == COLLECTOR_CORE_ID) {
-        // // Rejig the group scores to be in the correct location -> where everyone else also puts it
+        // Rejig the group scores to be in the correct location -> where everyone else also puts it
         auto src_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(local_group_score_src_addr1);
         auto dst_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(local_group_scores_dst_addr1);
         for (uint32_t i = 0; i < 8; i++) {
@@ -254,7 +256,8 @@ void kernel_main() {
         cb_reserve_back(cb_w2c_in4, 1);
 
         // I am collecting, let us wait for everyone else to finish sending their data to me
-        noc_semaphore_wait_min(my_semaphore_ptr, 1 + 7);
+        noc_semaphore_wait_min(my_semaphore_ptr, 7);
+        *my_semaphore_ptr = 0;
 
         // Let compute know that we got the group scores
         cb_push_back(cb_w2c_in4, 1);
@@ -268,6 +271,7 @@ void kernel_main() {
             local_group_masks_addr, group_masks_noc_addr, /*size=*/2048, /*num_dests=*/7);
 
         // Set the semaphore to let the clients know they got the data
+        *my_semaphore_ptr = 1;
         noc_semaphore_set_multicast(
             semaphore_addr, group_semaphore_noc_addr, /*num_dests=*/7, /*linked=*/false, /*noc=*/1);
 
@@ -276,9 +280,15 @@ void kernel_main() {
         cb_reserve_back(cb_w2c_in6, 4);
 
         // Wait for the top8 partials to be ready in the collector core
-        // noc_semaphore_wait_min(my_semaphore_ptr, 1 + 7 + 7);
+        noc_semaphore_wait_min(my_semaphore_ptr, 1 + 7);
 
         // Let compute know that we got the top8 partials
         cb_push_back(cb_w2c_in6, 4);
+
+        // Wait for final top8 to be ready from compute
+        cb_wait_front(cb_c2w_rdy, 1);
+        // We have the top8 indices for each of 32 tokens.
+        // We need to get the corresponding scores at those indices.
+        cb_pop_front(cb_c2w_rdy, 1);
     }
 }

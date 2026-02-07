@@ -20,18 +20,15 @@ namespace ckernel {
 namespace sfpu {
 
 inline void _enumerate_tile_configure_addrmod_() {
+    // TODO: No idea why we need this offset only when programming, but it works.
+    constexpr uint32_t ADDRMOD_OFFSET = 4;
+
     addr_mod_t{
         .srca = {.incr = 0},
         .srcb = {.incr = 0},
         .dest = {.incr = 0},
     }
-        .set(ADDR_MOD_0);
-    addr_mod_t{
-        .srca = {.incr = 0},
-        .srcb = {.incr = 0},
-        .dest = {.incr = 4},
-    }
-        .set(ADDR_MOD_1);
+        .set(ADDRMOD_OFFSET + ADDR_MOD_0);
 }
 
 inline void _enumerate_tile_(bool row_mode, float multiplier, float bias) {

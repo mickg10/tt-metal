@@ -12,11 +12,12 @@
 #include "top2.h"
 #include "top4.h"
 #include "top8.h"
-#include "enumerate.h"
+#include "top8_merge.h"
 
 #include "compute_kernel_api/eltwise_unary/fill.h"
 #include "api/debug/dprint_tensix.h"
 #include "compute_kernel_api/tile_move_copy.h"
+#include "enumerate.h"
 
 #ifdef TRISC_UNPACK
 #include "llk_unpack_common.h"
@@ -377,15 +378,9 @@ void kernel_main() {
     transpose_wh_init_short(cb_s2c_out);
     transpose_wh_tile(cb_s2c_out, 0, 0);
 
-    enumerate_tile_init();
-    enumerate_tile(0, false, 1.0f, 0.0f);
-    dprint_tensix_dest_reg(0);
-
     // Sum the top-2 of the output
     sum_top2_tile_init();
     sum_top2_tile(0);
-
-    dprint_tensix_dest_reg(0);
 
     tile_regs_commit();
 
@@ -416,8 +411,6 @@ void kernel_main() {
         copy_tile_init(cb_w2c_in5);
         copy_tile(cb_w2c_in5, 0, 2);
 
-        dprint_tensix_dest_reg(2);
-
         // Get top 8 from adjusted scores, and mask them
         top8_tile_init();
         top8_tile(/*tile_index=*/core_id, /*dst_index=*/0);
@@ -427,7 +420,7 @@ void kernel_main() {
 
         tile_regs_commit();
         tile_regs_wait();
-        pack_tile(1, cb_w2c_in8);
+        pack_tile(0, cb_w2c_in8);
         tile_regs_release();
         cb_push_back(cb_w2c_in8, 1);
     }
@@ -448,12 +441,8 @@ void kernel_main() {
         //-------------------------------------------------------------------------
         // Top 4 groups for each token
         //-------------------------------------------------------------------------
-        dprint_tensix_dest_reg(0);
-
         top4_tile_init();
         top4_tile(0);
-
-        dprint_tensix_dest_reg(0);
 
         // Pack this out for other cores to get the group masks
         tile_regs_commit();
@@ -465,35 +454,41 @@ void kernel_main() {
 
         // Get top 8 from adjusted scores, and mask them
         tile_regs_acquire();
-        // transpose_wh_init_short(cb_s2c_out);
-        // transpose_wh_tile(cb_s2c_out, 0, 0);
+        transpose_wh_init_short(cb_s2c_out);
+        transpose_wh_tile(cb_s2c_out, 0, 0);
 
-        // top8_tile_init();
-        // top8_tile(/*tile_index=*/core_id, /*dst_index=*/0);
+        copy_tile_init(cb_w2c_in5);
+        copy_tile(cb_w2c_in5, 0, 2);
+
+        top8_tile_init();
+        top8_tile(/*tile_index=*/core_id, /*dst_index=*/0);
+
         cb_pop_front(cb_w2c_in4, 1);
 
         // Wait for sorted top-8 from all other cores
-        // cb_wait_front(cb_w2c_in6, 4);
-        // copy_tile_init(cb_w2c_in6);
-        // copy_tile(cb_w2c_in6, 0, 0);
-        // copy_tile(cb_w2c_in6, 1, 1);
-        // copy_tile(cb_w2c_in6, 2, 2);
-        // copy_tile(cb_w2c_in6, 3, 3);
+        cb_wait_front(cb_w2c_in6, 4);
 
-        // cb_pop_front(cb_w2c_in6, 4);
+        copy_tile_init(cb_w2c_in6);
+        // Tile ID 0 has my own data, so we copy to 1-4
+        copy_tile(cb_w2c_in6, 0, 1);
+        copy_tile(cb_w2c_in6, 1, 2);
+        copy_tile(cb_w2c_in6, 2, 3);
+        copy_tile(cb_w2c_in6, 3, 4);
+
+        top8_merge_init();
+        top8_merge();
+
+        cb_pop_front(cb_w2c_in6, 4);
         tile_regs_commit();
 
         tile_regs_wait();
+        cb_reserve_back(cb_s2c_out, 1);
+        pack_tile(0, cb_s2c_out);
+        cb_push_back(cb_s2c_out, 1);
         tile_regs_release();
 
-        //-------------------------------------------------------------------------
-        // Adjusted scores -> Copy to mask and find top8 experts for each token
-        //-------------------------------------------------------------------------
-        // My own data
-        // copy_tile(cb_s2c_out, 0, 7);
-        // mask_group<7>(7);
-
-        // top8_tile_init();
-        // top8_tile(0);
+        // Let DM1 know that we are done
+        cb_reserve_back(cb_c2w_rdy, 1);
+        cb_push_back(cb_c2w_rdy, 1);
     }
 }
