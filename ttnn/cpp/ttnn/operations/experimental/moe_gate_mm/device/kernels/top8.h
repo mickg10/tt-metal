@@ -520,6 +520,8 @@ inline void _calculate_top8_tile_(uint32_t tile_index) {
     //-------------------------------------------------------------------------
     // PHASE 4: Flush some lanes if this group is not selected
     //-------------------------------------------------------------------------
+    TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
+
     TTI_SFPTRANSP(0, 0, 0, 0);
 
     // For these 4 indices, put the core_id in the LO 16 bits (bits 7-5)
@@ -529,11 +531,9 @@ inline void _calculate_top8_tile_(uint32_t tile_index) {
     TTI_SFPLOAD(p_sfpu::LREG4, InstrModLoadStore::LO16_ONLY, ADDR_MOD_1, 128);
 
     // Now, let us bitshift by tile_index to get the mask for this tile
-    TT_SFPSHFT((-tile_index) & 0xfff, 0, p_sfpu::LREG4, /*MOD=IMM1*/ 1);
-
-    // Mask to get only bit 0
-    TTI_SFPLOADI(p_sfpu::LREG5, sfpi::SFPLOADI_MOD0_UPPER, 0x1);
-    TTI_SFPAND(0, p_sfpu::LREG5, p_sfpu::LREG4, 0);  // LREG4 now has 0 or 1
+    // Mask to get only bit at tile_index
+    TT_SFPLOADI(p_sfpu::LREG5, sfpi::SFPLOADI_MOD0_USHORT, 1 << tile_index);
+    TTI_SFPAND(0, p_sfpu::LREG5, p_sfpu::LREG4, 0);  // LREG4 now has zero or (1<<tile_index)
 
     // Enable lanes if LREG4 is 0
     TTI_SFPSETCC(0, p_sfpu::LREG4, 0, sfpi::SFPSETCC_MOD1_LREG_EQ0);

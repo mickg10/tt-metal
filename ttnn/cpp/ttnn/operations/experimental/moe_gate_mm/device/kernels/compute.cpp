@@ -363,7 +363,7 @@ void kernel_main() {
     tile_regs_wait();
 
     // Store the bias adjusted scores for transpose
-    pack_tile(0, cb_s2c_out);
+    pack_tile</*out_of_order_output=*/true>(0, cb_s2c_out, /*output_tile_index=*/0);
 
     // Store the raw scores for transpose
     cb_reserve_back(cb_w2c_in3, 1);
@@ -448,7 +448,7 @@ void kernel_main() {
         tile_regs_commit();
         tile_regs_wait();
         cb_reserve_back(cb_w2c_in5, 1);
-        pack_tile(0, cb_w2c_in5);
+        pack_tile</*out_of_order_output=*/true>(0, cb_w2c_in5, /*output_tile_index=*/0);
         tile_regs_release();
         cb_push_back(cb_w2c_in5, 1);
 
@@ -482,9 +482,7 @@ void kernel_main() {
         tile_regs_commit();
 
         tile_regs_wait();
-        cb_reserve_back(cb_s2c_out, 1);
-        pack_tile(0, cb_s2c_out);
-        cb_push_back(cb_s2c_out, 1);
+        pack_tile</*out_of_order_output=*/true>(0, cb_s2c_out, /*output_tile_index=*/0);
         tile_regs_release();
 
         // Let DM1 know that we are done

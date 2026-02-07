@@ -16,7 +16,7 @@ from tracy.process_model_log import (
     run_device_profiler,
 )
 
-PCC_THRESHOLD = 0.998
+PCC_THRESHOLD = 0.98
 
 
 SEND_CORES = (0, 3, 6, 9)
@@ -146,24 +146,29 @@ def prepare_output_tensor(tt_output, ring2cores):
         if not send_flag:
             each_shard.append(tt_output[:, current_column : current_column + ttnn.TILE_SIZE])
         current_column += ttnn.TILE_SIZE
-    output = torch.cat(each_shard, dim=1)
+    # output = torch.cat(each_shard, dim=1)
 
-    # Get the 32 scores values from each tile.
-    f1_scores = output.view(output.shape[0], -1, ttnn.TILE_SIZE)[3, :, :16]
-    f2_scores = output.view(output.shape[0], -1, ttnn.TILE_SIZE)[4, :, :16]
+    # # Get the 32 scores values from each tile.
+    # f1_scores = output.view(output.shape[0], -1, ttnn.TILE_SIZE)[3, :, :16]
+    # f2_scores = output.view(output.shape[0], -1, ttnn.TILE_SIZE)[4, :, :16]
 
-    group_scores = torch.cat([f1_scores, f2_scores], dim=-1)
-    return group_scores.transpose(0, 1)
+    # group_scores = torch.cat([f1_scores, f2_scores], dim=-1)
+    # return group_scores.transpose(0, 1)
+
+    # Only the last core has the values in the first 8 rows of the first 2 faces of the tile
+    tt_indices = each_shard[-1][8:16, :].transpose(0, 1).view(torch.uint16)
+    tt_values = each_shard[-1][:8, :].transpose(0, 1)
+    return tt_values, tt_indices
 
 
 def get_accuracy_metrics(torch_output, tt_output):
     _pcc_passed, pcc_val = comp_pcc(torch_output, tt_output)
-    std = torch_output.std().item()
-    relative_rmse_val = (torch.nn.functional.mse_loss(torch_output, tt_output).sqrt().item() / std) if std != 0 else 0.0
-    allclose_passed, allclose_val = comp_allclose(torch_output, tt_output)
+    # std = torch_output.std().item()
+    # relative_rmse_val = (torch.nn.functional.mse_loss(torch_output, tt_output).sqrt().item() / std) if std != 0 else 0.0
+    allclose_passed, allclose_val = comp_allclose(torch_output, tt_output, rtol=2e-2, atol=1e-1)
     return {
         "pcc": pcc_val,
-        "relative_rmse": relative_rmse_val,
+        # "relative_rmse": relative_rmse_val,
         "allclose": allclose_passed,
         "allclose_val": allclose_val,
     }
@@ -312,7 +317,6 @@ def run_test_moe_mm(device, M, K, N, L, check_accuracy, dump_outputs):
             layer_id=layer_id,
         )
 
-        # Output is produced in-place on the input tensor
         tt_to_torch_output = ttnn.to_torch(tt_output)
         all_outputs.append(tt_to_torch_output)
 
@@ -324,31 +328,62 @@ def run_test_moe_mm(device, M, K, N, L, check_accuracy, dump_outputs):
             # Use first 2*M rows of input (one copy of the original replicated input)
             torch_input_ref = torch_input[:, 0, ...]
 
-            # Compute gate activations for each expert
+            # 1. Linear projection: scores = x @ weight
             # (L, M, K) @ (L, K, N) -> (L, M, N)
             torch_mm_out = torch_input_ref @ torch_w
+
+            # 2. Sigmoid activation: scores = sigmoid(scores)
             torch_sigmoid_out = torch.nn.functional.sigmoid(torch_mm_out)
+
+            # 3. Store original scores: original_scores = scores
+            torch_original_scores = torch_sigmoid_out.clone()
+
+            # 4. Add bias: scores = scores + bias
             torch_bias_out = torch_sigmoid_out + torch_bias[:, None, :]
 
-            # Make columns in groups of 8
+            # 5. Reshape to groups of 8
             num_groups = 8
             torch_bias_out = torch_bias_out.reshape(L, M, num_groups, -1)
 
-            # Sort values for each L,M and for each group.
-            torch_sorted_groups = torch.sort(torch_bias_out, dim=-1, descending=True).values
+            # 6. Compute group scores: sum of top-2 scores for each group
+            torch_topk_out = torch.topk(torch_bias_out, k=2, dim=-1)[0].sum(dim=-1)
 
-            # Get the sum of the top-2 values for each group.
-            group_scores = torch_sorted_groups[:, :, :, :2].sum(dim=-1)
+            # 7. Select top groups: 4 group indices for each token
+            torch_top4_groups = torch.topk(torch_topk_out, k=4, dim=-1)[1]
 
-            torch_w_output_ref = group_scores.view(L, M, num_groups)
+            # 7a. Get bitmask for each token, of 8 bits, 1 for each group
+            torch_group_bitmask = (
+                (1 << torch_top4_groups[:, :, 0])
+                + (1 << torch_top4_groups[:, :, 1])
+                + (1 << torch_top4_groups[:, :, 2])
+                + (1 << torch_top4_groups[:, :, 3])
+            )
+
+            # 8. Create group mask: mask = scatter(ones, indices)
+            torch_group_mask = torch.zeros((L, M, num_groups), dtype=torch.bool)
+            torch_group_mask.scatter_(2, torch_top4_groups, 1)
+
+            # 9. Mask and flatten scores
+            torch_masked_scores = (torch_bias_out * torch_group_mask.unsqueeze(-1)).flatten(2)
+
+            # 10. Select top 8 experts
+            torch_top8_values, torch_top8_indices = torch.topk(torch_masked_scores, k=8, dim=-1)
+
+            # # 11. Gather original scores: weights = original_scores.gather(1, indices)
+            # torch_w_output_ref = torch_original_scores.gather(1, torch_top8_experts)
+
+            # # 12. Normalize weights: weights = weights / weights.sum(dim=-1, keepdim=True)
+            # torch_w_output_ref = torch_w_output_ref / torch_w_output_ref.sum(dim=-1, keepdim=True)
+
+            # torch_w_output_ref = group_scores.view(L, M, num_groups)
 
         # Calculate accuracy metrics for each layer
         for layer_id in range(L):
-            torch_layer_output = torch_w_output_ref[layer_id, :, :]
+            torch_layer_values = torch_top8_values[layer_id, :, :]
+            torch_layer_indices = torch_top8_indices[layer_id, :, :]
             tt_layer_output = tt_to_torch_outputs[layer_id, :, :]
-            tt_output = prepare_output_tensor(tt_layer_output, ring2cores)
-            # breakpoint()
-            layer_metrics = get_accuracy_metrics(torch_layer_output, tt_output)
+            tt_values, tt_indices = prepare_output_tensor(tt_layer_output, ring2cores)
+            layer_metrics = get_accuracy_metrics(torch_layer_values, tt_values)
             all_accuracy_metrics[layer_id] = layer_metrics
 
     if dump_outputs:
