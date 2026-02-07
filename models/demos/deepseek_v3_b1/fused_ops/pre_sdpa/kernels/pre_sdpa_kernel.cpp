@@ -742,11 +742,30 @@ void kernel_main() {
         constexpr uint32_t receiver_semaphore_id = 0;
         // 144 32x32 tiles to make 256 * (1x576)
         // Each 32x32 bfp8 tile is 32*32 + 64 = 1088 bytes
-        constexpr uint32_t CHUNK_SIZE = 256;
         constexpr uint32_t SHARD_SIZE = 144 * 1088;
         constexpr uint32_t ENTRY_SIZE = 1088;
         constexpr uint32_t NUM_BANKS = 8;
         constexpr uint32_t TILE_SIZE = 1088;
+        constexpr uint32_t CHUNK_SIZE = 256;
+
+        // Figure out which 32x32 tiles the postion touches
+        // Block 0 (1024):  [Entry 0: 576][Entry 1: 448...]
+        // Block 1 (1024):  [...Entry 1: 128][Entry 2: 576][Entry 3: 320...]
+        // Block 2 (1024):  [...Entry 3: 256][Entry 4: 576][Entry 5: 192...]
+
+        constexpr uint32_t KV_DIM = 576;
+        constexpr uint32_t ELEMENTS_PER_TILE = 32 * 32;
+        uint32_t start_element = position_id * KV_DIM;
+        uint32_t end_element = start_element + KV_DIM;
+        uint32_t start_block = start_element / ELEMENTS_PER_TILE;
+        uint32_t end_block = end_element / ELEMENTS_PER_TILE;
+        uint32_t offset_in_first_block = start_element % ELEMENTS_PER_TILE;
+        bool spans_two_blocks = (start_block != end_block);
+        uint32_t valid_in_second_block = 0;
+        if (spans_two_blocks) {
+            valid_in_second_block = KV_DIM - (ELEMENTS_PER_TILE - offset_in_first_block);
+        }
+
         /*
                 constexpr uint32_t CHUNK_SIZE = 256;
                 constexpr uint32_t ENTRY_SIZE = 576 * 2;
@@ -775,12 +794,14 @@ void kernel_main() {
             // Get tile size from the output CB
             uint32_t tile_size = get_tile_size(kv_rmsnorm_output_cb);
 
+            // Wait for data from rope cores
             uint32_t noc0_receiver_semaphore_addr = get_semaphore(receiver_semaphore_id);
             volatile tt_l1_ptr uint32_t* noc0_receiver_semaphore_addr_ptr =
                 (volatile tt_l1_ptr uint32_t*)noc0_receiver_semaphore_addr;
             noc_semaphore_wait(noc0_receiver_semaphore_addr_ptr, 2);
             noc_semaphore_set(noc0_receiver_semaphore_addr_ptr, 0);
 
+            // Grab data from existing cache
             DPRINT << " push back kv_rmsnorm_output_cb" << ENDL();
             cb_push_back(kv_rmsnorm_output_cb, 1);
             DPRINT << " wait for kv_cache_output_cb" << ENDL();
@@ -806,13 +827,34 @@ void kernel_main() {
 
             DPRINT << " writing to kv_cache_output_cb " << shard_id << " " << offset_in_shard << ENDL();
             uint64_t kv_write_addr = k_writer.get_shard_noc_addr(shard_id) + offset_in_shard;
+            for (volatile uint32_t i = 0; i < 2000000000U; i++) {
+                asm volatile("nop");
+            }
             noc_async_write(l1_read_addr, kv_write_addr, 1088);
-
             noc_async_write_barrier();
+            // noc_async_write_one_packet<true, true>(l1_read_addr, kv_write_addr, tile_size);
+            // noc_async_posted_writes_flushed();
+            //  Read back from kv_write_addr and dump
+            /*  {
+                  constexpr uint32_t dump_bytes = 598;
+                  // Reuse l1_read_addr as readback buffer (data already written to DRAM)
+                  uint32_t readback_buf = l1_read_addr;
+                  noc_async_read(kv_write_addr, readback_buf, dump_bytes);
+                  noc_async_read_barrier();
+
+                  volatile tt_l1_ptr uint8_t* raw = reinterpret_cast<volatile tt_l1_ptr uint8_t*>(readback_buf);
+                  DPRINT << "DRAM readback from kv_write_addr:" << ENDL();
+                  for (uint32_t offset = 0; offset < dump_bytes; offset += 16) {
+                      DPRINT << HEX() << SETW(4) << offset << ": ";
+                      for (uint32_t i = 0; i < 16 && (offset + i) < dump_bytes; i++) {
+                          DPRINT << SETW(2) << (uint32_t)raw[offset + i] << " ";
+                      }
+                      DPRINT << DEC() << ENDL();
+                  }
+              }*/
+
             // cb_pop_front(kv_rmsnorm_output_cb, kv_cache_num_tiles); // pop 2
             // cb_pop_front(kv_cache_output_cb, 1);
-
-            // Read back from DRAM and dump first shard, first entry
         }
 #elif defined(COMPILE_FOR_NCRISC)
         // Write Rope output to KV cache (after nope tiles)
@@ -849,6 +891,7 @@ void kernel_main() {
             cb_wait_front(kv_rmsnorm_output_cb, kv_cache_num_tiles);
             copy_tile_init(kv_rmsnorm_output_cb);
 
+            UNPACK(reconfig_data_format_srca(kv_rmsnorm_output_cb));
             PACK((llk_pack_reconfig_data_format<DST_ACCUM_MODE, true>(kv_cache_output_cb)));
             DPRINT << " waiting for kv_cache_output_cb" << ENDL();
 
@@ -874,7 +917,6 @@ void kernel_main() {
                 tile_regs_release();
             }
             cb_push_back(kv_cache_output_cb, 1);
-            PACK(DPRINT << TSLICE(kv_cache_output_cb, 0, SliceRange::h0_w0_32()) << ENDL());
             cb_pop_front(kv_rmsnorm_output_cb, kv_cache_num_tiles);
         }
 #endif
