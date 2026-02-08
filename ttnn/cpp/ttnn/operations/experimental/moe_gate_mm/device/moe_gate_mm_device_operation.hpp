@@ -31,7 +31,11 @@ struct MoEGateMMDeviceOperation {
         const operation_attributes_t& operation_attributes, const tensor_args_t&);
 
     static std::tuple<operation_attributes_t, tensor_args_t> invoke(
-        const Tensor& input_tensor, const Tensor& w_tensor, const Tensor& output_tensor, const uint32_t layer_id);
+        const Tensor& input_tensor,
+        const Tensor& w_tensor,
+        const Tensor& output_tensor,
+        const uint32_t layer_id,
+        const uint32_t column_id);
 };
 
 }  // namespace ttnn::operations::experimental::moe_gate_mm

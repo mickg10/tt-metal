@@ -158,7 +158,10 @@ def prepare_output_tensor(tt_output, ring2cores):
     # Only the last core has the values in the first 8 rows of the first 2 faces of the tile
     tt_indices = each_shard[-1][8:16, :].transpose(0, 1).view(torch.uint16)
     tt_values = each_shard[-1][:8, :].transpose(0, 1)
-    return tt_values, tt_indices
+    token2experts_bitmask = ((each_shard[-1][16].view(torch.uint16).to(torch.int32)) << 16) + (
+        each_shard[-1][20].view(torch.uint16).to(torch.int32)
+    )
+    return tt_values, tt_indices, token2experts_bitmask
 
 
 def get_accuracy_metrics(torch_output, tt_output):
@@ -174,9 +177,9 @@ def get_accuracy_metrics(torch_output, tt_output):
     }
 
 
-def run_test_moe_mm(device, M, K, N, L, check_accuracy, dump_outputs):
+def run_test_moe_mm(device, M, K, N, L, C, check_accuracy, dump_outputs):
     logger.info(
-        f"Running test_moe_mm with M={M}, K={K}, N={N}, L={L}, check_accuracy={check_accuracy}, dump_outputs={dump_outputs}"
+        f"Running test_moe_mm with M={M}, K={K}, N={N}, L={L}, C={C}, check_accuracy={check_accuracy}, dump_outputs={dump_outputs}"
     )
 
     # --------------------------------------------------------------------------
@@ -300,7 +303,7 @@ def run_test_moe_mm(device, M, K, N, L, check_accuracy, dump_outputs):
     all_outputs = []
     all_accuracy_metrics = {}
 
-    for layer_id in range(L):
+    for layer_id, column_id in itertools.product(range(L), range(C)):
         if check_accuracy:
             tt_input = ttnn.from_torch(
                 torch_input[layer_id],
@@ -315,6 +318,7 @@ def run_test_moe_mm(device, M, K, N, L, check_accuracy, dump_outputs):
             w_tensor=tt_w,
             output_tensor=tt_output,
             layer_id=layer_id,
+            column_id=column_id,
         )
 
         tt_to_torch_output = ttnn.to_torch(tt_output)
@@ -369,29 +373,40 @@ def run_test_moe_mm(device, M, K, N, L, check_accuracy, dump_outputs):
             # 10. Select top 8 experts
             torch_top8_values, torch_top8_indices = torch.topk(torch_masked_scores, k=8, dim=-1)
 
-            # # 11. Gather original scores: weights = original_scores.gather(1, indices)
-            # torch_w_output_ref = torch_original_scores.gather(1, torch_top8_experts)
+            # 11. Gather original scores: weights = original_scores.gather(1, indices)
+            torch_weights = torch_original_scores.gather(-1, torch_top8_indices)
 
-            # # 12. Normalize weights: weights = weights / weights.sum(dim=-1, keepdim=True)
-            # torch_w_output_ref = torch_w_output_ref / torch_w_output_ref.sum(dim=-1, keepdim=True)
+            # 12. Normalize weights: weights = weights / weights.sum(dim=-1, keepdim=True)
+            torch_weights_scaled = 2.5 * (torch_weights / torch_weights.sum(dim=-1, keepdim=True))
 
-            # torch_w_output_ref = group_scores.view(L, M, num_groups)
+            # 13. Create a token -> experts bitmask for each column
+            group_idx, bit_idx = torch_top8_indices // ttnn.TILE_SIZE, torch_top8_indices % ttnn.TILE_SIZE
+            bit_values = (1 << bit_idx).to(torch.int32)
+
+            torch_bitmask = torch.zeros(L, M, 8, dtype=torch.int32)
+
+            for i in range(8):
+                mask = group_idx == i
+                masked_bits = torch.where(mask, bit_values, 0)
+                # OR reduction along N dimension
+                torch_bitmask[:, :, i] = masked_bits.sum(dim=2)
 
         # Calculate accuracy metrics for each layer
         for layer_id in range(L):
             torch_layer_values = torch_top8_values[layer_id, :, :]
             torch_layer_indices = torch_top8_indices[layer_id, :, :]
             tt_layer_output = tt_to_torch_outputs[layer_id, :, :]
-            tt_values, tt_indices = prepare_output_tensor(tt_layer_output, ring2cores)
+            tt_values, tt_indices, token2experts_bitmask = prepare_output_tensor(tt_layer_output, ring2cores)
             layer_metrics = get_accuracy_metrics(torch_layer_values, tt_values)
             all_accuracy_metrics[layer_id] = layer_metrics
 
     if dump_outputs:
         torch.set_printoptions(profile="full")
         var2filename = {
-            torch_w_output_ref: f"torch_w_output_ref.txt",
-            tt_to_torch_outputs: f"tt_w_output_act.txt",
+            tt_to_torch_outputs: "tt_w_output_act.txt",
         }
+        if check_accuracy:
+            var2filename[torch_top8_values] = "torch_w_output_ref.txt"
 
         for var, filename in var2filename.items():
             with open(filename, "w") as f:
@@ -401,7 +416,7 @@ def run_test_moe_mm(device, M, K, N, L, check_accuracy, dump_outputs):
 
 
 SHAPE2TIME = {
-    (32, 7168, 256, 1): 26.5,
+    (32, 7168, 256, 1, 1): 26.5,
 }
 
 
@@ -418,18 +433,19 @@ SHAPE2TIME = {
     indirect=True,
 )
 @pytest.mark.parametrize(
-    "M, K, N, L",
+    "M, K, N, L, C",
     SHAPE2TIME.keys(),
 )
 @pytest.mark.parametrize("check_accuracy", [True, False], ids=["check_accuracy_True", "check_accuracy_False"])
 @pytest.mark.parametrize("dump_outputs", [True, False], ids=["dump_outputs_True", "dump_outputs_False"])
-def test_moe_mm(device, M, K, N, L, check_accuracy, dump_outputs):
+def test_moe_mm(device, M, K, N, L, C, check_accuracy, dump_outputs):
     accuracy_metrics = run_test_moe_mm(
         device,
         M,
         K,
         N,
         L,
+        C,
         check_accuracy,
         dump_outputs,
     )
@@ -447,13 +463,13 @@ def test_moe_mm(device, M, K, N, L, check_accuracy, dump_outputs):
 
 
 @pytest.mark.parametrize(
-    "M, K, N, L",
+    "M, K, N, L, C",
     SHAPE2TIME.keys(),
 )
 @pytest.mark.parametrize("check_accuracy", [True, False], ids=["check_accuracy_True", "check_accuracy_False"])
 @pytest.mark.parametrize("dump_outputs", [True, False], ids=["dump_outputs_True", "dump_outputs_False"])
-def test_moe_mm_performance(M, K, N, L, check_accuracy, dump_outputs):
-    command = f"pytest tests/ttnn/nightly/unit_tests/operations/experimental/test_moe_mm.py::test_moe_mm[dump_outputs_{dump_outputs}-check_accuracy_{check_accuracy}-M={M}-K={K}-N={N}-L={L}-dispatch_row]"
+def test_moe_mm_performance(M, K, N, L, C, check_accuracy, dump_outputs):
+    command = f"pytest tests/ttnn/nightly/unit_tests/operations/experimental/test_moe_mm.py::test_moe_mm[dump_outputs_{dump_outputs}-check_accuracy_{check_accuracy}-M={M}-K={K}-N={N}-L={L}-C={C}-dispatch_row]"
     run_device_profiler(command, "ttnn_moe_mm_performance", device_analysis_types=["device_kernel_duration"])
 
     r = post_process_ops_log("ttnn_moe_mm_performance", float_columns=["DEVICE KERNEL DURATION [ns]"])
@@ -477,8 +493,8 @@ def test_moe_mm_performance(M, K, N, L, check_accuracy, dump_outputs):
     logger.warning(f"Useful Bandwidth: {bandwidth} GB/s")
 
     assert (
-        duration_us < SHAPE2TIME[(M, K, N, L)]
-    ), f"Performance {duration_us} us is greater than expected {SHAPE2TIME[(M, K, N, L)]} us"
+        duration_us < SHAPE2TIME[(M, K, N, L, C)]
+    ), f"Performance {duration_us} us is greater than expected {SHAPE2TIME[(M, K, N, L, C)]} us"
 
 
 def post_process_ops_log(output_logs_subdir: str, float_columns: list[str]) -> dict[str, float]:

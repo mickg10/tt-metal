@@ -49,6 +49,7 @@ void kernel_main() {
     const auto neighbor2_physical_x = get_arg_val<uint32_t>(argidx++);
     const auto neighbor2_physical_y = get_arg_val<uint32_t>(argidx++);
     const auto core_id = get_arg_val<uint32_t>(argidx++);
+    const auto raw_scores_semaphore = get_arg_val<uint32_t>(argidx++);
 
     // CBs
     constexpr auto cb_r2c_w = tt::CBIndex::c_0;
@@ -56,6 +57,11 @@ void kernel_main() {
     constexpr auto cb_c2w_rdy = tt::CBIndex::c_2;
     constexpr auto cb_w2c_in2 = tt::CBIndex::c_3;
     constexpr auto cb_s2c_out = tt::CBIndex::c_4;
+    constexpr auto cb_w2c_in3 = tt::CBIndex::c_5;
+    constexpr auto cb_w2c_in4 = tt::CBIndex::c_6;
+    constexpr auto cb_w2c_in5 = tt::CBIndex::c_7;
+    constexpr auto cb_w2c_in6 = tt::CBIndex::c_8;
+    constexpr auto cb_w2c_in7 = tt::CBIndex::c_9;
 
     // Tile sizes
     constexpr uint32_t in_tile_size = get_tile_size(cb_s2c_in);

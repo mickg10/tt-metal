@@ -11,6 +11,7 @@ namespace ttnn::operations::experimental::moe_gate_mm {
 
 struct operation_attributes_t {
     uint32_t layer_id{};
+    uint32_t column_id{};
 };
 
 struct tensor_args_t {

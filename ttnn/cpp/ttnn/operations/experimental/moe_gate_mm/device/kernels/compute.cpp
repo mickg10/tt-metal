@@ -38,6 +38,7 @@ void kernel_main() {
     constexpr uint32_t collector_physical_y = get_named_compile_time_arg_val("collector_physical_y");
     constexpr uint32_t first_physical_x = get_named_compile_time_arg_val("first_physical_x");
     constexpr uint32_t first_physical_y = get_named_compile_time_arg_val("first_physical_y");
+    constexpr uint32_t column_id = get_named_compile_time_arg_val("column_id");
 
     // Run-time arguments
     uint32_t argidx = 0;
@@ -53,6 +54,7 @@ void kernel_main() {
     const auto neighbor2_physical_x = get_arg_val<uint32_t>(argidx++);
     const auto neighbor2_physical_y = get_arg_val<uint32_t>(argidx++);
     const auto core_id = get_arg_val<uint32_t>(argidx++);
+    const auto raw_scores_semaphore = get_arg_val<uint32_t>(argidx++);
 
     // CBs
     constexpr auto cb_r2c_w = tt::CBIndex::c_0;
@@ -64,6 +66,7 @@ void kernel_main() {
     constexpr auto cb_w2c_in4 = tt::CBIndex::c_6;
     constexpr auto cb_w2c_in5 = tt::CBIndex::c_7;
     constexpr auto cb_w2c_in6 = tt::CBIndex::c_8;
+    constexpr auto cb_w2c_in7 = tt::CBIndex::c_9;
 
     // Aliases
     constexpr auto cb_w2c_in8 = tt::CBIndex::c_6;
@@ -369,7 +372,7 @@ void kernel_main() {
         copy_tile(cb_w2c_in6, 3, 4);
 
         top8_merge_init();
-        top8_merge();
+        top8_merge(/*column_idx=*/column_id);
 
         cb_pop_front(cb_w2c_in6, 4);
         tile_regs_commit();

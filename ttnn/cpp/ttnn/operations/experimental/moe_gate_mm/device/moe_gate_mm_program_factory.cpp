@@ -43,6 +43,7 @@ MoEGateMMProgramFactory::cached_program_t MoEGateMMProgramFactory::create(
         | cb_w2c_in4     | CBIndex::c_6  | Float16_b  | true  |    1     |      2048       |
         | cb_w2c_in5     | CBIndex::c_7  | Float16_b  | true  |    1     |      2048       |
         | cb_w2c_in6     | CBIndex::c_8  | Float16_b  | true  |    4     |      8192       |
+        | cb_w2c_in7     | CBIndex::c_9  | Float16_b  | true  |    8     |      16384      |
         ------------------------------------------------------------------------------------
     */
 
@@ -55,6 +56,7 @@ MoEGateMMProgramFactory::cached_program_t MoEGateMMProgramFactory::create(
         {"cb_w2c_in4", tt::CBIndex::c_6, tt::DataFormat::Float16_b, true, 1},
         {"cb_w2c_in5", tt::CBIndex::c_7, tt::DataFormat::Float16_b, true, 1},
         {"cb_w2c_in6", tt::CBIndex::c_8, tt::DataFormat::Float16_b, true, 4},
+        {"cb_w2c_in7", tt::CBIndex::c_9, tt::DataFormat::Float16_b, true, 8},
     };
 
     [[maybe_unused]] std::map<std::string, tt::tt_metal::CBHandle> cb_handles, cb_handles_sharded;
@@ -144,6 +146,7 @@ MoEGateMMProgramFactory::cached_program_t MoEGateMMProgramFactory::create(
         {"collector_physical_y", collector_core.y},
         {"first_physical_x", first_core.x},
         {"first_physical_y", first_core.y},
+        {"column_id", operation_attributes.column_id},
     };
 
     // Create kernels for the program
@@ -184,6 +187,7 @@ MoEGateMMProgramFactory::cached_program_t MoEGateMMProgramFactory::create(
     // There will be 8 cores, each waiting for partial to come from 4 other cores.
     // The 4 cores will send partial to two cores each.
     const uint32_t partial_semaphore_id = tt::tt_metal::CreateSemaphore(program, all_cores, 0);
+    const uint32_t raw_scores_semaphore_id = tt::tt_metal::CreateSemaphore(program, all_cores, 0);
 
     // Set the runtime arguments for the kernels
     std::vector<uint32_t> runtime_args;
@@ -202,6 +206,7 @@ MoEGateMMProgramFactory::cached_program_t MoEGateMMProgramFactory::create(
     runtime_args.push_back(0);  // Neighbor2 physical x
     runtime_args.push_back(0);  // Neighbor2 physical y
     runtime_args.push_back(0);  // Core ID
+    runtime_args.push_back(raw_scores_semaphore_id);
 
     std::vector<uint32_t> vchannels;
     uint32_t dram_bank = 0;

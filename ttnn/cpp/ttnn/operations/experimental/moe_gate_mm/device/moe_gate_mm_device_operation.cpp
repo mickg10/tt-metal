@@ -40,9 +40,13 @@ MoEGateMMDeviceOperation::tensor_return_value_t MoEGateMMDeviceOperation::create
 
 std::tuple<MoEGateMMDeviceOperation::operation_attributes_t, MoEGateMMDeviceOperation::tensor_args_t>
 MoEGateMMDeviceOperation::invoke(
-    const Tensor& input_tensor, const Tensor& w_tensor, const Tensor& output_tensor, const uint32_t layer_id) {
+    const Tensor& input_tensor,
+    const Tensor& w_tensor,
+    const Tensor& output_tensor,
+    const uint32_t layer_id,
+    const uint32_t column_id) {
     return {
-        operation_attributes_t{.layer_id = layer_id},
+        operation_attributes_t{.layer_id = layer_id, .column_id = column_id},
         tensor_args_t{.input_tensor = input_tensor, .w_tensor = w_tensor, .output_tensor = output_tensor}};
 }
 

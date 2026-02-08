@@ -21,6 +21,7 @@ void bind_moe_gate_mm(nb::module_& mod) {
             w_tensor: Weight tensor
             output_tensor: Output tensor (sharded)
             layer_id: The layer for which the MoE Gate MM operation is being performed
+            column_id: The column in the 16x8 grid in which this MoE gate is being performed
         )doc",
         ttnn::nanobind_arguments_t{
             nb::arg("input_tensor"),
@@ -28,6 +29,7 @@ void bind_moe_gate_mm(nb::module_& mod) {
             nb::arg("w_tensor"),
             nb::arg("output_tensor"),
             nb::arg("layer_id"),
+            nb::arg("column_id"),
         });
 }
 

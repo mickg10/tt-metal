@@ -35,6 +35,7 @@ void kernel_main() {
     const auto neighbor2_physical_x = get_arg_val<uint32_t>(argidx++);
     const auto neighbor2_physical_y = get_arg_val<uint32_t>(argidx++);
     const auto core_id = get_arg_val<uint32_t>(argidx++);
+    const auto raw_scores_semaphore = get_arg_val<uint32_t>(argidx++);
 
     // CBs
     constexpr auto cb_r2c_w = tt::CBIndex::c_0;
@@ -46,6 +47,7 @@ void kernel_main() {
     constexpr auto cb_w2c_in4 = tt::CBIndex::c_6;
     constexpr auto cb_w2c_in5 = tt::CBIndex::c_7;
     constexpr auto cb_w2c_in6 = tt::CBIndex::c_8;
+    constexpr auto cb_w2c_in7 = tt::CBIndex::c_9;
 
     // Aliases
     constexpr auto cb_w2c_in8 = tt::CBIndex::c_6;
@@ -116,7 +118,6 @@ void kernel_main() {
         first_physical_x, first_physical_y, collector_physical_x, collector_physical_y, local_group_masks_addr);
     const uint64_t group_semaphore_noc_addr = get_noc_multicast_addr(
         first_physical_x, first_physical_y, collector_physical_x, collector_physical_y, semaphore_addr);
-    //-------------------------------------------------------------------------
 
     //-------------------------------------------------------------------------
     // Top8 partials (7 cores -> 1 collector core)
@@ -128,6 +129,27 @@ void kernel_main() {
 
     const uint32_t local_top8_dst_base_addr = get_write_ptr(cb_w2c_in6);
     const uint32_t local_top8_dst_addr = local_top8_dst_base_addr + core_id * partials_size;
+
+    //-------------------------------------------------------------------------
+    // Raw scores (7 cores -> 1 collector core)
+    //-------------------------------------------------------------------------
+    constexpr uint32_t raw_scores_size = tt::constants::TILE_HW * sizeof(uint16_t);
+
+    uint32_t raw_scores_semaphore_addr = get_semaphore(raw_scores_semaphore);
+    volatile tt_l1_ptr uint32_t* my_raw_scores_semaphore_ptr =
+        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(raw_scores_semaphore_addr);
+    *my_raw_scores_semaphore_ptr = 0;
+
+    // Top8 partials: data exists in first 16 rows
+    const uint32_t local_raw_scores_src_addr = get_write_ptr(cb_w2c_in3);
+
+    const uint32_t local_raw_scores_dst_base_addr = get_write_ptr(cb_w2c_in7);
+    const uint32_t local_raw_scores_dst_addr = local_raw_scores_dst_base_addr + core_id * raw_scores_size;
+
+    const uint64_t raw_scores_semaphore_noc_addr =
+        get_noc_addr(collector_physical_x, collector_physical_y, raw_scores_semaphore_addr);
+    const uint64_t raw_scores_noc_addr = get_noc_multicast_addr(
+        first_physical_x, first_physical_y, collector_physical_x, collector_physical_y, local_raw_scores_dst_base_addr);
 
     //-------------------------------------------------------------------------
     *my_semaphore_ptr = 0;
@@ -230,6 +252,23 @@ void kernel_main() {
         noc_async_posted_atomic_barrier();
 
         cb_pop_front(cb_w2c_in8, 1);
+
+        // We should also send the raw scores
+        noc_async_write_one_packet_set_state</*posted=*/true>(
+            collector_dst_base_addr, raw_scores_size, /*noc=*/1, vchannel);
+
+        // Send them over to the collector core
+        noc_async_write_one_packet_with_state</*posted=*/true>(local_raw_scores_src_addr, local_raw_scores_dst_addr);
+
+        // Signal the collector core that data is ready (increment their semaphore)
+        noc_semaphore_inc</*posted=*/true>(raw_scores_semaphore_noc_addr, /*incr=*/1, /*noc_id=*/1, /*vc=*/vchannel);
+
+        // Ensure write and semaphore have left the core before continuing
+        noc_async_posted_atomic_barrier();
+
+        // // Wait for combined raw scores to be ready from collector core
+        // noc_semaphore_wait_min(my_raw_scores_semaphore_ptr, 1);
+        // *my_raw_scores_semaphore_ptr = 0;
     }
 
     //-------------------------------------------------------------------------
@@ -279,7 +318,7 @@ void kernel_main() {
 
         cb_reserve_back(cb_w2c_in6, 4);
 
-        // Wait for the top8 partials to be ready in the collector core
+        // Wait for the top8 partials to arrive
         noc_semaphore_wait_min(my_semaphore_ptr, 1 + 7);
 
         // Let compute know that we got the top8 partials
@@ -287,8 +326,88 @@ void kernel_main() {
 
         // Wait for final top8 to be ready from compute
         cb_wait_front(cb_c2w_rdy, 1);
+        cb_pop_front(cb_c2w_rdy, 1);
+
         // We have the top8 indices for each of 32 tokens.
         // We need to get the corresponding scores at those indices.
-        cb_pop_front(cb_c2w_rdy, 1);
+        // Wait for the raw scores to arrive
+        noc_semaphore_wait_min(my_raw_scores_semaphore_ptr, 7);
+        *my_raw_scores_semaphore_ptr = 0;
+
+        // noc_async_write_multicast_one_packet(
+        //     local_raw_scores_dst_base_addr, raw_scores_noc_addr, /*size=*/2048 * 4, /*num_dests=*/7);
+
+        // // Set the semaphore to let the clients know they got the data
+        // *my_semaphore_ptr = 1;
+        // noc_semaphore_set_multicast(
+        //     semaphore_addr, raw_scores_semaphore_noc_addr, /*num_dests=*/7, /*linked=*/false, /*noc=*/1);
+
+        // Step 1: Gather the raw scores based on the top8 indices
+        //
+        // cb_s2c_out tile (Float16_b, 2048 bytes, no header):
+        //   Face 0 (uint16 offset 0):   rows 0-7 values, rows 8-15 indices, tokens 0-15
+        //   Face 1 (uint16 offset 256): rows 0-7 values, rows 8-15 indices, tokens 16-31
+        //
+        // cb_w2c_in7 (8 × 2048 bytes):
+        //   Tile i at uint16 offset i*1024: raw scores for experts [32i..32i+31]
+        //     Face 0 (+0):   experts 0-15,  tokens 0-15
+        //     Face 1 (+256): experts 0-15,  tokens 16-31
+        //     Face 2 (+512): experts 16-31, tokens 0-15
+        //     Face 3 (+768): experts 16-31, tokens 16-31
+
+        // Key insight from Baby RISC-V spec (RV32IM):
+        //   - Max load/store width = 32 bits
+        //   - L1 store throughput = 1 per 5 cycles  ← THE BOTTLENECK
+        //   - 16-bit and 32-bit L1 ops cost the same → always use 32-bit
+        //
+        // Strategy: Process 2 adjacent tokens per iteration.
+        //   - 1× lw reads 2 indices  (halves index loads: 128 vs 256)
+        //   - 2× lhu reads 2 scores  (random access, can't batch)
+        //   - 1× sw writes 2 scores  (halves stores:     128 vs 256)
+        //
+        // Cycle estimate: 128 stores × 5 cycles = 640 cycles (2× speedup)
+
+        // auto s2c32 = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(local_src_addr);
+        // auto w2c   = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(local_raw_scores_dst_base_addr);
+
+        // for (uint32_t face = 0; face < 2; face++) {
+        //     const uint32_t face_off   = face << 8;   // uint16 offset per face
+        //     const uint32_t face_off32 = face << 7;   // uint32 offset per face
+
+        //     for (uint32_t rank = 0; rank < 1; rank++) {
+        //         const uint32_t idx_base32 = face_off32 + ((8 + rank) << 3);
+        //         const uint32_t val_base32 = face_off32 + (rank << 3);
+
+        //         for (uint32_t tp = 0; tp < 8; tp++) {
+        //             // ---- 1 × 32-bit L1 load: read 2 indices ----
+        //             uint32_t idx_pair = s2c32[idx_base32 + tp];
+        //             uint32_t idx0 = idx_pair & 0xFFFF;
+        //             uint32_t idx1 = idx_pair >> 16;
+
+        //             uint32_t tok = tp << 1;
+
+        //             // Decode index 0
+        //             uint32_t tid0 = idx0 >> 5;
+        //             uint32_t el0  = idx0 & 0x1F;
+        //             uint32_t rf0  = ((el0 >> 4) << 1) | face;
+        //             uint32_t rr0  = el0 & 0xF;
+        //             uint32_t off0 = (tid0 << 10) | (rf0 << 8) | (rr0 << 4) | tok;
+
+        //             // // Decode index 1
+        //             // uint32_t tid1 = idx1 >> 5;
+        //             // uint32_t el1  = idx1 & 0x1F;
+        //             // uint32_t rf1  = ((el1 >> 4) << 1) | face;
+        //             // uint32_t rr1  = el1 & 0xF;
+        //             // uint32_t off1 = (tid1 << 10) | (rf1 << 8) | (rr1 << 4) | (tok + 1);
+
+        //             // // ---- 2 × 16-bit L1 loads: read 2 scores (random, can't batch) ----
+        //             // uint32_t score0 = w2c[off0];
+        //             // uint32_t score1 = w2c[off1];
+
+        //             // // ---- 1 × 32-bit L1 store: write 2 scores packed ----
+        //             // s2c32[val_base32 + tp] = score0 | (score1 << 16);
+        //         }
+        //     }
+        // }
     }
 }

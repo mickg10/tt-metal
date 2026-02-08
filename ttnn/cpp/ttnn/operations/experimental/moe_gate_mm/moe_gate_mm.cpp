@@ -11,8 +11,9 @@ ttnn::Tensor ExecuteMoEGateMM::invoke(
     const ttnn::Tensor& input_tensor,
     const ttnn::Tensor& w_tensor,
     const ttnn::Tensor& output_tensor,
-    const uint32_t layer_id) {
-    return ttnn::prim::moe_gate_mm(input_tensor, w_tensor, output_tensor, layer_id);
+    const uint32_t layer_id,
+    const uint32_t column_id) {
+    return ttnn::prim::moe_gate_mm(input_tensor, w_tensor, output_tensor, layer_id, column_id);
 }
 
 }  // namespace ttnn::operations::experimental::moe_gate_mm

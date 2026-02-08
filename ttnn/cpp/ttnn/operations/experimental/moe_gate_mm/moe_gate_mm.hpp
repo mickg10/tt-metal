@@ -15,7 +15,8 @@ struct ExecuteMoEGateMM {
         const ttnn::Tensor& input_tensor,
         const ttnn::Tensor& w_tensor,
         const ttnn::Tensor& output_tensor,
-        const uint32_t layer_id);
+        const uint32_t layer_id,
+        const uint32_t column_id);
 };
 
 }  // namespace ttnn::operations::experimental::moe_gate_mm
