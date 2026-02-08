@@ -163,12 +163,12 @@ def prepare_output_tensor(tt_output, ring2cores):
 
 def get_accuracy_metrics(torch_output, tt_output):
     _pcc_passed, pcc_val = comp_pcc(torch_output, tt_output)
-    # std = torch_output.std().item()
-    # relative_rmse_val = (torch.nn.functional.mse_loss(torch_output, tt_output).sqrt().item() / std) if std != 0 else 0.0
+    std = torch_output.std().item()
+    relative_rmse_val = (torch.nn.functional.mse_loss(torch_output, tt_output).sqrt().item() / std) if std != 0 else 0.0
     allclose_passed, allclose_val = comp_allclose(torch_output, tt_output, rtol=2e-2, atol=1e-1)
     return {
         "pcc": pcc_val,
-        # "relative_rmse": relative_rmse_val,
+        "relative_rmse": relative_rmse_val,
         "allclose": allclose_passed,
         "allclose_val": allclose_val,
     }
@@ -401,7 +401,7 @@ def run_test_moe_mm(device, M, K, N, L, check_accuracy, dump_outputs):
 
 
 SHAPE2TIME = {
-    (32, 7168, 256, 1): 20.0,
+    (32, 7168, 256, 1): 26.5,
 }
 
 

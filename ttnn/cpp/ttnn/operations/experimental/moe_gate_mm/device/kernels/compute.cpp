@@ -9,6 +9,7 @@
 #include "compute_kernel_api/bcast.h"
 #include "compute_kernel_api/copy_dest_values.h"
 #include "compute_kernel_api/transpose_wh.h"
+#include "bias.h"
 #include "top2.h"
 #include "top4.h"
 #include "top8.h"
@@ -29,120 +30,6 @@
 #include "llk_math_common.h"
 #include "ckernel_template.h"
 #endif
-
-//=============================================================================
-// Add row 0 from CB tile to all 32 rows in DST using MOP
-// Uses: Zero SrcA + acc_to_dest mode: DST = 0 + broadcast_row + DST
-//=============================================================================
-
-#ifdef TRISC_UNPACK
-inline void add_row_to_dst_unpack_init() {
-    using namespace ckernel;
-    using namespace ckernel::unpacker;
-
-    // Record instructions to replay buffer:
-    // [0]: Zero SrcA
-    // [1]: Set dvalid for SrcA
-    lltt::record(0, 2);
-    TTI_UNPACR_NOP(SrcA, p_unpacr_nop::UNP_ZEROSRC);
-    TTI_UNPACR_NOP(SrcA, p_unpacr_nop::UNP_SET_DVALID);
-
-    const uint32_t zero_srca_dvalid = lltt::replay_insn(0, 2);
-
-    // SrcB unpack with Z increment and dvalid
-    const uint32_t unpack_srcb = TT_OP_UNPACR(SrcB, 0b1, 0, 0, 0, 1, 1, p_unpacr::RAREFYB_DISABLE, 0, 0, 0, 0, 1);
-    const uint32_t srcb_clear_z = TT_OP_SETADCZW(p_setadc::UNP_B, 0, 0, 0, 0, 0b0001);
-
-    // MOP structure matches standard ROW broadcast: outerloop=2, innerloop=2
-    // Each iteration: (unpack_srcb, zero_srca_dvalid) - matches (srcB, srcA) pattern
-    // end_op resets SrcB Z counter between halves
-    ckernel_template tmp(2, 2, unpack_srcb, zero_srca_dvalid);
-    tmp.set_end_op(srcb_clear_z);
-    tmp.program();
-}
-
-inline void add_row_to_dst_unpack(uint32_t row_cb, uint32_t tile_idx) {
-    using namespace ckernel;
-    using namespace ckernel::unpacker;
-
-    uint32_t op_id = get_operand_id(row_cb);
-    uint32_t addr =
-        get_local_cb_interface(op_id).fifo_rd_ptr - 1 + get_local_cb_interface(op_id).fifo_page_size * tile_idx;
-
-    // Reset SrcB Z/W counters
-    TTI_SETADCZW(0b010, 0, 0, 0, 0, 0b1111);
-
-    volatile uint tt_reg_ptr* cfg = get_cfg_pointer();
-    wait_for_next_context(2);
-
-    // Set SrcB base address (SrcA is zeroed, no address needed)
-    const uint32_t upk1_reg =
-        (unp_cfg_context == 0) ? THCON_SEC1_REG3_Base_address_ADDR32 : THCON_SEC1_REG3_Base_cntx1_address_ADDR32;
-    cfg[upk1_reg] = addr;
-
-    semaphore_post(semaphore::UNPACK_SYNC);
-    TTI_STALLWAIT(p_stall::STALL_UNPACK, p_stall::TRISC_CFG);
-
-    // Run the MOP (processes all 4 faces)
-    ckernel::ckernel_template::run();
-
-    t6_semaphore_get(semaphore::UNPACK_SYNC);
-    switch_config_context(unp_cfg_context);
-}
-#endif
-
-#ifdef TRISC_MATH
-inline void add_row_to_dst_math_init() {
-    using namespace ckernel;
-
-    // Configure address modifiers for ROW broadcast
-    // SrcA: increment by 8 (8 rows per op)
-    // SrcB: no increment (same row broadcast to all)
-    // Dest: increment by 8
-    addr_mod_t{
-        .srca = {.incr = 8},
-        .srcb = {.incr = 0},
-        .dest = {.incr = 8},
-    }
-        .set(ADDR_MOD_0);
-
-    // MOP structure: outerloop=4 (faces), innerloop=2 (8 rows × 2 = 16 rows per face)
-    const uint32_t elwadd_op = TT_OP_ELWADD(0, 1 /*acc_to_dest*/, p_elwise::SRCB_BCAST_ROW, ADDR_MOD_0, 0);
-    const uint32_t clr_src = TT_OP_SETRWC(p_setrwc::CLR_AB, p_setrwc::CR_AB, 0, 0, 0, p_setrwc::SET_AB);
-
-    ckernel_template tmp(4, 2, elwadd_op);
-    tmp.set_end_op(clr_src);
-    tmp.program();
-
-    // Disable clearing dvalid on SrcA read (we're using zeroed SrcA)
-    TTI_SETC16(CLR_DVALID_SrcA_Disable_ADDR32, 0);
-
-    math::reset_counters(p_setrwc::SET_ABD_F);
-}
-
-inline void add_row_to_dst_math(uint32_t dst_idx) {
-    using namespace ckernel;
-
-    math::set_dst_write_addr<DstTileShape::Tile32x32, UnpackDestination::SrcRegs>(dst_idx);
-
-    // Run the MOP (processes all 4 faces)
-    ckernel::ckernel_template::run();
-
-    math::clear_dst_reg_addr();
-}
-#endif
-
-// Combined init - call once before using add_row_to_dst
-inline void add_row_to_dst_init() {
-    UNPACK((add_row_to_dst_unpack_init()));
-    MATH((add_row_to_dst_math_init()));
-}
-
-// Main function - adds row 0 from CB tile to all rows in DST
-inline void add_row_to_dst(uint32_t row_cb, uint32_t tile_idx, uint32_t dst_idx) {
-    UNPACK((add_row_to_dst_unpack(row_cb, tile_idx)));
-    MATH((add_row_to_dst_math(dst_idx)));
-}
 
 void kernel_main() {
     constexpr uint32_t layer_id = get_named_compile_time_arg_val("layer_id");
@@ -352,8 +239,10 @@ void kernel_main() {
     //-------------------------------------------------------------------------
     // Add bias
     //-------------------------------------------------------------------------
-    add_row_to_dst_init();
-    add_row_to_dst(cb_r2c_w, bias_tile_index, 0);
+    copy_tile_init(cb_r2c_w);
+    copy_tile(cb_r2c_w, bias_tile_index, 2);
+    add_bias_init();
+    add_bias(0, 2);
 
     //-------------------------------------------------------------------------
     // Sum of top2 scores for this group
@@ -363,7 +252,9 @@ void kernel_main() {
     tile_regs_wait();
 
     // Store the bias adjusted scores for transpose
+    cb_reserve_back(cb_s2c_out, 1);
     pack_tile</*out_of_order_output=*/true>(0, cb_s2c_out, /*output_tile_index=*/0);
+    cb_push_back(cb_s2c_out, 1);
 
     // Store the raw scores for transpose
     cb_reserve_back(cb_w2c_in3, 1);
@@ -375,8 +266,10 @@ void kernel_main() {
     tile_regs_acquire();
 
     // Transpose
+    cb_wait_front(cb_s2c_out, 1);
     transpose_wh_init_short(cb_s2c_out);
     transpose_wh_tile(cb_s2c_out, 0, 0);
+    cb_pop_front(cb_s2c_out, 1);
 
     // Sum the top-2 of the output
     sum_top2_tile_init();
