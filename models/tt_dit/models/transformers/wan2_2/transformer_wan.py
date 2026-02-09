@@ -616,7 +616,9 @@ class WanTransformer3DModel(Module):
 
         return spatial_out
 
-    def inner_step(self, spatial_1BNI_torch, prompt_1BLP, rope_cos_1HND, rope_sin_1HND, trans_mat, N, timestep_torch):
+    def inner_step(
+        self, spatial_1BNI, prompt_1BLP, rope_cos_1HND, rope_sin_1HND, trans_mat, N, temb_11BD, timestep_proj_1BTD
+    ):
         """
         Reduced forward function which assumes outer loop has cached certain inputs that are step independent:
             - prompt_1BLP
@@ -625,19 +627,9 @@ class WanTransformer3DModel(Module):
             - trans_mat
             - N
 
-        Spatial input is a torch tensor with layout `1 B (patch_F patch_H patch_W) (pF pH pW C)`.
-        Spatial output is a torch tensor with same layout.
+        Spatial input is a TT-NN tensor with layout `1 B (patch_F patch_H patch_W) (pF pH pW C)`.
+        Spatial output is a TT-NN tensor with same layout.
         """
-
-        # Push spatial input to device
-        spatial_1BNI = bf16_tensor(
-            spatial_1BNI_torch,
-            device=self.mesh_device,
-            mesh_axis=self.parallel_config.sequence_parallel.mesh_axis,
-            shard_dim=-2,
-        )
-        temb_11BD, timestep_proj_1BTD = self.prepare_timestep_conditioning(timestep_torch)
-
         spatial_1BND = self.patch_embedding(spatial_1BNI)
 
         for idx, block in enumerate(self.blocks):
@@ -670,6 +662,4 @@ class WanTransformer3DModel(Module):
             proj_out_1BNI, dim=2, mesh_axis=self.parallel_config.sequence_parallel.mesh_axis
         )
 
-        spatial_1BNI_torch = ttnn.to_torch(ttnn.get_device_tensors(spatial_1BNI)[0])
-
-        return spatial_1BNI_torch
+        return spatial_1BNI
