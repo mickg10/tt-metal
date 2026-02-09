@@ -63,10 +63,18 @@ inline void _top8_merge_set_d_rwc_() {
 }
 
 // Load sorted group from tile layout
-template <uint32_t tile_index, uint32_t face_offset>
+template <uint32_t tile_index, uint32_t face_offset, bool replay>
 inline void _top8_merge_load_rows_0_3_() {
     _top8_merge_set_d_rwc_<tile_index, face_offset, /*row_offset*/ 0>();
 
+    if constexpr (replay) {
+        lltt::replay(0, 4);
+        _top8_merge_set_d_rwc_<tile_index, face_offset, /*row_offset*/ 0>();
+        lltt::replay(4, 4);
+        return;
+    }
+
+    lltt::record<lltt::Exec>(0, 4);
     TTI_SFPLOAD(p_sfpu::LREG0, InstrModLoadStore::FP16B, ADDR_MOD_1, 0);  // offset 0
     TTI_SFPLOAD(p_sfpu::LREG1, InstrModLoadStore::FP16B, ADDR_MOD_2, 0);  // offset 2
     TTI_SFPLOAD(p_sfpu::LREG2, InstrModLoadStore::FP16B, ADDR_MOD_1, 0);  // offset 16
@@ -74,33 +82,50 @@ inline void _top8_merge_load_rows_0_3_() {
 
     _top8_merge_set_d_rwc_<tile_index, face_offset, /*row_offset*/ 0>();
 
+    lltt::record<lltt::Exec>(4, 4);
     TTI_SFPLOAD(p_sfpu::LREG0, InstrModLoadStore::LO16_ONLY, ADDR_MOD_1, 8);  // offset 0
     TTI_SFPLOAD(p_sfpu::LREG1, InstrModLoadStore::LO16_ONLY, ADDR_MOD_2, 8);  // offset 2
     TTI_SFPLOAD(p_sfpu::LREG2, InstrModLoadStore::LO16_ONLY, ADDR_MOD_1, 8);  // offset 16
     TTI_SFPLOAD(p_sfpu::LREG3, InstrModLoadStore::LO16_ONLY, ADDR_MOD_3, 8);  // offset 18
 }
 
-template <uint32_t tile_index, uint32_t face_offset>
+template <uint32_t tile_index, uint32_t face_offset, bool replay>
 inline void _top8_merge_load_rows_4_7_() {
     _top8_merge_set_d_rwc_<tile_index, face_offset, /*row_offset*/ 4>();
 
+    if constexpr (replay) {
+        lltt::replay(8, 4);
+        _top8_merge_set_d_rwc_<tile_index, face_offset, /*row_offset*/ 4>();
+        lltt::replay(12, 4);
+        return;
+    }
+
+    lltt::record<lltt::Exec>(8, 4);
     TTI_SFPLOAD(p_sfpu::LREG4, InstrModLoadStore::FP16B, ADDR_MOD_1, 0);  // offset 4
     TTI_SFPLOAD(p_sfpu::LREG5, InstrModLoadStore::FP16B, ADDR_MOD_2, 0);  // offset 6
     TTI_SFPLOAD(p_sfpu::LREG6, InstrModLoadStore::FP16B, ADDR_MOD_1, 0);  // offset 20
     TTI_SFPLOAD(p_sfpu::LREG7, InstrModLoadStore::FP16B, ADDR_MOD_3, 0);  // offset 22
 
     _top8_merge_set_d_rwc_<tile_index, face_offset, /*row_offset*/ 4>();
-
+    lltt::record<lltt::Exec>(12, 4);
     TTI_SFPLOAD(p_sfpu::LREG4, InstrModLoadStore::LO16_ONLY, ADDR_MOD_1, 8);  // offset 4
     TTI_SFPLOAD(p_sfpu::LREG5, InstrModLoadStore::LO16_ONLY, ADDR_MOD_2, 8);  // offset 6
     TTI_SFPLOAD(p_sfpu::LREG6, InstrModLoadStore::LO16_ONLY, ADDR_MOD_1, 8);  // offset 20
     TTI_SFPLOAD(p_sfpu::LREG7, InstrModLoadStore::LO16_ONLY, ADDR_MOD_3, 8);  // offset 22
 }
 
-template <uint32_t tile_index, uint32_t face_offset>
+template <uint32_t tile_index, uint32_t face_offset, bool replay>
 inline void _top8_merge_store_rows_0_3_() {
     _top8_merge_set_d_rwc_<tile_index, face_offset, /*row_offset*/ 0>();
 
+    if constexpr (replay) {
+        lltt::replay(16, 4);
+        _top8_merge_set_d_rwc_<tile_index, face_offset, /*row_offset*/ 0>();
+        lltt::replay(20, 4);
+        return;
+    }
+
+    lltt::record<lltt::Exec>(16, 4);
     TTI_SFPSTORE(p_sfpu::LREG0, InstrModLoadStore::FP16B, ADDR_MOD_1, 0);  // offset 0
     TTI_SFPSTORE(p_sfpu::LREG1, InstrModLoadStore::FP16B, ADDR_MOD_2, 0);  // offset 2
     TTI_SFPSTORE(p_sfpu::LREG2, InstrModLoadStore::FP16B, ADDR_MOD_1, 0);  // offset 16
@@ -108,16 +133,25 @@ inline void _top8_merge_store_rows_0_3_() {
 
     _top8_merge_set_d_rwc_<tile_index, face_offset, /*row_offset*/ 0>();
 
+    lltt::record<lltt::Exec>(20, 4);
     TTI_SFPSTORE(p_sfpu::LREG0, InstrModLoadStore::LO16_ONLY, ADDR_MOD_1, 8);  // offset 0
     TTI_SFPSTORE(p_sfpu::LREG1, InstrModLoadStore::LO16_ONLY, ADDR_MOD_2, 8);  // offset 2
     TTI_SFPSTORE(p_sfpu::LREG2, InstrModLoadStore::LO16_ONLY, ADDR_MOD_1, 8);  // offset 16
     TTI_SFPSTORE(p_sfpu::LREG3, InstrModLoadStore::LO16_ONLY, ADDR_MOD_3, 8);  // offset 18
 }
 
-template <uint32_t tile_index, uint32_t face_offset>
+template <uint32_t tile_index, uint32_t face_offset, bool replay>
 inline void _top8_merge_store_rows_4_7_() {
     _top8_merge_set_d_rwc_<tile_index, face_offset, /*row_offset*/ 4>();
 
+    if constexpr (replay) {
+        lltt::replay(24, 4);
+        _top8_merge_set_d_rwc_<tile_index, face_offset, /*row_offset*/ 4>();
+        lltt::replay(28, 4);
+        return;
+    }
+
+    lltt::record<lltt::Exec>(24, 4);
     TTI_SFPSTORE(p_sfpu::LREG4, InstrModLoadStore::FP16B, ADDR_MOD_1, 0);  // offset 4
     TTI_SFPSTORE(p_sfpu::LREG5, InstrModLoadStore::FP16B, ADDR_MOD_2, 0);  // offset 6
     TTI_SFPSTORE(p_sfpu::LREG6, InstrModLoadStore::FP16B, ADDR_MOD_1, 0);  // offset 20
@@ -125,11 +159,24 @@ inline void _top8_merge_store_rows_4_7_() {
 
     _top8_merge_set_d_rwc_<tile_index, face_offset, /*row_offset*/ 4>();
 
+    lltt::record<lltt::Exec>(28, 4);
     TTI_SFPSTORE(p_sfpu::LREG4, InstrModLoadStore::LO16_ONLY, ADDR_MOD_1, 8);  // offset 4
     TTI_SFPSTORE(p_sfpu::LREG5, InstrModLoadStore::LO16_ONLY, ADDR_MOD_2, 8);  // offset 6
     TTI_SFPSTORE(p_sfpu::LREG6, InstrModLoadStore::LO16_ONLY, ADDR_MOD_1, 8);  // offset 20
     TTI_SFPSTORE(p_sfpu::LREG7, InstrModLoadStore::LO16_ONLY, ADDR_MOD_3, 8);  // offset 22
 }
+
+// Replay Buffer Layout (32 slots total):
+// Slots 0-7:   Load rows 0-3 (8 SFPLOAD instructions)
+// Slots 8-15:  Load rows 4-7 (8 SFPLOAD instructions)
+// Slots 16-23: Store rows 0-3 (8 SFPSTORE instructions)
+// Slots 24-31: Store rows 4-7 (8 SFPSTORE instructions)
+//
+// Replay strategy (Option 2 - Load/Store Microkernels):
+// - First call to _top8_merge_two_sorted_8_ records SFPLOAD/SFPSTORE patterns (replay=false)
+// - Subsequent 6 calls replay recorded load/store patterns (replay=true)
+// - Positioning (SETRWC/INCRWC) is executed separately before each replay
+// - Expected speedup: ~2x on load/store (96 instructions × 6 replays = 576 inst → 288 cycles)
 
 inline void _top8_merge_bitonic_merge_8_rows_() {
     // Stage 1: Compare distance 4 (4 swaps)
@@ -155,18 +202,18 @@ inline void _top8_merge_bitonic_merge_8_rows_() {
 // Assumes LREG0-7 contains sorted sequence A (descending, untransposed)
 // Loads sequence B from specified location and merges
 // Result is left in LREG0-7 (untransposed, sorted descending)
-template <uint32_t tile_index, uint32_t face_offset>
+template <uint32_t tile_index, uint32_t face_offset, bool replay>
 inline void _top8_merge_two_sorted_8_() {
     //-------------------------------------------------------------------------
     // PHASE 1: Compare and store each halves
     //-------------------------------------------------------------------------
 
     // First comparison half: A[0-3] vs B[7,6,5,4]
-    // Load A[0-3] to LREG0-3
-    _top8_merge_load_rows_0_3_</*tile_index*/ 0, /*face_offset*/ 0>();
+    // Load A[0-3] to LREG0-3 (positioning + replay load pattern)
+    _top8_merge_load_rows_0_3_</*tile_index*/ 0, /*face_offset*/ 0, replay>();
 
-    // Load B[4-7] to LREG4-7
-    _top8_merge_load_rows_4_7_<tile_index, face_offset>();
+    // Load B[4-7] to LREG4-7 (positioning + replay load pattern)
+    _top8_merge_load_rows_4_7_<tile_index, face_offset, replay>();
 
     // Transpose for comparison
     TTI_SFPTRANSP(0, 0, 0, 0);
@@ -180,15 +227,15 @@ inline void _top8_merge_two_sorted_8_() {
     // Transpose back for store
     TTI_SFPTRANSP(0, 0, 0, 0);
 
-    // Store first 4 winners to temp
-    _top8_merge_store_rows_0_3_</*tile_index*/ 0, /*face_offset*/ 0>();
+    // Store first 4 winners to temp (positioning + replay store pattern)
+    _top8_merge_store_rows_0_3_</*tile_index*/ 0, /*face_offset*/ 0, replay>();
 
     // Second comparison half: A[4-7] vs B[3,2,1,0]
-    // Load A[4-7] from temp storage
-    _top8_merge_load_rows_4_7_</*tile_index*/ 0, /*face_offset*/ 0>();
+    // Load A[4-7] from temp storage (positioning + replay load pattern)
+    _top8_merge_load_rows_4_7_</*tile_index*/ 0, /*face_offset*/ 0, replay>();
 
-    // Load B[0-3] to LREG0-3
-    _top8_merge_load_rows_0_3_<tile_index, face_offset>();
+    // Load B[0-3] to LREG0-3 (positioning + replay load pattern)
+    _top8_merge_load_rows_0_3_<tile_index, face_offset, replay>();
 
     // Transpose for comparison
     TTI_SFPTRANSP(0, 0, 0, 0);
@@ -202,16 +249,16 @@ inline void _top8_merge_two_sorted_8_() {
     // Transpose back for store
     TTI_SFPTRANSP(0, 0, 0, 0);
 
-    // Store second 4 winners to temp
-    _top8_merge_store_rows_4_7_</*tile_index*/ 0, /*face_offset*/ 0>();
+    // Store second 4 winners to temp (positioning + replay store pattern)
+    _top8_merge_store_rows_4_7_</*tile_index*/ 0, /*face_offset*/ 0, replay>();
 
     //-------------------------------------------------------------------------
     // PHASE 2: Bitonic merge
     //-------------------------------------------------------------------------
 
-    // Load all 8 winners
-    _top8_merge_load_rows_0_3_</*tile_index*/ 0, /*face_offset*/ 0>();
-    _top8_merge_load_rows_4_7_</*tile_index*/ 0, /*face_offset*/ 0>();
+    // Load all 8 winners (positioning + replay load patterns)
+    _top8_merge_load_rows_0_3_</*tile_index*/ 0, /*face_offset*/ 0, replay>();
+    _top8_merge_load_rows_4_7_</*tile_index*/ 0, /*face_offset*/ 0, replay>();
 
     // Transpose for bitonic merge
     TTI_SFPTRANSP(0, 0, 0, 0);
@@ -222,9 +269,9 @@ inline void _top8_merge_two_sorted_8_() {
     // Transpose back - data is now untransposed and sorted descending
     TTI_SFPTRANSP(0, 0, 0, 0);
 
-    // Store the result
-    _top8_merge_store_rows_0_3_</*tile_index*/ 0, /*face_offset*/ 0>();
-    _top8_merge_store_rows_4_7_</*tile_index*/ 0, /*face_offset*/ 0>();
+    // Store the result (positioning + replay store patterns)
+    _top8_merge_store_rows_0_3_</*tile_index*/ 0, /*face_offset*/ 0, replay>();
+    _top8_merge_store_rows_4_7_</*tile_index*/ 0, /*face_offset*/ 0, replay>();
 }
 
 // Main entry point for cross-core merge
@@ -233,26 +280,29 @@ inline void _top8_merge_() {
     TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
 
     // Sequentially merge core 0 data with that in cores 1-7
-    // Core 1: tile 1
-    _top8_merge_two_sorted_8_<1, 0>();
+    // First call records instructions into replay buffer (replay=false)
+    // Subsequent calls replay recorded instructions (replay=true)
 
-    // Core 2: tile 1
-    _top8_merge_two_sorted_8_<1, 1>();
+    // Core 1: tile 1 - Record instructions
+    _top8_merge_two_sorted_8_<1, 0, /*replay=*/false>();
 
-    // Core 3: tile 2
-    _top8_merge_two_sorted_8_<2, 0>();
+    // Core 2: tile 1 - Replay instructions
+    _top8_merge_two_sorted_8_<1, 1, /*replay=*/true>();
 
-    // Core 4: tile 2
-    _top8_merge_two_sorted_8_<2, 1>();
+    // Core 3: tile 2 - Replay instructions
+    _top8_merge_two_sorted_8_<2, 0, /*replay=*/true>();
 
-    // Core 5: tile 3
-    _top8_merge_two_sorted_8_<3, 0>();
+    // Core 4: tile 2 - Replay instructions
+    _top8_merge_two_sorted_8_<2, 1, /*replay=*/true>();
 
-    // Core 6: tile 3
-    _top8_merge_two_sorted_8_<3, 1>();
+    // Core 5: tile 3 - Replay instructions
+    _top8_merge_two_sorted_8_<3, 0, /*replay=*/true>();
 
-    // Core 7: tile 4
-    _top8_merge_two_sorted_8_<4, 0>();
+    // Core 6: tile 3 - Replay instructions
+    _top8_merge_two_sorted_8_<3, 1, /*replay=*/true>();
+
+    // Core 7: tile 4 - Replay instructions
+    _top8_merge_two_sorted_8_<4, 0, /*replay=*/true>();
 
     //-------------------------------------------------------------------------
     // Create a 32-bit value for each token (lane) for each expert in the column
