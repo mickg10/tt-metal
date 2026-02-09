@@ -156,12 +156,15 @@ def prepare_output_tensor(tt_output, ring2cores):
     # return group_scores.transpose(0, 1)
 
     # Only the last core has the values in the first 8 rows of the first 2 faces of the tile
-    tt_indices = each_shard[-1][8:16, :].transpose(0, 1).view(torch.uint16)
     tt_values = each_shard[-1][:8, :].transpose(0, 1)
-    token2experts_bitmask = ((each_shard[-1][16].view(torch.uint16).to(torch.int32)) << 16) + (
-        each_shard[-1][20].view(torch.uint16).to(torch.int32)
-    )
-    return tt_values, tt_indices, token2experts_bitmask
+    tt_as_bf16_indices = each_shard[-1][8:16, :].transpose(0, 1).view(torch.uint16)
+
+    # Initialize an empty array of shape tt_indices
+    tt_indices = torch.zeros(tt_as_bf16_indices.shape, dtype=torch.uint16)
+    for m, k in itertools.product(range(tt_as_bf16_indices.shape[0]), range(tt_as_bf16_indices.shape[1])):
+        tt_indices[m, k] = tt_as_bf16_indices[m, k].item() >> 7
+
+    return tt_values, tt_indices
 
 
 def get_accuracy_metrics(torch_output, tt_output):
@@ -392,11 +395,11 @@ def run_test_moe_mm(device, M, K, N, L, C, check_accuracy, dump_outputs):
                 torch_bitmask[:, :, i] = masked_bits.sum(dim=2)
 
         # Calculate accuracy metrics for each layer
-        for layer_id in range(L):
+        for layer_id, column_id in itertools.product(range(L), range(C)):
             torch_layer_values = torch_top8_values[layer_id, :, :]
             torch_layer_indices = torch_top8_indices[layer_id, :, :]
-            tt_layer_output = tt_to_torch_outputs[layer_id, :, :]
-            tt_values, tt_indices, token2experts_bitmask = prepare_output_tensor(tt_layer_output, ring2cores)
+            tt_layer_output = tt_to_torch_outputs[C * layer_id + column_id, :, :]
+            tt_values, tt_indices = prepare_output_tensor(tt_layer_output, ring2cores)
             layer_metrics = get_accuracy_metrics(torch_layer_values, tt_values)
             all_accuracy_metrics[layer_id] = layer_metrics
 
@@ -416,7 +419,7 @@ def run_test_moe_mm(device, M, K, N, L, C, check_accuracy, dump_outputs):
 
 
 SHAPE2TIME = {
-    (32, 7168, 256, 1, 1): 26.5,
+    (32, 7168, 256, 1, 1): 27,
 }
 
 

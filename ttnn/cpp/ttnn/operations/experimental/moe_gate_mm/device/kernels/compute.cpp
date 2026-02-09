@@ -272,7 +272,6 @@ void kernel_main() {
     cb_wait_front(cb_s2c_out, 1);
     transpose_wh_init_short(cb_s2c_out);
     transpose_wh_tile(cb_s2c_out, 0, 0);
-    cb_pop_front(cb_s2c_out, 1);
 
     // Sum the top-2 of the output
     sum_top2_tile_init();
@@ -302,6 +301,7 @@ void kernel_main() {
         // Get the adjusted scores
         transpose_wh_init_short(cb_s2c_out);
         transpose_wh_tile(cb_s2c_out, 0, 0);
+        cb_pop_front(cb_s2c_out, 1);
 
         // Get the group masks
         copy_tile_init(cb_w2c_in5);
@@ -352,6 +352,7 @@ void kernel_main() {
         tile_regs_acquire();
         transpose_wh_init_short(cb_s2c_out);
         transpose_wh_tile(cb_s2c_out, 0, 0);
+        cb_pop_front(cb_s2c_out, 1);
 
         copy_tile_init(cb_w2c_in5);
         copy_tile(cb_w2c_in5, 0, 2);
@@ -372,13 +373,15 @@ void kernel_main() {
         copy_tile(cb_w2c_in6, 3, 4);
 
         top8_merge_init();
-        top8_merge(/*column_idx=*/column_id);
+        top8_merge<column_id>();
 
         cb_pop_front(cb_w2c_in6, 4);
         tile_regs_commit();
 
         tile_regs_wait();
+        cb_reserve_back(cb_s2c_out, 1);
         pack_tile</*out_of_order_output=*/true>(0, cb_s2c_out, /*output_tile_index=*/0);
+        cb_push_back(cb_s2c_out, 1);
         tile_regs_release();
 
         // Let DM1 know that we are done

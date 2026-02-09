@@ -67,7 +67,7 @@ inline void _add_bias_(uint32_t bias_index) {
     TTI_SFPMAD(p_sfpu::LREG1, p_sfpu::LCONST_1, p_sfpu::LREG4, p_sfpu::LREG1, 0);
     TTI_SFPMAD(p_sfpu::LREG2, p_sfpu::LCONST_1, p_sfpu::LREG4, p_sfpu::LREG2, 0);
     TTI_SFPMAD(p_sfpu::LREG3, p_sfpu::LCONST_1, p_sfpu::LREG4, p_sfpu::LREG3, 0);
-    TTI_NOP;
+    TTI_SFPNOP;
 
     TTI_SFPTRANSP(0, 0, 0, 0);
 

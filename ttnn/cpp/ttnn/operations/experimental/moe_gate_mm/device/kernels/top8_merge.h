@@ -228,7 +228,8 @@ inline void _top8_merge_two_sorted_8_() {
 }
 
 // Main entry point for cross-core merge
-inline void _top8_merge_(uint32_t column_idx) {
+template <uint32_t column_idx>
+inline void _top8_merge_() {
     TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
 
     // Sequentially merge core 0 data with that in cores 1-7
@@ -253,84 +254,135 @@ inline void _top8_merge_(uint32_t column_idx) {
     // Core 7: tile 4
     _top8_merge_two_sorted_8_<4, 0>();
 
-    // Create a 32-bit mask of the top 8 values in face 2
+    //-------------------------------------------------------------------------
+    // Create a 32-bit value for each token (lane) for each expert in the column
+    //-------------------------------------------------------------------------
     _top8_merge_set_d_rwc_<0, 0, 0>();
 
     // Load just the top 4 indices
-    // TTI_SFPLOAD(p_sfpu::LREG0, InstrModLoadStore::LO16_ONLY, ADDR_MOD_1, 8);  // offset 0
-    // TTI_SFPLOAD(p_sfpu::LREG1, InstrModLoadStore::LO16_ONLY, ADDR_MOD_2, 8);  // offset 2
-    // TTI_SFPLOAD(p_sfpu::LREG2, InstrModLoadStore::LO16_ONLY, ADDR_MOD_1, 8);  // offset 16
-    // TTI_SFPLOAD(p_sfpu::LREG3, InstrModLoadStore::LO16_ONLY, ADDR_MOD_3, 8);  // offset 18
+    TTI_SFPLOAD(p_sfpu::LREG0, InstrModLoadStore::LO16, ADDR_MOD_1, 8);  // offset 0
+    TTI_SFPLOAD(p_sfpu::LREG1, InstrModLoadStore::LO16, ADDR_MOD_2, 8);  // offset 2
+    TTI_SFPLOAD(p_sfpu::LREG2, InstrModLoadStore::LO16, ADDR_MOD_1, 8);  // offset 16
+    TTI_SFPLOAD(p_sfpu::LREG3, InstrModLoadStore::LO16, ADDR_MOD_3, 8);  // offset 18
 
-    // TTI_SFPTRANSP(0, 0, 0, 0);
+    TTI_SFPTRANSP(0, 0, 0, 0);
 
-    // TTI_SFPMOV(0, p_sfpu::LCONST_0, p_sfpu::LREG4, 0); // Initialize accumulator to 0
+    TTI_SFPMOV(0, p_sfpu::LCONST_0, p_sfpu::LREG4, 0);  // Initialize accumulator to 0 (Lower 16 experts)
+    TTI_SFPMOV(0, p_sfpu::LCONST_0, p_sfpu::LREG5, 0);  // Initialize accumulator to 0 (Higher 16 experts)
 
     // Main loop: 4 iterations, one per index slot
-    for (uint32_t lreg = 0; lreg < 1; lreg++) {
-        // TTI_SFPMOV(0, p_sfpu::LCONST_0, p_sfpu::LREG5, 0);
+    for (uint32_t lreg = 0; lreg < 4; lreg++) {
+        TTI_SFPMOV(0, p_sfpu::LCONST_0, p_sfpu::LREG6, 0);
+        // If value is less than "column_idx" in any lane, disable that lane
+        TTI_SFPIADD((-int(column_idx << 5)) & 0xfff, lreg, lreg, SFPIADD_MOD1_ARG_IMM | SFPIADD_MOD1_CC_GTE0);
 
-        // // If value is less than "column_idx" in any lane, disable that lane
-        // TTI_SFPIADD((-int(column_idx)) & 0xfff, lreg, lreg, SFPIADD_MOD1_ARG_IMM | SFPIADD_MOD1_CC_LT0);
+        // If value is greater than column_idx + 15 in any lane, disable that lane also
+        TTI_SFPIADD((-int(16)) & 0xfff, lreg, p_sfpu::LREG7, SFPIADD_MOD1_ARG_IMM | SFPIADD_MOD1_CC_LT0);
 
-        // // Add 1 if lane is enabled
-        // TTI_SFPIADD(0x1, p_sfpu::LREG5, p_sfpu::LREG5, SFPIADD_MOD1_ARG_IMM | SFPIADD_MOD1_CC_NONE);
+        // Add 1 if lane is enabled
+        TTI_SFPIADD(0x1, p_sfpu::LREG6, p_sfpu::LREG6, SFPIADD_MOD1_ARG_IMM | SFPIADD_MOD1_CC_NONE);
 
-        // TTI_SFPSHFT2(p_sfpu::LREG5, lreg, p_sfpu::LREG6, SFPSHFT2_MOD1_SHFT_LREG);
+        // Shift left by the value in LREG[i]: LREG7 = (1 << LREG[i])
+        // This creates a bitmask where bit LREG[i] is set
+        TTI_SFPSHFT2(p_sfpu::LREG6, lreg, p_sfpu::LREG7, SFPSHFT2_MOD1_SHFT_LREG);
 
-        // // Now add this to the accumulator
-        // TTI_SFPOR(0, p_sfpu::LREG6, p_sfpu::LREG4, 0);
+        // Now add this to the accumulator
+        TTI_SFPOR(0, p_sfpu::LREG7, p_sfpu::LREG4, 0);
 
-        // // Clear condition codes (re-enable all lanes)
-        // TTI_SFPENCC(0, 0, 0, 0);
+        // Clear condition codes (re-enable all lanes)
+        TTI_SFPENCC(0, 0, 0, 0);
     }
 
-    // TTI_SFPTRANSP(0, 0, 0, 0);
-    // // Load just next 4 indices
-    // TTI_SFPLOAD(p_sfpu::LREG0, InstrModLoadStore::LO16_ONLY, ADDR_MOD_1, 8);  // offset 0
-    // TTI_SFPLOAD(p_sfpu::LREG1, InstrModLoadStore::LO16_ONLY, ADDR_MOD_2, 8);  // offset 2
-    // TTI_SFPLOAD(p_sfpu::LREG2, InstrModLoadStore::LO16_ONLY, ADDR_MOD_1, 8);  // offset 16
-    // TTI_SFPLOAD(p_sfpu::LREG3, InstrModLoadStore::LO16_ONLY, ADDR_MOD_3, 8);  // offset 18
+    // Main loop: 4 iterations, one per index slot
 
-    // TTI_SFPTRANSP(0, 0, 0, 0);
+    for (uint32_t lreg = 0; lreg < 4; lreg++) {
+        TTI_SFPMOV(0, p_sfpu::LCONST_0, p_sfpu::LREG6, 0);
+        // If value is less than "column_idx + 16" in any lane, disable that lane
+        TTI_SFPIADD((-int(16)) & 0xfff, lreg, lreg, SFPIADD_MOD1_ARG_IMM | SFPIADD_MOD1_CC_GTE0);
 
-    // // Main loop: 4 iterations, one per index slot
-    // for (uint32_t lreg = 0; lreg < 4; lreg++) {
-    //     TTI_SFPMOV(0, p_sfpu::LCONST_0, p_sfpu::LREG5, 0);
+        // If value is greater than column_idx + 15 in any lane, disable that lane also
+        TTI_SFPIADD((-int(16)) & 0xfff, lreg, p_sfpu::LREG7, SFPIADD_MOD1_ARG_IMM | SFPIADD_MOD1_CC_LT0);
 
-    //     // If value is less than "column_idx" in any lane, disable that lane
-    //     TTI_SFPIADD((-int(column_idx)) & 0xfff, lreg, lreg, SFPIADD_MOD1_ARG_IMM | SFPIADD_MOD1_CC_GTE0);
+        // Add 1 if lane is enabled
+        TTI_SFPIADD(0x1, p_sfpu::LREG6, p_sfpu::LREG6, SFPIADD_MOD1_ARG_IMM | SFPIADD_MOD1_CC_NONE);
 
-    //     // If value is greater than column_idx + 31 in any lane, disable that lane also
-    //     TTI_SFPIADD((-int(32)) & 0xfff, lreg, lreg, SFPIADD_MOD1_ARG_IMM | SFPIADD_MOD1_CC_LT0);
+        // Shift left by the value in LREG[i]: LREG7 = (1 << LREG[i])
+        // This creates a bitmask where bit LREG[i] is set
+        TTI_SFPSHFT2(p_sfpu::LREG6, lreg, p_sfpu::LREG7, SFPSHFT2_MOD1_SHFT_LREG);
 
-    //     // Add 1 if lane is enabled
-    //     TTI_SFPIADD(0x1, p_sfpu::LREG5, p_sfpu::LREG5, SFPIADD_MOD1_ARG_IMM | SFPIADD_MOD1_CC_NONE);
+        // Now add this to the accumulator
+        TTI_SFPOR(0, p_sfpu::LREG7, p_sfpu::LREG5, 0);
 
-    //     TTI_SFPSHFT2(p_sfpu::LREG5, lreg, p_sfpu::LREG6, SFPSHFT2_MOD1_SHFT_LREG);
+        // Clear condition codes (re-enable all lanes)
+        TTI_SFPENCC(0, 0, 0, 0);
+    }
 
-    //     // Now add this to the accumulator
-    //     TTI_SFPOR(0, p_sfpu::LREG6, p_sfpu::LREG4, 0);
+    TTI_SFPTRANSP(0, 0, 0, 0);
 
-    //     // Clear condition codes (re-enable all lanes)
-    //     TTI_SFPENCC(0, 0, 0, 0);
-    // }
+    // Load just next 4 indices
+    TTI_SFPLOAD(p_sfpu::LREG0, InstrModLoadStore::LO16, ADDR_MOD_1, 8);  // offset 0
+    TTI_SFPLOAD(p_sfpu::LREG1, InstrModLoadStore::LO16, ADDR_MOD_2, 8);  // offset 2
+    TTI_SFPLOAD(p_sfpu::LREG2, InstrModLoadStore::LO16, ADDR_MOD_1, 8);  // offset 16
+    TTI_SFPLOAD(p_sfpu::LREG3, InstrModLoadStore::LO16, ADDR_MOD_3, 8);  // offset 18
 
-    // TTI_SFPTRANSP(0, 0, 0, 0);
+    TTI_SFPTRANSP(0, 0, 0, 0);
+
+    // Main loop: 4 iterations, one per index slot
+    for (uint32_t lreg = 0; lreg < 4; lreg++) {
+        TTI_SFPMOV(0, p_sfpu::LCONST_0, p_sfpu::LREG6, 0);
+        // If value is less than "column_idx" in any lane, disable that lane
+        TTI_SFPIADD((-int(column_idx << 5)) & 0xfff, lreg, lreg, SFPIADD_MOD1_ARG_IMM | SFPIADD_MOD1_CC_GTE0);
+
+        // If value is greater than column_idx + 15 in any lane, disable that lane also
+        TTI_SFPIADD((-int(16)) & 0xfff, lreg, p_sfpu::LREG7, SFPIADD_MOD1_ARG_IMM | SFPIADD_MOD1_CC_LT0);
+
+        // Add 1 if lane is enabled
+        TTI_SFPIADD(0x1, p_sfpu::LREG6, p_sfpu::LREG6, SFPIADD_MOD1_ARG_IMM | SFPIADD_MOD1_CC_NONE);
+
+        // Shift left by the value in LREG[i]: LREG7 = (1 << LREG[i])
+        // This creates a bitmask where bit LREG[i] is set
+        TTI_SFPSHFT2(p_sfpu::LREG6, lreg, p_sfpu::LREG7, SFPSHFT2_MOD1_SHFT_LREG);
+
+        // Now add this to the accumulator
+        TTI_SFPOR(0, p_sfpu::LREG7, p_sfpu::LREG4, 0);
+
+        // Clear condition codes (re-enable all lanes)
+        TTI_SFPENCC(0, 0, 0, 0);
+    }
+
+    // Main loop: 4 iterations, one per index slot
+
+    for (uint32_t lreg = 0; lreg < 4; lreg++) {
+        TTI_SFPMOV(0, p_sfpu::LCONST_0, p_sfpu::LREG6, 0);
+        // If value is less than "column_idx + 16" in any lane, disable that lane
+        TTI_SFPIADD((-int(16)) & 0xfff, lreg, lreg, SFPIADD_MOD1_ARG_IMM | SFPIADD_MOD1_CC_GTE0);
+
+        // If value is greater than column_idx + 15 in any lane, disable that lane also
+        TTI_SFPIADD((-int(16)) & 0xfff, lreg, p_sfpu::LREG7, SFPIADD_MOD1_ARG_IMM | SFPIADD_MOD1_CC_LT0);
+
+        // Add 1 if lane is enabled
+        TTI_SFPIADD(0x1, p_sfpu::LREG6, p_sfpu::LREG6, SFPIADD_MOD1_ARG_IMM | SFPIADD_MOD1_CC_NONE);
+
+        // Shift left by the value in LREG[i]: LREG7 = (1 << LREG[i])
+        // This creates a bitmask where bit LREG[i] is set
+        TTI_SFPSHFT2(p_sfpu::LREG6, lreg, p_sfpu::LREG7, SFPSHFT2_MOD1_SHFT_LREG);
+
+        // Now add this to the accumulator
+        TTI_SFPOR(0, p_sfpu::LREG7, p_sfpu::LREG5, 0);
+
+        // Clear condition codes (re-enable all lanes)
+        TTI_SFPENCC(0, 0, 0, 0);
+    }
+
+    TTI_SFPTRANSP(0, 0, 0, 0);
 
     // Store result
-    // _top8_merge_set_d_rwc_<0, 1, 0>();
+    _top8_merge_set_d_rwc_<0, 1, 0>();
 
-    // TTI_SFPSTORE(p_sfpu::LREG4, InstrModLoadStore::HI16_ONLY, ADDR_MOD_1, 0);
-    // TTI_SFPSTORE(p_sfpu::LREG5, InstrModLoadStore::HI16_ONLY, ADDR_MOD_2, 0);
-    // TTI_SFPSTORE(p_sfpu::LREG6, InstrModLoadStore::HI16_ONLY, ADDR_MOD_1, 0);
-    // TTI_SFPSTORE(p_sfpu::LREG7, InstrModLoadStore::HI16_ONLY, ADDR_MOD_3, 0);
-
-    // _top8_merge_set_d_rwc_<0, 1, 4>();
-    // TTI_SFPSTORE(p_sfpu::LREG4, InstrModLoadStore::LO16_ONLY, ADDR_MOD_1, 0);
-    // TTI_SFPSTORE(p_sfpu::LREG5, InstrModLoadStore::LO16_ONLY, ADDR_MOD_2, 0);
-    // TTI_SFPSTORE(p_sfpu::LREG6, InstrModLoadStore::LO16_ONLY, ADDR_MOD_1, 0);
-    // TTI_SFPSTORE(p_sfpu::LREG7, InstrModLoadStore::LO16_ONLY, ADDR_MOD_3, 0);
+    TTI_SFPSTORE(p_sfpu::LREG4, InstrModLoadStore::LO16, ADDR_MOD_1, 0);
+    TTI_SFPSTORE(p_sfpu::LREG5, InstrModLoadStore::LO16, ADDR_MOD_2, 0);
+    TTI_SFPSTORE(p_sfpu::LREG6, InstrModLoadStore::LO16, ADDR_MOD_1, 0);
+    TTI_SFPSTORE(p_sfpu::LREG7, InstrModLoadStore::LO16, ADDR_MOD_3, 0);
 }
 
 }  // namespace sfpu
@@ -340,9 +392,10 @@ inline void _llk_math_top8_merge_init_() {
         ckernel::sfpu::_top8_merge_configure_addrmod_);
 }
 
-inline void _llk_math_top8_merge_(uint32_t column_idx) {
+template <uint32_t column_idx>
+inline void _llk_math_top8_merge_() {
     _llk_math_eltwise_unary_sfpu_params_</*APPROXIMATE=*/true>(
-        ckernel::sfpu::_top8_merge_, 0, VectorMode::RC_custom, column_idx);
+        ckernel::sfpu::_top8_merge_<column_idx>, 0, VectorMode::RC_custom);
 }
 
 #endif
@@ -369,6 +422,9 @@ inline void top8_merge_init() { MATH((_llk_math_top8_merge_init_())); }
  * - Tile 0, face 0: Merged top8 for lanes 0-15
  * - Tile 0, face 1: Merged top8 for lanes 16-31
  */
-ALWI void top8_merge(uint32_t column_idx) { MATH((_llk_math_top8_merge_(column_idx))); }
+template <uint32_t column_idx>
+ALWI void top8_merge() {
+    MATH((_llk_math_top8_merge_<column_idx>()));
+}
 
 }  // namespace ckernel
