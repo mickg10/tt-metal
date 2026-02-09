@@ -24,6 +24,7 @@ from ...models.vae.vae_mochi import MochiVAEDecoder
 from ...parallel.config import DiTParallelConfig, MochiVAEParallelConfig, ParallelFactor
 from ...parallel.manager import CCLManager
 from ...utils import cache
+from ...utils.tracing import Tracer
 
 
 # from: https://github.com/genmoai/models/blob/075b6e36db58f1242921deff83a1066887b9c9e1/src/mochi_preview/infer.py#L77
@@ -224,6 +225,7 @@ class MochiPipeline(DiffusionPipeline):
             parallel_config=parallel_config,
             is_fsdp=True,
         )
+        self._transformer_tracer = Tracer(self.transformer.forward, device=mesh_device)
 
         # Load state dict into TT transformer
         cache.load_model(
@@ -785,13 +787,15 @@ class MochiPipeline(DiffusionPipeline):
                 print(f"prompt_attention_mask.shape: {prompt_attention_mask.shape}")
                 print(f"attention_kwargs: {attention_kwargs}")
 
-                noise_pred_uncond = self.transformer(
+                forward = self._transformer_tracer if traced else self.transformer.forward
+
+                noise_pred_uncond = forward(
                     spatial=latent_model_input[:1],
                     prompt=prompt_embeds[:1],
                     timestep=timestep[:1],
                     prompt_attention_mask=prompt_attention_mask[:1],
                 )
-                noise_pred_text = self.transformer(
+                noise_pred_text = forward(
                     spatial=latent_model_input[1:],
                     prompt=prompt_embeds[1:],
                     timestep=timestep[1:],
