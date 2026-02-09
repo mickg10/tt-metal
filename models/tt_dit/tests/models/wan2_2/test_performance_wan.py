@@ -13,8 +13,8 @@ from PIL import Image
 
 import ttnn
 from models.common.utility_functions import is_blackhole
-from models.experimental.tt_dit.pipelines.wan.pipeline_wan import WanPipeline
-from models.experimental.tt_dit.pipelines.wan.pipeline_wan_i2v import WanPipelineI2V
+from models.tt_dit.pipelines.wan.pipeline_wan import WanPipeline
+from models.tt_dit.pipelines.wan.pipeline_wan_i2v import WanPipelineI2V
 from models.perf.benchmarking_utils import BenchmarkData, BenchmarkProfiler
 
 from ....utils.test import line_params, ring_params
