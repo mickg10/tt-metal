@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Tuple
 
@@ -13,6 +12,7 @@ from tracy import signpost
 from transformers import AutoConfig
 
 import ttnn
+from models.common.warmup import DecodeWarmupMixin
 from models.demos.deepseek_v3.tt.ccl import CCL
 from models.demos.deepseek_v3.tt.mla.mla2d import MLA2D
 from models.demos.deepseek_v3.tt.model.row_batched_model import RowBatchedModel
@@ -22,13 +22,7 @@ from models.demos.deepseek_v3.utils.config_helpers import USERS_PER_ROW, even_in
 from models.demos.deepseek_v3.utils.run_config import create_run_config
 from models.demos.deepseek_v3.utils.weight_config import get_weight_config
 from models.perf.benchmarking_utils import BenchmarkProfiler
-
-
-@dataclass(frozen=True)
-class SamplingParams:
-    temperature: float = 0.0
-    top_k: int = 0
-    top_p: float = 0.0
+from models.tt_transformers.tt.common import SamplingParams
 
 
 def _strip_model_prefix(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -46,7 +40,7 @@ def _strip_model_prefix(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.
     return out
 
 
-class DeepseekGenerator:
+class DeepseekGenerator(DecodeWarmupMixin):
     """
     Simple generator that wires RowBatchedModel + LMHead for decode-only inference.
 
@@ -151,7 +145,6 @@ class DeepseekGenerator:
         self.signpost = signpost
         self.prefill_max_tokens = prefill_max_tokens
         logger.info(f"Enable trace: {self.enable_trace}")
-
         # Initialize rope_setup once
         self.rope_setup = RotarySetup(
             device=self.mesh_device, batch_size_per_row=self.batch_size_per_row, hf_config=self.hf_config

@@ -5,6 +5,7 @@
 import math
 import os
 import re
+from dataclasses import dataclass
 from enum import Enum
 from types import SimpleNamespace
 from typing import Optional
@@ -16,10 +17,11 @@ from pydantic import AliasChoices, BaseModel, Field
 
 import ttnn
 
-
+        
 class Mode(Enum):
     DECODE = "decode"
     PREFILL = "prefill"
+
 
 
 class HostEmbedding(torch.nn.Module):
