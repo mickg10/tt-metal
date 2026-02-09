@@ -43,7 +43,7 @@ MoEGateMMProgramFactory::cached_program_t MoEGateMMProgramFactory::create(
         | cb_w2c_in4     | CBIndex::c_6  | Float16_b  | true  |    1     |      2048       |
         | cb_w2c_in5     | CBIndex::c_7  | Float16_b  | true  |    1     |      2048       |
         | cb_w2c_in6     | CBIndex::c_8  | Float16_b  | true  |    4     |      8192       |
-        | cb_w2c_in7     | CBIndex::c_9  | Float16_b  | true  |    8     |      16384      |
+        | cb_w2c_in7     | CBIndex::c_9  | Float16_b  | true  |    4     |      8192      |
         ------------------------------------------------------------------------------------
     */
 
@@ -56,7 +56,7 @@ MoEGateMMProgramFactory::cached_program_t MoEGateMMProgramFactory::create(
         {"cb_w2c_in4", tt::CBIndex::c_6, tt::DataFormat::Float16_b, true, 1},
         {"cb_w2c_in5", tt::CBIndex::c_7, tt::DataFormat::Float16_b, true, 1},
         {"cb_w2c_in6", tt::CBIndex::c_8, tt::DataFormat::Float16_b, true, 4},
-        {"cb_w2c_in7", tt::CBIndex::c_9, tt::DataFormat::Float16_b, true, 8},
+        {"cb_w2c_in7", tt::CBIndex::c_9, tt::DataFormat::Float16_b, true, 4},
     };
 
     [[maybe_unused]] std::map<std::string, tt::tt_metal::CBHandle> cb_handles, cb_handles_sharded;
