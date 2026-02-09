@@ -4,9 +4,9 @@
 
 #pragma once
 
+#include <map>
 #include <tt_stl/span.hpp>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 #include <hostdevcommon/common_values.hpp>
 #include "umd/device/types/cluster_descriptor_types.hpp"
@@ -19,6 +19,9 @@ class DispatchContext;
 }  // namespace experimental
 
 class IDevice;
+class FirmwareInitializer;
+enum class InitializerKey;
+
 class DeviceManager {
 public:
     ~DeviceManager();
@@ -45,7 +48,6 @@ public:
     bool is_device_active(ChipId id) const;
     // True if dispatch firmware is active on this device pool
     bool is_dispatch_firmware_active() const;
-    void init_profiler() const;
     void initialize_fabric_and_dispatch_fw();
     // API needed due to Issue #19729
     std::size_t get_max_num_eth_cores_across_all_devices() const;
@@ -59,10 +61,6 @@ private:
     bool using_fast_dispatch_ = false;
     bool init_profiler_ = true;
     bool initialize_fabric_and_dispatch_fw_ = false;
-    // This variable tracks the state of dispatch firmware on device.
-    // It is set to true when dispatch firmware is launched, and reset
-    // after the terminate command is sent.
-    bool dispatch_firmware_active_ = false;
     bool is_initialized_ = false;
 
     mutable std::mutex lock_;
@@ -70,6 +68,7 @@ private:
 
     bool skip_remote_devices_{};
 
+    std::map<InitializerKey, std::unique_ptr<FirmwareInitializer>> initializers_;
     // Determine which CPU cores the worker threads need to be placed on for each device
     std::unordered_map<uint32_t, uint32_t> worker_thread_to_cpu_core_map_;
     std::unordered_map<uint32_t, uint32_t> completion_queue_reader_to_cpu_core_map_;
@@ -77,25 +76,15 @@ private:
     void activate_device(ChipId id);
     Device* get_active_device_internal(ChipId device_id) const;
 
-    // Initialize DeviceManager
-    void initialize_devices(const std::vector<ChipId>& device_ids);
+    // Open requested devices, configure fabric, and initialize firmware.
+    void open_devices(const std::vector<ChipId>& device_ids);
 
-    // Initialize state on the host for this device
-    void initialize_host(IDevice* dev) const;
-
-    // Initialize state for activated devices
-    void init_fabric(const std::vector<IDevice*>& active_devices) const;
-    void initialize_active_devices();
-    void configure_and_load_fast_dispatch_kernels();
-    void compile_and_load_fabric();
     void add_devices_to_pool(const std::vector<ChipId>& device_ids);
-    void wait_for_fabric_router_sync(uint32_t timeout_ms = 5000) const;
     Device* get_device(ChipId id) const;
-    // NOLINTNEXTLINE(readability-make-member-function-const)
-    void teardown_fd(const std::unordered_set<ChipId>& devices_to_close);
 
-    // Retrieves the fabric router sync timeout value from configuration or returns a default
-    static uint32_t get_fabric_router_sync_timeout_ms();
+    // Initialize dispatch firmware (compile + configure device CQs).
+    // Delegates to DispatchFirmwareInitializer. Used by DispatchContext for manual FD setup.
+    void initialize_dispatch_firmware();
 
     friend class experimental::DispatchContext;
 };
