@@ -260,6 +260,7 @@ class TtLlamaMLP(LightweightModule):
                 matmul_config=minimal_pc_1_3,
                 compute_kernel_config=self.args.compute_kernel_config_lofi,
             )
+            ttnn.deallocate(matmul_out)
             # print("Reading out")
             # torch_out = ttnn.to_torch(
             #     w1_out_reduced,
@@ -290,13 +291,13 @@ class TtLlamaMLP(LightweightModule):
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
             ttnn.deallocate(x)
-            print("Reduce scatter input = ", w3_out.shape, "output = ", w3_out_reduced.shape)
             w3_out_reduced = self.tt_ccl.line_reduce_scatter(
                 w3_out, cluster_axis=1, num_links=3, memory_config=w3_out.memory_config(), buffer_key="FF3", dim=3
             )
+            print("Reduce scatter input = ", w3_out.shape, "output = ", w3_out_reduced.shape)
             ttnn.deallocate(w3_out)
         else:
-            w3_out_reduced, _ = self.tt_ccl.minimal_matmul_reduce_scatter(
+            w3_out_reduced, matmul_out = self.tt_ccl.minimal_matmul_reduce_scatter(
                 matmul_input=x,
                 matmul_weight=self.w3_interleaved if use_w1_w3_interleaved else self.w3,
                 cluster_axis=1,
@@ -306,6 +307,7 @@ class TtLlamaMLP(LightweightModule):
                 matmul_config=minimal_pc_1_3,
                 compute_kernel_config=self.args.compute_kernel_config_lofi,
             )
+            ttnn.deallocate(matmul_out)
             # w3_out = ttnn.experimental.minimal_matmul(
             #     input_tensor=x,
             #     weight_tensor=self.w3_interleaved if use_w1_w3_interleaved else self.w3,
