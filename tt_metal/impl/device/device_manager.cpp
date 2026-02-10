@@ -488,14 +488,11 @@ void DeviceManager::init_firmware_on_active_devices() {
             descriptor_, skip_remote_devices_, ctx.profiler_state_manager().get());
     }
 
-    // Init + configure CQ and Profiler (configure is a no-op for both)
     for (auto& [key, init] : initializers_) {
         init->init(active_devices);
         init->configure();
     }
 
-    // Fabric + dispatch use interleaved ordering (dispatch compilation overlaps
-    // with fabric router handshake), so they go through their own method.
     if (initialize_fabric_and_dispatch_fw_) {
         this->initialize_fabric_and_dispatch_fw();
     }
