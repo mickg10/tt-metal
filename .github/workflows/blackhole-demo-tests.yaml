@@ -135,7 +135,7 @@ jobs:
       build-wheel: true
       platform: ${{ inputs.platform || 'Ubuntu 22.04' }}
       enable-lto: ${{ inputs.enable-lto || false }}
-  blackhole-multi-card-demo-tests:
+  blackhole-demo-tests:
     needs: [build-artifact, generate-card-matrix]
     secrets: inherit
     uses: ./.github/workflows/blackhole-demo-tests-impl.yaml
