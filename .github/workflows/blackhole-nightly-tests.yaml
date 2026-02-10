@@ -25,6 +25,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_bh_ttnn_stress_tests:
+        description: 'Run Blackhole ttnn stress tests'
+        required: false
+        type: boolean
+        default: false
       platform:
         required: false
         type: choice
@@ -61,6 +66,16 @@ on:
         required: false
         default: "all"
         type: string
+      run_grid_override_tests:
+        description: 'Run Blackhole grid override tests (20 cores/110 cores tests on 1xP150b)'
+        required: false
+        type: boolean
+        default: false
+      run_bh_ttnn_stress_tests:
+        description: 'Run Blackhole ttnn stress tests'
+        required: false
+        type: boolean
+        default: false
       platform:
         required: false
         type: string
@@ -147,3 +162,23 @@ jobs:
       build-artifact-name: ${{ needs.build-artifact.outputs.build-artifact-name }}
       wheel-artifact-name: ${{ needs.build-artifact.outputs.wheel-artifact-name }}
       runner-label: P150b
+  blackhole-ttnn-stress-tests:
+    if: ${{ github.event_name == 'schedule' || inputs.run_bh_ttnn_stress_tests }}
+    needs: build-artifact
+    secrets: inherit
+    uses: ./.github/workflows/ttnn-stress-tests-impl.yaml
+    strategy:
+      fail-fast: false
+      matrix:
+        test-group:
+          - name: P150b ttnn stress tests
+            runner-label: P150b
+          - name: LLMBox ttnn stress tests
+            runner-label: BH-LLMBox
+    with:
+      arch: blackhole
+      runner-label: ${{ matrix.test-group.runner-label }}
+      timeout: 45
+      docker-image: ${{ needs.build-artifact.outputs.dev-docker-image }}
+      build-artifact-name: ${{ needs.build-artifact.outputs.build-artifact-name }}
+      wheel-artifact-name: ${{ needs.build-artifact.outputs.wheel-artifact-name }}
