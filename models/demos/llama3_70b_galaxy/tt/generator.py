@@ -24,7 +24,7 @@ from models.tt_transformers.tt.common import (
     get_block_size,
 )
 from models.common.sampling.generator import format_sampling_params
-from models.tt_transformers.tt.common import SamplingParams
+from models.common.sampling.sampling_params import SamplingParams
 from models.common.warmup import DecodeWarmupMixin
 
 
