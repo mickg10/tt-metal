@@ -28,8 +28,8 @@ public:
     bool is_initialized() const override;
 
 private:
-    bool skip_remote_devices_;
-    ProfilerStateManager* profiler_state_manager_;
+    [[maybe_unused]] bool skip_remote_devices_;
+    [[maybe_unused]] ProfilerStateManager* profiler_state_manager_;
     std::vector<IDevice*> devices_;
     bool initialized_ = false;
 };

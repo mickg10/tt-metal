@@ -29,7 +29,7 @@ ProfilerInitializer::ProfilerInitializer(
 void ProfilerInitializer::init(const std::vector<IDevice*>& devices) {
     devices_ = devices;
 
-#if defined(TRACY_ENABLE)
+#if !defined(TRACY_ENABLE)
     if (!getDeviceProfilerState()) {
         initialized_ = true;
         return;
