@@ -165,6 +165,24 @@ public:
         return it->second;
     }
 
+    // Get all names and types (returns unique values)
+    std::unordered_set<std::string> all_names() const {
+        std::unordered_set<std::string> names;
+        names.reserve(instances_by_name_.size());
+        for (const auto& [name, _] : instances_by_name_) {
+            names.insert(name);
+        }
+        return names;
+    }
+    std::unordered_set<std::string> all_types() const {
+        std::unordered_set<std::string> types;
+        types.reserve(instances_by_type_.size());
+        for (const auto& [type, _] : instances_by_type_) {
+            types.insert(type);
+        }
+        return types;
+    }
+
     // TODO: This will disappear after we move to Physical discovery
     proto::Architecture get_arch() const;
     uint32_t get_num_eth_ports_per_direction() const;

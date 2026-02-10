@@ -542,7 +542,7 @@ TEST(PhysicalGroupingDescriptorTests, GetGroupingsByNameReturnsAllDefinitions) {
         EXPECT_EQ(meshes.size(), 1);
         EXPECT_EQ(meshes[0].name, "meshes");
         EXPECT_EQ(meshes[0].items.size(), 1);
-        EXPECT_EQ(meshes[0].items[0].type, PhysicalGroupingDescriptor::GroupingItemInfo::ItemType::GROUPING_REF);
+        EXPECT_EQ(meshes[0].items[0].type, GroupingItemInfo::ItemType::GROUPING_REF);
         EXPECT_EQ(meshes[0].items[0].grouping_name, "halftray");
         // Count is represented by items.size(), which is 1 in this case
     });
@@ -649,15 +649,14 @@ TEST(PhysicalGroupingDescriptorTests, GetAllGroupingsReturnsAllGroupings) {
             if (grouping.name == "meshes") {
                 found_meshes = true;
                 EXPECT_EQ(grouping.items.size(), 1);
-                EXPECT_EQ(
-                    grouping.items[0].type, PhysicalGroupingDescriptor::GroupingItemInfo::ItemType::ASIC_LOCATION);
+                EXPECT_EQ(grouping.items[0].type, GroupingItemInfo::ItemType::ASIC_LOCATION);
                 EXPECT_EQ(grouping.items[0].asic_location, 1);
             } else if (grouping.name == "pods") {
                 found_pods = true;
                 EXPECT_EQ(grouping.items.size(), 2);  // Count is represented by items.size()
-                EXPECT_EQ(grouping.items[0].type, PhysicalGroupingDescriptor::GroupingItemInfo::ItemType::GROUPING_REF);
+                EXPECT_EQ(grouping.items[0].type, GroupingItemInfo::ItemType::GROUPING_REF);
                 EXPECT_EQ(grouping.items[0].grouping_name, "meshes");
-                EXPECT_EQ(grouping.items[1].type, PhysicalGroupingDescriptor::GroupingItemInfo::ItemType::GROUPING_REF);
+                EXPECT_EQ(grouping.items[1].type, GroupingItemInfo::ItemType::GROUPING_REF);
                 EXPECT_EQ(grouping.items[1].grouping_name, "meshes");
             }
         }

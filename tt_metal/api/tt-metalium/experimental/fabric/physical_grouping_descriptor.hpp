@@ -11,6 +11,7 @@
 #include <vector>
 
 #include <tt_stl/assert.hpp>
+#include <tt-metalium/experimental/fabric/mesh_graph_descriptor.hpp>
 
 // Forward declaration
 namespace tt::tt_fabric {
@@ -23,6 +24,22 @@ class GroupingItem;
 class GroupingReference;
 enum AsicLocation : int;
 }  // namespace proto
+
+// Grouping item information
+struct GroupingItemInfo {
+    enum class ItemType { ASIC_LOCATION, GROUPING_REF };
+
+    ItemType type;
+    uint32_t asic_location = 0;  // Only valid if type == ASIC_LOCATION
+    std::string grouping_name;   // Only valid if type == GROUPING_REF
+    // Note: Counts are represented by having multiple items. Use items.size() to get the count.
+};
+
+// Grouping information
+struct GroupingInfo {
+    std::string name;
+    std::vector<GroupingItemInfo> items;
+};
 
 // PhysicalGroupingDescriptor - Interpreter class for physical grouping descriptor files
 // Similar to MeshGraphDescriptor, provides validation and access to grouping definitions
@@ -44,22 +61,6 @@ public:
 
     // Get total number of groupings (including duplicates)
     size_t get_grouping_count() const;
-
-    // Grouping item information
-    struct GroupingItemInfo {
-        enum class ItemType { ASIC_LOCATION, GROUPING_REF };
-
-        ItemType type;
-        uint32_t asic_location = 0;  // Only valid if type == ASIC_LOCATION
-        std::string grouping_name;   // Only valid if type == GROUPING_REF
-        // Note: Counts are represented by having multiple items. Use items.size() to get the count.
-    };
-
-    // Grouping information
-    struct GroupingInfo {
-        std::string name;
-        std::vector<GroupingItemInfo> items;
-    };
 
     // Get all groupings with a specific name (supports multiple definitions)
     // Returns grouping information without exposing proto objects
@@ -92,5 +93,54 @@ private:
     static void validate_counts(const proto::PhysicalGroupings& proto, std::vector<std::string>& errors);
     static void validate_grouping_structure(const proto::PhysicalGroupings& proto, std::vector<std::string>& errors);
 };
+
+/**
+ * @brief Finds and returns valid groupings that match instance names defined in the MeshGraphDescriptor (MGD),
+ *        organized hierarchically by TYPE and then by NAME.
+ *
+ * This function extracts all instance names from the provided MGD and matches them against available physical
+ * groupings. The matching process works as follows:
+ *
+ * 1. **Name Matching**: For each instance in the MGD (identified by its name, e.g., "G0", "G1", "M0", "M1"),
+ *    the function searches for physical groupings with matching names. A grouping matches if its name exactly
+ *    matches an instance name from the MGD.
+ *
+ * 2. **Type Categorization**: Matched groupings are first categorized by their TYPE (e.g., "CLUSTER", "POD",
+ *    "MESH", "DEVICE", "SWITCH"). The TYPE corresponds to the instance type in the MGD, allowing groupings
+ *    to be grouped by their logical category.
+ *
+ * 3. **Name Organization**: Within each TYPE category, groupings are further organized by their NAME. This
+ *    allows multiple groupings of the same type to be distinguished (e.g., multiple "MESH" instances like "M0",
+ *    "M1", "M2" are each stored under their respective names within the "MESH" type category).
+ *
+ * @param mesh_graph_descriptor The MeshGraphDescriptor containing instance definitions (names and types) to
+ *                              match against available physical groupings.
+ *
+ * @return A nested unordered map structure:
+ *         - Outer map key: Instance TYPE (e.g., "CLUSTER", "POD", "MESH", "DEVICE", "SWITCH")
+ *         - Inner map key: Instance NAME (e.g., "G0", "G1", "M0", "M1")
+ *         - Value: GroupingInfo containing the matched grouping's information
+ *
+ * @note Only groupings whose names exactly match instance names found in the MGD are included in the result.
+ *       Groupings that don't match any MGD instance names are excluded.
+ *
+ * @example
+ *   If MGD contains instances:
+ *     - Graph "G0" of type "POD"
+ *     - Graph "G1" of type "POD"
+ *     - Mesh "M0" of type "MESH"
+ *   And physical groupings exist for "G0", "G1", and "M0", the result would be:
+ *   {
+ *     "POD": {
+ *       "G0": GroupingInfo{...},
+ *       "G1": GroupingInfo{...}
+ *     },
+ *     "MESH": {
+ *       "M0": GroupingInfo{...}
+ *     }
+ *   }
+ */
+std::unordered_map<std::string, unordered_map<std::string, GroupingInfo>> get_valid_groupings_for_mgd(
+    const tt::tt_fabric::MeshGraphDescriptor& mesh_graph_descriptor);
 
 }  // namespace tt::tt_fabric

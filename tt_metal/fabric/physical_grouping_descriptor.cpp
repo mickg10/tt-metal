@@ -81,8 +81,7 @@ bool PhysicalGroupingDescriptor::has_grouping(const std::string& grouping_name) 
 
 size_t PhysicalGroupingDescriptor::get_grouping_count() const { return proto_->groupings_size(); }
 
-PhysicalGroupingDescriptor::GroupingInfo PhysicalGroupingDescriptor::convert_grouping_to_info(
-    const proto::Grouping& grouping) const {
+GroupingInfo PhysicalGroupingDescriptor::convert_grouping_to_info(const proto::Grouping& grouping) const {
     GroupingInfo info;
     info.name = grouping.name();
 
@@ -110,8 +109,7 @@ PhysicalGroupingDescriptor::GroupingInfo PhysicalGroupingDescriptor::convert_gro
     return info;
 }
 
-std::vector<PhysicalGroupingDescriptor::GroupingInfo> PhysicalGroupingDescriptor::get_groupings_by_name(
-    const std::string& grouping_name) const {
+std::vector<GroupingInfo> PhysicalGroupingDescriptor::get_groupings_by_name(const std::string& grouping_name) const {
     std::vector<GroupingInfo> result;
     for (const auto& grouping : proto_->groupings()) {
         if (grouping.name() == grouping_name) {
@@ -121,7 +119,7 @@ std::vector<PhysicalGroupingDescriptor::GroupingInfo> PhysicalGroupingDescriptor
     return result;
 }
 
-std::vector<PhysicalGroupingDescriptor::GroupingInfo> PhysicalGroupingDescriptor::get_all_groupings() const {
+std::vector<GroupingInfo> PhysicalGroupingDescriptor::get_all_groupings() const {
     std::vector<GroupingInfo> result;
     for (const auto& grouping : proto_->groupings()) {
         result.push_back(convert_grouping_to_info(grouping));

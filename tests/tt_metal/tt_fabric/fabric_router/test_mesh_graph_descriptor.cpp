@@ -515,6 +515,46 @@ TEST(MeshGraphDescriptorTests, TestInstanceCreation) {
     // Simple device check for one mesh (M2): just count and a few local IDs
     check_mesh_devices_simple(desc, "M2", 8 * 4, {0, 5, 31});
 
+    // Test all_names() returns unique names (as unordered_set)
+    {
+        auto all_names = desc.all_names();
+        // Verify it's a set (no duplicates) by checking size matches expected unique count
+        EXPECT_GE(all_names.size(), 8u) << "Should have at least 8 unique names (G2, G0, G1, M0-M4)";
+
+        // Verify expected names are present
+        EXPECT_TRUE(all_names.contains("G2")) << "Should contain G2";
+        EXPECT_TRUE(all_names.contains("G0")) << "Should contain G0";
+        EXPECT_TRUE(all_names.contains("G1")) << "Should contain G1";
+        EXPECT_TRUE(all_names.contains("M0")) << "Should contain M0";
+        EXPECT_TRUE(all_names.contains("M1")) << "Should contain M1";
+        EXPECT_TRUE(all_names.contains("M2")) << "Should contain M2";
+        EXPECT_TRUE(all_names.contains("M3")) << "Should contain M3";
+        EXPECT_TRUE(all_names.contains("M4")) << "Should contain M4";
+
+        // Verify no duplicates by checking that inserting all names into a new set gives same size
+        std::unordered_set<std::string> verification_set(all_names.begin(), all_names.end());
+        EXPECT_EQ(all_names.size(), verification_set.size())
+            << "all_names() should return unique names (no duplicates)";
+    }
+
+    // Test all_types() returns unique types (as unordered_set)
+    {
+        auto all_types = desc.all_types();
+        // Verify it's a set (no duplicates)
+        EXPECT_GE(all_types.size(), 4u) << "Should have at least 4 unique types (CLUSTER, POD, MESH, DEVICE)";
+
+        // Verify expected types are present
+        EXPECT_TRUE(all_types.contains("CLUSTER")) << "Should contain CLUSTER type";
+        EXPECT_TRUE(all_types.contains("POD")) << "Should contain POD type";
+        EXPECT_TRUE(all_types.contains("MESH")) << "Should contain MESH type";
+        EXPECT_TRUE(all_types.contains("DEVICE")) << "Should contain DEVICE type";
+
+        // Verify no duplicates by checking that inserting all types into a new set gives same size
+        std::unordered_set<std::string> verification_set(all_types.begin(), all_types.end());
+        EXPECT_EQ(all_types.size(), verification_set.size())
+            << "all_types() should return unique types (no duplicates)";
+    }
+
     desc.print_all_nodes();
 }
 
@@ -572,6 +612,40 @@ TEST(MeshGraphDescriptorTests, TestIntraMeshConnections) {
     connections = desc.connections_by_source_device_id(device_2);
     ASSERT_EQ(connections.size(), 3);
     check_connections(desc, connections, {1, 5}, 1u, mesh_ids[0], {"D1", "D5"});
+
+    // Test all_names() returns unique names (as unordered_set)
+    {
+        auto all_names = desc.all_names();
+        // Verify it's a set (no duplicates) - should have M0 + 6 devices = 7 unique names
+        EXPECT_EQ(all_names.size(), 7u) << "Should have exactly 7 unique names (M0 + D0-D5)";
+
+        // Verify expected names are present (M0 mesh and D0-D5 devices)
+        EXPECT_TRUE(all_names.contains("M0")) << "Should contain M0";
+        for (int i = 0; i < 6; ++i) {
+            EXPECT_TRUE(all_names.contains("D" + std::to_string(i))) << "Should contain D" << i;
+        }
+
+        // Verify no duplicates by checking that inserting all names into a new set gives same size
+        std::unordered_set<std::string> verification_set(all_names.begin(), all_names.end());
+        EXPECT_EQ(all_names.size(), verification_set.size())
+            << "all_names() should return unique names (no duplicates)";
+    }
+
+    // Test all_types() returns unique types (as unordered_set)
+    {
+        auto all_types = desc.all_types();
+        // Verify it's a set (no duplicates) - should have exactly 2 types
+        EXPECT_EQ(all_types.size(), 2u) << "Should have exactly 2 unique types (MESH, DEVICE)";
+
+        // Verify expected types are present
+        EXPECT_TRUE(all_types.contains("MESH")) << "Should contain MESH type";
+        EXPECT_TRUE(all_types.contains("DEVICE")) << "Should contain DEVICE type";
+
+        // Verify no duplicates by checking that inserting all types into a new set gives same size
+        std::unordered_set<std::string> verification_set(all_types.begin(), all_types.end());
+        EXPECT_EQ(all_types.size(), verification_set.size())
+            << "all_types() should return unique types (no duplicates)";
+    }
 }
 
 
