@@ -12,7 +12,7 @@
 
 # Wormhole Galaxy e2e tests
 - name: Galaxy CCL tests
-  cmd: pytest tests/nightly/tg/ccl --ignore ccl/moe
+  cmd: pytest tests/nightly/tg/ccl --ignore tests/nightly/tg/ccl/moe
   sku: wh_galaxy
   owner_id: U05ACKAJTHS # Naif Tarafdar
   team: ttnn
