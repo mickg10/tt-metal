@@ -292,6 +292,9 @@ void DeviceManager::open_devices(const std::vector<ChipId>& device_ids) {
     // Initialize fabric tensix datamover config after devices are added to the pool
     tt::tt_metal::MetalContext::instance().initialize_fabric_tensix_datamover_config();
 
+    descriptor_ = tt::tt_metal::MetalContext::instance().create_context_descriptor(
+        num_hw_cqs_, l1_small_size_, trace_region_size_, worker_l1_size_);
+
     init_firmware_on_active_devices();
 }
 
