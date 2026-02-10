@@ -198,7 +198,7 @@ jobs:
             {
               "name": "[WH-T3K][v1] Llama-3.1-8B-Instruct",
               "model": "meta-llama/Llama-3.1-8B-Instruct",
-              "server-timeout": 10,
+              "server-timeout": 15,
               "benchmark-timeout": 5,
               "runner-label": "config-t3000",
               "arch": "arch-wormhole_b0",
