@@ -30,11 +30,7 @@
 #include "../../../unified_kernels/gather.hpp"
 #include "../../../unified_kernels/gather_heads.hpp"
 #include "../../../unified_kernels/rope.hpp"
-#if defined(COMPILE_FOR_BRISC) || defined(COMPILE_FOR_NCRISC)
-#include "api/dataflow/dataflow_api.h"
-#elif defined(COMPILE_FOR_TRISC)
-#include "compute_kernel_api.h"
-#endif
+#include "../../../unified_kernels/kv_cache_update.hpp"
 
 // Compile-time role flags for dead code elimination via if constexpr
 // Defined at namespace scope (local classes cannot have static data members)
@@ -169,7 +165,9 @@ void kernel_main() {
         .sin_cb = krope_sin_cb,
         .trans_mat_cb = krope_trans_mat_cb,
     };
-
+    deepseek_b1_ops::KVCacheUpdate::ReaderArgs kv_cache_update_args{
+        .kv_cache_buffer_base_addr = get_common_arg_val<uint32_t>(2),
+    };
 // ============================================================================
 // BRISC (Writer + Mcast Sender) - WriterConfigDescriptor compiles as BRISC
 // Named compile-time args: rmsnorm writer, mcast sender, matmul writer, gather receiver
@@ -308,6 +306,11 @@ void kernel_main() {
 
     // Writer args (empty - no-op)
     deepseek_b1_ops::Rope::WriterArgs krope_args{};
+
+    deepseek_b1_ops::KVCacheUpdate::WriterArgs kv_cache_update_args{
+        .kv_cache_buffer_base_addr = get_common_arg_val<uint32_t>(0),
+        .position_id = get_common_arg_val<uint32_t>(1),
+    };
 // ============================================================================
 // TRISC (Compute) - ComputeConfigDescriptor compiles as TRISC
 // Named compile-time args: rmsnorm compute, matmul compute
@@ -459,6 +462,10 @@ void kernel_main() {
         .cos_interm_cb = krope_cos_interm_cb,
         .sin_interm_cb = krope_sin_interm_cb,
         .out_cb = krope_output_cb,
+    };
+
+    deepseek_b1_ops::KVCacheUpdate::ComputeArgs kv_cache_update_args{
+        .kv_cache_num_tiles = 16,
     };
 #endif
 
@@ -691,7 +698,7 @@ void kernel_main() {
         }
     }
     {
-        // ========================================================================o
+        // ========================================================================
         // KV Cache Branch - Matmul
         // DKV Matmul: 9x2 grid, each core handles 1 head of 32 dim
         // ========================================================================
@@ -731,195 +738,10 @@ void kernel_main() {
         // KV Cache Update: Write results to DRAM interleaved tensor
         // BRISC handles writing from output CBs to DRAM
         // ========================================================================
-#if defined(COMPILE_FOR_BRISC)
-        // Unit testing the KV Cache write to DRAM.
-        // Support 8 shards, one per DRAM core, each shard is 576x2 bytes (BFLOAT16)
-        // KNOPE writes to first 512x2 bytes, each KROPE core writes to the remaining 64x2 bytes.
-        DeviceZoneScopedN("KV_CACHE_UPDATE");
-        // Get runtime args: buffer address and starting tile ID
-        uint32_t kv_cache_buffer_base_addr = get_common_arg_val<uint32_t>(0);
-        uint32_t position_id = get_common_arg_val<uint32_t>(1);
-        constexpr uint32_t receiver_semaphore_id = 0;
-        // 144 32x32 tiles to make 256 * (1x576)
-        // Each 32x32 bfp8 tile is 32*32 + 64 = 1088 bytes
-        constexpr uint32_t SHARD_SIZE = 144 * 1088;
-        constexpr uint32_t ENTRY_SIZE = 1088;
-        constexpr uint32_t NUM_BANKS = 8;
-        constexpr uint32_t TILE_SIZE = 1088;
-        constexpr uint32_t CHUNK_SIZE = 256;
-
-        // Figure out which 32x32 tiles the postion touches
-        // Block 0 (1024):  [Entry 0: 576][Entry 1: 448...]
-        // Block 1 (1024):  [...Entry 1: 128][Entry 2: 576][Entry 3: 320...]
-        // Block 2 (1024):  [...Entry 3: 256][Entry 4: 576][Entry 5: 192...]
-
-        constexpr uint32_t KV_DIM = 576;
-        constexpr uint32_t ELEMENTS_PER_TILE = 32 * 32;
-        uint32_t start_element = position_id * KV_DIM;
-        uint32_t end_element = start_element + KV_DIM;
-        uint32_t start_block = start_element / ELEMENTS_PER_TILE;
-        uint32_t end_block = end_element / ELEMENTS_PER_TILE;
-        uint32_t offset_in_first_block = start_element % ELEMENTS_PER_TILE;
-        bool spans_two_blocks = (start_block != end_block);
-        uint32_t valid_in_second_block = 0;
-        if (spans_two_blocks) {
-            valid_in_second_block = KV_DIM - (ELEMENTS_PER_TILE - offset_in_first_block);
+        {
+            DeviceZoneScopedN("KV_CACHE_UPDATE");
+            deepseek_b1_ops::KVCacheUpdate::Op<Core::is_kv_rmsnorm_core, Core::is_krope_core> kv_cache_update;
+            kv_cache_update(kv_cache_update_args);
         }
-
-        /*
-                constexpr uint32_t CHUNK_SIZE = 256;
-                constexpr uint32_t ENTRY_SIZE = 576 * 2;
-                constexpr uint32_t SHARD_SIZE = CHUNK_SIZE * ENTRY_SIZE;
-                constexpr uint32_t TILE_SIZE = 1 * 32* 2;*/
-
-        constexpr auto k_args = TensorAccessorArgs<0>();
-        // correct
-        auto k_writer = TensorAccessor(k_args, kv_cache_buffer_base_addr, TILE_SIZE);
-        DPRINT << "shard_id 0: " << k_writer.get_shard_noc_addr(0) << ENDL();
-        DPRINT << "shard_id 8: " << k_writer.get_shard_noc_addr(8) << ENDL();
-
-        // Calculate which shard this position belongs to
-        uint32_t shard_id = position_id / CHUNK_SIZE;
-
-        // Calculate offset within the shard
-        uint32_t position_in_shard = position_id % CHUNK_SIZE;
-        uint32_t offset_in_shard = position_in_shard * ENTRY_SIZE;
-        // Write RMSNorm output (nope portion) to KV cache
-        if constexpr (Core::is_kv_rmsnorm_core) {
-            constexpr uint32_t kv_rmsnorm_output_cb = get_named_compile_time_arg_val("kv_rmsnorm_output_cb");
-            constexpr uint32_t kv_cache_num_tiles = 2;  // get_named_compile_time_arg_val("kv_cache_num_tiles");
-            constexpr uint32_t kv_cache_output_cb = get_named_compile_time_arg_val("kv_cache_output_cb");
-
-            cb_reserve_back(kv_rmsnorm_output_cb, 1);
-            // Get tile size from the output CB
-            uint32_t tile_size = get_tile_size(kv_rmsnorm_output_cb);
-
-            // Wait for data from rope cores
-            uint32_t noc0_receiver_semaphore_addr = get_semaphore(receiver_semaphore_id);
-            volatile tt_l1_ptr uint32_t* noc0_receiver_semaphore_addr_ptr =
-                (volatile tt_l1_ptr uint32_t*)noc0_receiver_semaphore_addr;
-            noc_semaphore_wait(noc0_receiver_semaphore_addr_ptr, 2);
-            noc_semaphore_set(noc0_receiver_semaphore_addr_ptr, 0);
-
-            // Grab data from existing cache
-            DPRINT << " push back kv_rmsnorm_output_cb" << ENDL();
-            cb_push_back(kv_rmsnorm_output_cb, 1);
-            DPRINT << " wait for kv_cache_output_cb" << ENDL();
-            cb_wait_front(kv_cache_output_cb, 1);
-
-            uint32_t l1_read_addr = get_read_ptr(kv_cache_output_cb);
-            {
-                // Allocate L1 buffer for readback (reuse the CB address after pop)
-                uint32_t readback_addr = l1_read_addr;
-                DPRINT << " tile size: " << tile_size << ENDL();
-                constexpr uint32_t dump_bytes = 598;
-
-                volatile tt_l1_ptr uint8_t* raw = reinterpret_cast<volatile tt_l1_ptr uint8_t*>(readback_addr);
-                DPRINT << "DRAM shard 0 entry 0 raw dump:" << ENDL();
-                for (uint32_t offset = 0; offset < dump_bytes; offset += 16) {
-                    DPRINT << HEX() << SETW(4) << offset << ": ";
-                    for (uint32_t i = 0; i < 16 && (offset + i) < dump_bytes; i++) {
-                        DPRINT << SETW(2) << (uint32_t)raw[offset + i] << " ";
-                    }
-                    DPRINT << DEC() << ENDL();
-                }
-            }
-
-            DPRINT << " writing to kv_cache_output_cb " << shard_id << " " << offset_in_shard << ENDL();
-            uint64_t kv_write_addr = k_writer.get_shard_noc_addr(shard_id) + offset_in_shard;
-            for (volatile uint32_t i = 0; i < 2000000000U; i++) {
-                asm volatile("nop");
-            }
-            noc_async_write(l1_read_addr, kv_write_addr, 1088);
-            noc_async_write_barrier();
-            // noc_async_write_one_packet<true, true>(l1_read_addr, kv_write_addr, tile_size);
-            // noc_async_posted_writes_flushed();
-            //  Read back from kv_write_addr and dump
-            /*  {
-                  constexpr uint32_t dump_bytes = 598;
-                  // Reuse l1_read_addr as readback buffer (data already written to DRAM)
-                  uint32_t readback_buf = l1_read_addr;
-                  noc_async_read(kv_write_addr, readback_buf, dump_bytes);
-                  noc_async_read_barrier();
-
-                  volatile tt_l1_ptr uint8_t* raw = reinterpret_cast<volatile tt_l1_ptr uint8_t*>(readback_buf);
-                  DPRINT << "DRAM readback from kv_write_addr:" << ENDL();
-                  for (uint32_t offset = 0; offset < dump_bytes; offset += 16) {
-                      DPRINT << HEX() << SETW(4) << offset << ": ";
-                      for (uint32_t i = 0; i < 16 && (offset + i) < dump_bytes; i++) {
-                          DPRINT << SETW(2) << (uint32_t)raw[offset + i] << " ";
-                      }
-                      DPRINT << DEC() << ENDL();
-                  }
-              }*/
-
-            // cb_pop_front(kv_rmsnorm_output_cb, kv_cache_num_tiles); // pop 2
-            // cb_pop_front(kv_cache_output_cb, 1);
-        }
-#elif defined(COMPILE_FOR_NCRISC)
-        // Write Rope output to KV cache (after nope tiles)
-        if constexpr (Core::is_krope_core) {
-            constexpr uint32_t krope_output_cb = get_named_compile_time_arg_val("krope_output_cb");
-            constexpr uint32_t krope_Wt = get_named_compile_time_arg_val("krope_Wt");
-            constexpr uint32_t kv_rmsnorm_output_cb = 26;
-            constexpr uint32_t receiver_semaphore_id = 0;
-            constexpr uint32_t dest_noc_x = get_named_compile_time_arg_val("kv_cache_dest_noc_x");
-            constexpr uint32_t dest_noc_y = get_named_compile_time_arg_val("kv_cache_dest_noc_y");
-
-            // Get tile size from the output CB
-            uint32_t rope_offset = get_absolute_logical_y() - 8;  // yea...
-            uint32_t tile_size = get_tile_size(krope_output_cb);
-            uint32_t l1_read_addr = get_read_ptr(krope_output_cb);
-            uint32_t rope_offset_write_addr = get_read_ptr(kv_rmsnorm_output_cb) + 512 * 2 + tile_size * rope_offset;
-
-            cb_wait_front(krope_output_cb, krope_Wt);
-            uint32_t receiver_semaphore_addr = get_semaphore(receiver_semaphore_id);
-            const uint64_t dst_noc_coord = get_noc_addr(dest_noc_x, dest_noc_y, 0);
-            uint64_t dst_data_noc_addr = dst_noc_coord | (uint64_t)(rope_offset_write_addr);
-            uint64_t dst_semaphore_noc_addr = dst_noc_coord | (uint64_t)receiver_semaphore_addr;
-            noc_async_write_one_packet<true, true>(l1_read_addr, dst_data_noc_addr, tile_size);
-            noc_semaphore_inc<true>(dst_semaphore_noc_addr, 1);
-            noc_async_posted_writes_flushed();
-
-            cb_pop_front(krope_output_cb, krope_Wt);
-        }
-#elif defined(COMPILE_FOR_TRISC)
-        if constexpr (Core::is_kv_rmsnorm_core) {
-            constexpr uint32_t kv_rmsnorm_output_cb = get_named_compile_time_arg_val("kv_rmsnorm_output_cb");
-            constexpr uint32_t kv_cache_output_cb = get_named_compile_time_arg_val("kv_cache_output_cb");
-            constexpr uint32_t kv_cache_num_tiles = 2;  // get_named_compile_time_arg_val("kv_cache_num_tiles");
-            cb_wait_front(kv_rmsnorm_output_cb, kv_cache_num_tiles);
-            copy_tile_init(kv_rmsnorm_output_cb);
-
-            UNPACK(reconfig_data_format_srca(kv_rmsnorm_output_cb));
-            PACK((llk_pack_reconfig_data_format<DST_ACCUM_MODE, true>(kv_cache_output_cb)));
-            DPRINT << " waiting for kv_cache_output_cb" << ENDL();
-
-            // PACK((llk_pack_hw_configure<DST_ACCUM_MODE>(kv_cache_output_cb)));
-            // PACK((llk_pack_init(kv_cache_output_cb)));
-            // PACK((llk_pack_dest_init<DST_ACCUM_MODE, false>()));
-            cb_reserve_back(kv_cache_output_cb, 1);
-            for (uint32_t i = 0; i < 1; i++) {
-                tile_regs_acquire();
-
-                // Copy tile from input CB to DST register
-                // Unpacker converts BFloat16 → FP32 internally
-                copy_tile(kv_rmsnorm_output_cb, i, 0);
-
-                tile_regs_commit();
-
-                tile_regs_wait();
-
-                // Pack from DST to output CB
-                // Packer converts FP32 → BFP8_b
-                pack_tile(0, kv_cache_output_cb, i);
-
-                tile_regs_release();
-            }
-            cb_push_back(kv_cache_output_cb, 1);
-            cb_pop_front(kv_rmsnorm_output_cb, kv_cache_num_tiles);
-        }
-#endif
-        DPRINT << " done with KV Cache Update" << ENDL();
     }
 }

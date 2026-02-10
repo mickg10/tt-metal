@@ -613,7 +613,7 @@ void MAIN {
                     untilize_block(cb_out_accumulate_im, out_chunk_tiles, cb_out_final);
                 }
                 if constexpr (use_pack_untilize) {
-                    pack_untilize_uninit(cb_out_final);
+                    ;
                 } else {
                     untilize_uninit(cb_out_final);
                 }

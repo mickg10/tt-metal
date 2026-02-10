@@ -80,6 +80,13 @@ std::vector<float> unpack_bfp8_tiles_into_float_vec(
     uint32_t num_exp_words = tt::round_up(num_faces * face_H, l1_alignment) / 4;
     uint32_t num_tile_words = tile_HW / 4;
     uint32_t num_bfp8_in_tile = num_tile_words + num_exp_words;
+    printf("num_exp_words: %d\n", num_exp_words);
+    printf("num_tile_words: %d\n", num_tile_words);
+    printf("num_faces: %d\n", num_faces);
+    printf("subtiles_in_tile_row: %d\n", subtiles_in_tile_row);
+    printf("subtiles_in_tile_col: %d\n", subtiles_in_tile_col);
+    printf("subtile_rows: %d\n", subtile_rows);
+    printf("subtile_cols: %d\n", subtile_cols);
 
     // the exponent index will always be 0 when tile_HW == 16, between 0-1 when tile_HW == 32, and between 0-3 otherwise
     uint32_t exp_bit_mask;
@@ -95,6 +102,8 @@ std::vector<float> unpack_bfp8_tiles_into_float_vec(
     uint32_t size_bytes = bfp8_tiles.size() * num_elements_in_dword;  // each uint32_t contains 4 BFP8 values
     uint32_t single_bfp8_tile_size =
         tile.has_value() ? tile->get_tile_size(tt::DataFormat::Bfp8_b) : tile_size(tt::DataFormat::Bfp8_b);
+    printf("single_bfp8_tile_size: %d\n", single_bfp8_tile_size);
+    printf("size_bytes: %d\n", size_bytes);
     TT_ASSERT(size_bytes % single_bfp8_tile_size == 0);
     uint32_t num_tiles = size_bytes / single_bfp8_tile_size;
 

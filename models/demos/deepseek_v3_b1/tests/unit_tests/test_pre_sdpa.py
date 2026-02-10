@@ -456,12 +456,14 @@ def test_pre_sdpa(device, epsilon, use_fp32, position_id):
     logger.info(f"Creating KV cache with seq_len={max_seq_len}...")
     kvpe_dim = KNOPE_DIM + KROPE_DIM
     cache_shape = (1, 1, max_seq_len, kvpe_dim)
-    torch_kv_cache = torch.zeros(cache_shape, dtype=torch.bfloat16)
+    test_temp = torch.ones(1, 1, 1, 576, dtype=torch.bfloat16)
+    torch_kv_cache = torch.randn(cache_shape, dtype=torch.bfloat16)
 
     # ND sharding with ROUND_ROBIN_1D distribution across DRAM banks
     # Each shard = one k_chunk (k_chunk_size x kvpe_dim), distributed round-robin
     # Use optimal DRAM bank order matching S block work assignment for locality
     grid = program_config.grid
+    print("program config ", program_config.k_chunk_size)
     kv_nd_shard_spec = ttnn.NdShardSpec(
         shard_shape=[1, 1, program_config.k_chunk_size, kvpe_dim],
         grid=grid.optimal_dram_grid(),
@@ -562,8 +564,13 @@ def test_pre_sdpa(device, epsilon, use_fp32, position_id):
     assert sdpa_input_passing, f"SDPA Q verification failed: {sdpa_input_pcc_message}"
 
     # Read back from kv cache tensor in DRAM to check PCC
-    torch_kv_cache = ttnn.to_torch(ttnn_kv_cache)
-    compare_kv_cache = torch_kv_cache[:, :, position_id, :]
+    print("original ", torch_kv_cache[:, :, position_id, :])
+    torch_kv_cache_output = ttnn.to_torch(ttnn_kv_cache)
+    compare_kv_cache = torch_kv_cache_output[:, :, position_id, :]
+    print("compared ", compare_kv_cache)
+    print(ttnn_kv_cache.dtype)  # Should be ttnn.bfloat8_b
+    print(ttnn_kv_cache.layout)  # Should be ttnn.TILE_LAYOUT
+    print(ttnn_kv_cache.shape)
 
     # Split into nope (first 512 elements) and rope (last 64 elements)
     nope_dim = 512
@@ -589,7 +596,6 @@ def test_pre_sdpa(device, epsilon, use_fp32, position_id):
     logger.info(f"KV Cache ROPE mean absolute difference: {rope_mean_diff}")
     rope_passing, rope_pcc_message = comp_pcc(compare_rope, expected_rope, 0.98)
     logger.info(f"KV Cache ROPE PCC: {rope_pcc_message}")
-    print(compare_kv_cache)
 
     assert nope_passing, f"KV Cache NOPE verification failed: {nope_pcc_message}"
     assert rope_passing, f"KV Cache ROPE verification failed: {rope_pcc_message}"
