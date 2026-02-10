@@ -357,7 +357,6 @@ def main():
         "tg-op-perf-tests.yaml",
         # Blackhole
         "blackhole-demo-tests.yaml",
-        "blackhole-multi-card-unit-tests.yaml",
         "blackhole-nightly-tests.yaml",
         "blackhole-post-commit.yaml",
     ]
