@@ -16,12 +16,8 @@
 namespace tt::tt_metal {
 
 CommandQueueInitializer::CommandQueueInitializer(
-    const Hal& hal,
-    Cluster& cluster,
-    const llrt::RunTimeOptions& rtoptions,
-    std::shared_ptr<const ContextDescriptor> descriptor,
-    bool skip_remote_devices) :
-    FirmwareInitializer(hal, cluster, rtoptions, std::move(descriptor)), skip_remote_devices_(skip_remote_devices) {}
+    std::shared_ptr<const ContextDescriptor> descriptor, bool skip_remote_devices) :
+    FirmwareInitializer(std::move(descriptor)), skip_remote_devices_(skip_remote_devices) {}
 
 void CommandQueueInitializer::init(const std::vector<IDevice*>& devices) {
     devices_ = devices;

@@ -15,9 +15,6 @@ public:
     static constexpr InitializerKey key() { return InitializerKey::Profiler; }
 
     ProfilerInitializer(
-        const Hal& hal,
-        Cluster& cluster,
-        const llrt::RunTimeOptions& rtoptions,
         std::shared_ptr<const ContextDescriptor> descriptor,
         bool skip_remote_devices,
         ProfilerStateManager* profiler_state_manager);

@@ -8,11 +8,10 @@
 
 namespace tt::tt_metal {
 
-FirmwareInitializer::FirmwareInitializer(
-    const Hal& hal,
-    Cluster& cluster,
-    const llrt::RunTimeOptions& rtoptions,
-    std::shared_ptr<const ContextDescriptor> descriptor) :
-    hal_(hal), cluster_(cluster), rtoptions_(rtoptions), descriptor_(std::move(descriptor)) {}
+FirmwareInitializer::FirmwareInitializer(std::shared_ptr<const ContextDescriptor> descriptor) :
+    hal_(descriptor->hal()),
+    cluster_(descriptor->cluster()),
+    rtoptions_(descriptor->rtoptions()),
+    descriptor_(std::move(descriptor)) {}
 
 }  // namespace tt::tt_metal

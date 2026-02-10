@@ -179,20 +179,18 @@ namespace tt_metal {
 
 void DeviceManager::initialize(
     const std::vector<ChipId>& device_ids,
-    const uint8_t num_hw_cqs,
-    size_t l1_small_size,
-    size_t trace_region_size,
     tt::stl::Span<const std::uint32_t> l1_bank_remap,
-    size_t worker_l1_size,
     bool init_profiler,
-    bool initialize_fabric_and_dispatch_fw) {
+    bool initialize_fabric_and_dispatch_fw,
+    std::shared_ptr<ContextDescriptor> descriptor) {
     ZoneScoped;
     log_debug(tt::LogMetal, "DeviceManager initialize");
 
-    num_hw_cqs_ = num_hw_cqs;
-    l1_small_size_ = l1_small_size;
-    trace_region_size_ = trace_region_size;
-    worker_l1_size_ = worker_l1_size;
+    descriptor_ = std::move(descriptor);
+    num_hw_cqs_ = descriptor_->num_cqs();
+    l1_small_size_ = descriptor_->l1_small_size();
+    trace_region_size_ = descriptor_->trace_region_size();
+    worker_l1_size_ = descriptor_->worker_l1_size();
     using_fast_dispatch_ = MetalContext::instance().rtoptions().get_fast_dispatch();
     init_profiler_ = init_profiler;
     initialize_fabric_and_dispatch_fw_ = initialize_fabric_and_dispatch_fw;
@@ -439,9 +437,6 @@ void DeviceManager::add_devices_to_pool(const std::vector<ChipId>& device_ids) {
 
 void DeviceManager::initialize_fabric_and_dispatch_fw() {
     auto& ctx = tt::tt_metal::MetalContext::instance();
-    bool is_mock = ctx.get_cluster().get_target_device_type() == tt::TargetDevice::Mock;
-    auto descriptor = std::make_shared<ContextDescriptor>(
-        is_mock, ctx.get_fabric_config(), ctx.get_fabric_tensix_config(), ctx.get_fabric_manager());
 
     if (using_fast_dispatch_ && ctx.get_cluster().is_galaxy_cluster()) {
         log_info(
@@ -452,10 +447,9 @@ void DeviceManager::initialize_fabric_and_dispatch_fw() {
 
     // Add fabric + dispatch to the chain, then init + configure each in order.
     // Fabric must fully complete before dispatch starts.
-    initializers_[FabricFirmwareInitializer::key()] = std::make_unique<FabricFirmwareInitializer>(
-        ctx.hal(), ctx.get_cluster(), ctx.rtoptions(), descriptor, ctx.get_control_plane());
-    initializers_[DispatchFirmwareInitializer::key()] =
-        std::make_unique<DispatchFirmwareInitializer>(ctx.hal(), ctx.get_cluster(), ctx.rtoptions(), descriptor);
+    initializers_[FabricFirmwareInitializer::key()] =
+        std::make_unique<FabricFirmwareInitializer>(descriptor_, ctx.get_control_plane());
+    initializers_[DispatchFirmwareInitializer::key()] = std::make_unique<DispatchFirmwareInitializer>(descriptor_);
 
     initializers_[FabricFirmwareInitializer::key()]->init(active_devices);
 
@@ -470,13 +464,7 @@ void DeviceManager::initialize_dispatch_firmware() {
     // This function is used by DispatchContext for manual FD setup.
     // It will re initialize the dispatch firmware on the active devices as they were manually
     // disabled
-    auto& ctx = tt::tt_metal::MetalContext::instance();
-    bool is_mock = ctx.get_cluster().get_target_device_type() == tt::TargetDevice::Mock;
-    auto descriptor = std::make_shared<ContextDescriptor>(
-        is_mock, ctx.get_fabric_config(), ctx.get_fabric_tensix_config(), ctx.get_fabric_manager());
-
-    initializers_[DispatchFirmwareInitializer::key()] =
-        std::make_unique<DispatchFirmwareInitializer>(ctx.hal(), ctx.get_cluster(), ctx.rtoptions(), descriptor);
+    initializers_[DispatchFirmwareInitializer::key()] = std::make_unique<DispatchFirmwareInitializer>(descriptor_);
 
     auto active_devices = this->get_all_active_devices();
     initializers_[DispatchFirmwareInitializer::key()]->init(active_devices);
@@ -485,25 +473,16 @@ void DeviceManager::initialize_dispatch_firmware() {
 
 void DeviceManager::init_firmware_on_active_devices() {
     auto& ctx = tt::tt_metal::MetalContext::instance();
-    bool is_mock = ctx.get_cluster().get_target_device_type() == tt::TargetDevice::Mock;
-
-    auto descriptor = std::make_shared<ContextDescriptor>(
-        is_mock, ctx.get_fabric_config(), ctx.get_fabric_tensix_config(), ctx.get_fabric_manager());
 
     auto active_devices = this->get_all_active_devices();
 
     // Build the initializer chain — key order determines init sequence
-    initializers_[CommandQueueInitializer::key()] = std::make_unique<CommandQueueInitializer>(
-        ctx.hal(), ctx.get_cluster(), ctx.rtoptions(), descriptor, skip_remote_devices_);
+    initializers_[CommandQueueInitializer::key()] =
+        std::make_unique<CommandQueueInitializer>(descriptor_, skip_remote_devices_);
 
     if (init_profiler_) {
         initializers_[ProfilerInitializer::key()] = std::make_unique<ProfilerInitializer>(
-            ctx.hal(),
-            ctx.get_cluster(),
-            ctx.rtoptions(),
-            descriptor,
-            skip_remote_devices_,
-            ctx.profiler_state_manager().get());
+            descriptor_, skip_remote_devices_, ctx.profiler_state_manager().get());
     }
 
     // Init + configure CQ and Profiler (configure is a no-op for both)

@@ -5,6 +5,7 @@
 #pragma once
 
 #include <map>
+#include <memory>
 #include <tt_stl/span.hpp>
 #include <unordered_map>
 #include <vector>
@@ -18,6 +19,7 @@ namespace experimental {
 class DispatchContext;
 }  // namespace experimental
 
+class ContextDescriptor;
 class IDevice;
 class FirmwareInitializer;
 enum class InitializerKey;
@@ -31,13 +33,10 @@ public:
 
     void initialize(
         const std::vector<ChipId>& device_ids,
-        uint8_t num_hw_cqs,
-        size_t l1_small_size,
-        size_t trace_region_size,
-        tt::stl::Span<const std::uint32_t> l1_bank_remap = {},
-        size_t worker_l1_size = DEFAULT_WORKER_L1_SIZE,
-        bool init_profiler = true,
-        bool initialize_fabric_and_dispatch_fw = true);
+        tt::stl::Span<const std::uint32_t> l1_bank_remap,
+        bool init_profiler,
+        bool initialize_fabric_and_dispatch_fw,
+        std::shared_ptr<ContextDescriptor> descriptor);
 
     IDevice* get_active_device(ChipId device_id) const;
     std::vector<IDevice*> get_all_active_devices() const;
@@ -68,6 +67,7 @@ private:
 
     bool skip_remote_devices_{};
 
+    std::shared_ptr<ContextDescriptor> descriptor_;
     std::map<InitializerKey, std::unique_ptr<FirmwareInitializer>> initializers_;
     // Determine which CPU cores the worker threads need to be placed on for each device
     std::unordered_map<uint32_t, uint32_t> worker_thread_to_cpu_core_map_;

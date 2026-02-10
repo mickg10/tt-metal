@@ -16,13 +16,10 @@
 namespace tt::tt_metal {
 
 ProfilerInitializer::ProfilerInitializer(
-    const Hal& hal,
-    Cluster& cluster,
-    const llrt::RunTimeOptions& rtoptions,
     std::shared_ptr<const ContextDescriptor> descriptor,
     bool skip_remote_devices,
     ProfilerStateManager* profiler_state_manager) :
-    FirmwareInitializer(hal, cluster, rtoptions, std::move(descriptor)),
+    FirmwareInitializer(std::move(descriptor)),
     skip_remote_devices_(skip_remote_devices),
     profiler_state_manager_(profiler_state_manager) {}
 

@@ -28,11 +28,7 @@ enum class InitializerKey {
 
 class FirmwareInitializer {
 public:
-    FirmwareInitializer(
-        const Hal& hal,
-        Cluster& cluster,
-        const llrt::RunTimeOptions& rtoptions,
-        std::shared_ptr<const ContextDescriptor> descriptor);
+    explicit FirmwareInitializer(std::shared_ptr<const ContextDescriptor> descriptor);
 
     virtual ~FirmwareInitializer() = default;
 

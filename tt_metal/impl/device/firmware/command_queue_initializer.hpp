@@ -12,12 +12,7 @@ class CommandQueueInitializer final : public FirmwareInitializer {
 public:
     static constexpr InitializerKey key() { return InitializerKey::CommandQueue; }
 
-    CommandQueueInitializer(
-        const Hal& hal,
-        Cluster& cluster,
-        const llrt::RunTimeOptions& rtoptions,
-        std::shared_ptr<const ContextDescriptor> descriptor,
-        bool skip_remote_devices);
+    CommandQueueInitializer(std::shared_ptr<const ContextDescriptor> descriptor, bool skip_remote_devices);
 
     void init(const std::vector<IDevice*>& devices) override;
     void configure() override;

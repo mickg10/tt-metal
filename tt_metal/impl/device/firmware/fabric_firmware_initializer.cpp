@@ -23,12 +23,8 @@
 namespace tt::tt_metal {
 
 FabricFirmwareInitializer::FabricFirmwareInitializer(
-    const Hal& hal,
-    Cluster& cluster,
-    const llrt::RunTimeOptions& rtoptions,
-    std::shared_ptr<const ContextDescriptor> descriptor,
-    tt::tt_fabric::ControlPlane& control_plane) :
-    FirmwareInitializer(hal, cluster, rtoptions, std::move(descriptor)), control_plane_(control_plane) {}
+    std::shared_ptr<const ContextDescriptor> descriptor, tt::tt_fabric::ControlPlane& control_plane) :
+    FirmwareInitializer(std::move(descriptor)), control_plane_(control_plane) {}
 
 void FabricFirmwareInitializer::init(const std::vector<IDevice*>& devices) {
     devices_ = devices;

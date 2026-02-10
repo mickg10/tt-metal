@@ -17,11 +17,7 @@ public:
     static constexpr InitializerKey key() { return InitializerKey::Fabric; }
 
     FabricFirmwareInitializer(
-        const Hal& hal,
-        Cluster& cluster,
-        const llrt::RunTimeOptions& rtoptions,
-        std::shared_ptr<const ContextDescriptor> descriptor,
-        tt::tt_fabric::ControlPlane& control_plane);
+        std::shared_ptr<const ContextDescriptor> descriptor, tt::tt_fabric::ControlPlane& control_plane);
 
     void init(const std::vector<IDevice*>& devices) override;
     void configure() override;
