@@ -295,7 +295,7 @@ class DistributedLayerNorm(Module):
             )
 
     def forward(
-        self, x: ttnn.Tensor, dynamic_weight=None, dynamic_bias=None, compute_kernel_config=None
+        self, x: ttnn.Tensor, dynamic_weight=None, dynamic_bias=None, compute_kernel_config=None, use_old: bool = False
     ) -> ttnn.Tensor:
         assert (dynamic_weight is None) == (
             dynamic_bias is None
@@ -310,6 +310,32 @@ class DistributedLayerNorm(Module):
         else:
             weight = self.weight.data if self.weight is not None else None
             bias = self.bias.data if self.bias is not None else None
+
+        if use_old:
+            stats = ttnn.layer_norm_pre_all_gather(x)
+
+            if tuple(self.mesh_device.shape)[self.mesh_axis] > 1:
+                stats = ttnn.experimental.all_gather_async(
+                    stats,
+                    dim=len(x.shape) - 1,
+                    cluster_axis=self.mesh_axis,
+                    mesh_device=x.device(),
+                    topology=self.ccl_manager.topology,
+                    multi_device_global_semaphore=self.ccl_manager.get_ag_ping_pong_semaphore(self.mesh_axis),
+                    persistent_output_tensor=self.ccl_manager.get_ag_ping_pong_buffer(
+                        stats.shape, len(stats.shape) - 1, self.mesh_axis
+                    ),
+                    num_links=self.ccl_manager.num_links,
+                )
+
+            return ttnn.layer_norm_post_all_gather(
+                x,
+                stats,
+                weight=weight,
+                bias=bias,
+                epsilon=self.norm_eps,
+                compute_kernel_config=compute_kernel_config or self.compute_kernel_config,
+            )
 
         stats = ttnn.experimental.dit_layernorm_pre_allgather(
             x,

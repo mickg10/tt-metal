@@ -146,13 +146,12 @@ class Flux1SingleTransformerBlock(Module):
             time_embed = ttnn.silu(time_embed)
         time = self.time_embed(time_embed)
 
+        spatial_normed = ttnn.squeeze(self.norm(ttnn.unsqueeze(spatial, 0), use_old=True), 0)
+        prompt_normed = ttnn.squeeze(self.norm(ttnn.unsqueeze(prompt, 0), use_old=True), 0)
+
         shift_msa, scale_msa, gate_msa = _chunk_time3d(time, 3)
-        norm_spatial = ttnn.squeeze(
-            self.norm(ttnn.unsqueeze(spatial, 0), dynamic_weight=(1 + scale_msa), dynamic_bias=shift_msa), 0
-        )
-        norm_prompt = ttnn.squeeze(
-            self.norm(ttnn.unsqueeze(prompt, 0), dynamic_weight=(1 + scale_msa), dynamic_bias=shift_msa), 0
-        )
+        norm_spatial = spatial_normed * (1 + scale_msa) + shift_msa
+        norm_prompt = prompt_normed * (1 + scale_msa) + shift_msa
 
         norm_spatial = self.ccl_manager.all_gather_persistent_buffer(
             norm_spatial, dim=2, mesh_axis=tp_axis, use_hyperparams=True
@@ -410,7 +409,7 @@ class Flux1Transformer(Module):
                 skip_time_embed_activation_fn=True,
             )
 
-        spatial = ttnn.squeeze(self.norm_out(ttnn.unsqueeze(spatial, 0)), 0)
+        spatial = ttnn.squeeze(self.norm_out(ttnn.unsqueeze(spatial, 0), use_old=True), 0)
 
         spatial_time = self.time_embed_out(time_embed)
         [scale, shift] = _chunk_time3d(spatial_time, 2)
