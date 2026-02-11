@@ -147,10 +147,8 @@ TEST(DispatchContext, SdEnableFdDisableFdThenL1Buffer) {
 
     // Verify sharded buffer works correctly in FD mode
     std::vector<uint32_t> fd_dst_vec = {};
-    for (const auto& coord : MeshCoordinateRange(mesh_device_->shape())) {
-        ReadShard(mesh_device_->mesh_command_queue(), fd_dst_vec, fd_buf, coord);
-        EXPECT_EQ(fd_dst_vec, fd_src_vec) << "Sharded buffer readback failed in FD mode";
-    }
+    EnqueueReadMeshBuffer(mesh_device_->mesh_command_queue(), fd_dst_vec, fd_buf, true);
+    EXPECT_EQ(fd_dst_vec, fd_src_vec) << "Sharded buffer readback failed in FD mode";
 
     // Phase 2: FD→SD transition - Return to Slow Dispatch mode
     // The grid re-expands (11 cols → 12 cols) when returning to SD
@@ -158,12 +156,9 @@ TEST(DispatchContext, SdEnableFdDisableFdThenL1Buffer) {
 
     // Verify the sharded buffer created in FD mode remains accessible after transition to SD
     // This confirms buffer mappings persist correctly across grid reconfigurations
-    for (const auto& coord : MeshCoordinateRange(mesh_device_->shape())) {
-        std::vector<uint32_t> fd_buf_readback_in_sd = {};
-        ReadShard(mesh_device_->mesh_command_queue(), fd_buf_readback_in_sd, fd_buf, coord);
-        EXPECT_EQ(fd_buf_readback_in_sd, fd_src_vec)
-            << "Sharded buffer data mismatch after FD->SD transition";
-    }
+    std::vector<uint32_t> fd_buf_readback_in_sd = {};
+    EnqueueReadMeshBuffer(mesh_device_->mesh_command_queue(), fd_buf_readback_in_sd, fd_buf, true);
+    EXPECT_EQ(fd_buf_readback_in_sd, fd_src_vec) << "Sharded buffer data mismatch after FD->SD transition";
 
     // Phase 3: Create and verify new buffer operations in SD mode
     // Validates that new buffers can be created using the expanded grid with reclaimed dispatch cores
