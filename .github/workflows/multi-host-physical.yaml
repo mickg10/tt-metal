@@ -12,33 +12,38 @@ on:
         required: false
         default: true
         type: boolean
-      glx_4x_unit_tests:
-        description: 'Run Galaxy 4x unit tests'
+      unit_tests_quad_on_4x:
+        description: 'Run unit tests (quad setup on 4x Galaxy)'
         required: false
         default: false
         type: boolean
-      glx_4x_deepseekv3_unit_tests:
-        description: 'Run Galaxy 4x DeepSeek V3 unit tests'
+      deepseekv3_unit_tests_quad_on_4x:
+        description: 'Run DeepSeek V3 unit tests (quad setup on 4x Galaxy)'
         required: false
         default: false
         type: boolean
-      glx_4x_deepseekv3_module_tests:
-        description: 'Run Galaxy 4x DeepSeek V3 module tests'
+      deepseekv3_module_tests_dual_on_4x:
+        description: 'Run DeepSeek V3 module tests (dual setup on 4x Galaxy)'
         required: false
         default: false
         type: boolean
-      glx_4x_teacher_forced:
-        description: 'Run Galaxy 4x DeepSeekV3 accuracy test'
+      deepseekv3_module_tests_quad_on_4x:
+        description: 'Run DeepSeek V3 module tests (quad setup on 4x Galaxy)'
         required: false
         default: false
         type: boolean
-      glx_4x_dual_demo:
-        description: 'Run Galaxy 4x dual demo test'
+      teacher_forced_dual_on_4x:
+        description: 'Run DeepSeek V3 teacher forced accuracy test (dual setup on 4x Galaxy)'
         required: false
         default: false
         type: boolean
-      glx_4x_dual_demo_stress:
-        description: 'Run Galaxy 4x dual demo stress test'
+      dual_demo_on_4x:
+        description: 'Run DeepSeek V3 dual demo test (dual setup on 4x Galaxy)'
+        required: false
+        default: false
+        type: boolean
+      dual_demo_stress_on_4x:
+        description: 'Run DeepSeek V3 dual demo stress test (dual setup on 4x Galaxy)'
         required: false
         default: false
         type: boolean
@@ -196,7 +201,7 @@ jobs:
             ./tests/scripts/multihost/run_dual_galaxy_tests.sh
 
   multi-host-glx-4x:
-    if: ${{ github.event.inputs.glx_4x_unit_tests == 'true' || github.event.inputs.glx_4x_deepseekv3_unit_tests == 'true' || github.event.inputs.glx_4x_deepseekv3_module_tests == 'true' || github.event.inputs.glx_4x_teacher_forced == 'true' || github.event.inputs.glx_4x_dual_demo == 'true' || github.event.inputs.glx_4x_dual_demo_stress == 'true' || github.event.schedule == '0 4 * * *' }}
+    if: ${{ github.event.inputs.unit_tests_quad_on_4x == 'true' || github.event.inputs.deepseekv3_unit_tests_quad_on_4x == 'true' || github.event.inputs.deepseekv3_module_tests_dual_on_4x == 'true' || github.event.inputs.deepseekv3_module_tests_quad_on_4x == 'true' || github.event.inputs.teacher_forced_dual_on_4x == 'true' || github.event.inputs.dual_demo_on_4x == 'true' || github.event.inputs.dual_demo_stress_on_4x == 'true' || github.event.schedule == '0 4 * * *' }}
     runs-on:
       # A physical, multi-host WH Galaxy that's in service
       - multi-host-glx-4x
@@ -224,8 +229,8 @@ jobs:
       - name: Capture runner's home directory
         id: capture-home
         run: echo "home=${HOME}" >> $GITHUB_OUTPUT
-      - name: Run quad galaxy unit tests
-        if: ${{ github.event.inputs.glx_4x_unit_tests == 'true' || github.event.schedule == '0 4 * * *' }}
+      - name: Run unit tests (quad setup on 4x Galaxy)
+        if: ${{ github.event.inputs.unit_tests_quad_on_4x == 'true' || github.event.schedule == '0 4 * * *' }}
         uses: ./.github/actions/docker-run
         timeout-minutes: 30
         with:
@@ -246,9 +251,9 @@ jobs:
           install_wheel: true
           run_args: |
             ./tests/scripts/multihost/setup_shared_venv.sh
-            ./tests/scripts/multihost/run_quad_galaxy_tests.sh unit_tests
-      - name: Run DeepSeek V3 unit tests
-        if: ${{ github.event.inputs.glx_4x_deepseekv3_unit_tests == 'true' || github.event.schedule == '0 4 * * *' }}
+            ./tests/scripts/multihost/run_quad_galaxy_tests.sh unit_tests_quad_on_4x
+      - name: Run DeepSeek V3 unit tests (quad setup on 4x Galaxy)
+        if: ${{ github.event.inputs.deepseekv3_unit_tests_quad_on_4x == 'true' || github.event.schedule == '0 4 * * *' }}
         uses: ./.github/actions/docker-run
         timeout-minutes: 60
         with:
@@ -270,8 +275,8 @@ jobs:
           run_args: |
             ./tests/scripts/multihost/setup_shared_venv.sh
             ./tests/scripts/multihost/run_quad_galaxy_tests.sh deepseekv3_unit_tests_quad_on_4x
-      - name: Run DeepSeek V3 module tests
-        if: ${{ github.event.inputs.glx_4x_deepseekv3_module_tests == 'true' || github.event.schedule == '0 4 * * *' }}
+      - name: Run DeepSeek V3 module tests (dual setup on 4x Galaxy)
+        if: ${{ github.event.inputs.deepseekv3_module_tests_dual_on_4x == 'true' || github.event.schedule == '0 4 * * *' }}
         uses: ./.github/actions/docker-run
         timeout-minutes: 150
         with:
@@ -292,9 +297,32 @@ jobs:
           install_wheel: true
           run_args: |
             ./tests/scripts/multihost/setup_shared_venv.sh
-            ./tests/scripts/multihost/run_quad_galaxy_tests.sh deepseekv3_module_tests
-      - name: Run teacher forced accuracy test
-        if: ${{ github.event.inputs.glx_4x_teacher_forced == 'true' || github.event.schedule == '0 4 * * *' }}
+            ./tests/scripts/multihost/run_quad_galaxy_tests.sh deepseekv3_module_tests_dual_on_4x
+      - name: Run DeepSeek V3 module tests (quad setup on 4x Galaxy)
+        if: ${{ github.event.inputs.deepseekv3_module_tests_quad_on_4x == 'true' || github.event.schedule == '0 4 * * *' }}
+        uses: ./.github/actions/docker-run
+        timeout-minutes: 150
+        with:
+          docker_image: ${{ needs.build-artifact.outputs.dev-docker-image }}
+          docker_password: ${{ secrets.GITHUB_TOKEN }}
+          docker_opts: |
+            -e LD_LIBRARY_PATH=${{ github.workspace }}/build/lib
+            -e PYTHONPATH=${{ github.workspace }}
+            -e TT_METAL_HOME=${{ github.workspace }}
+            -e ARCH_NAME=wormhole_b0
+            -e TT_METAL_ENABLE_ERISC_IRAM="1"
+            -e GTEST_OUTPUT="xml:${{ github.workspace }}/generated/test_reports/"
+            -v /etc/mpirun:/etc/mpirun:ro
+            -v ${{ steps.capture-home.outputs.home }}/.ssh:${{ steps.capture-home.outputs.home }}/.ssh:ro
+            --device /dev/tenstorrent
+            --pid=host
+            --hostname=mpirun-host
+          install_wheel: true
+          run_args: |
+            ./tests/scripts/multihost/setup_shared_venv.sh
+            ./tests/scripts/multihost/run_quad_galaxy_tests.sh deepseekv3_module_tests_quad_on_4x
+      - name: Run DeepSeek V3 teacher forced accuracy test (dual setup on 4x Galaxy)
+        if: ${{ github.event.inputs.teacher_forced_dual_on_4x == 'true' || github.event.schedule == '0 4 * * *' }}
         uses: ./.github/actions/docker-run
         timeout-minutes: 60
         with:
@@ -317,7 +345,7 @@ jobs:
             ./tests/scripts/multihost/setup_shared_venv.sh
             ./tests/scripts/multihost/run_quad_galaxy_tests.sh teacher_forced_dual_on_4x
       - name: Upload teacher forced accuracy artifacts
-        if: ${{ always() && (github.event.inputs.glx_4x_teacher_forced == 'true' || github.event.schedule == '0 4 * * *') }}
+        if: ${{ always() && (github.event.inputs.teacher_forced_dual_on_4x == 'true' || github.event.schedule == '0 4 * * *') }}
         uses: actions/upload-artifact@v4
         with:
           name: teacher-forced-accuracy-${{ github.run_id }}
@@ -325,8 +353,8 @@ jobs:
             generated/artifacts/teacher_forced_accuracy.txt
             generated/artifacts/teacher_forced_output.log
           if-no-files-found: warn
-      - name: Run dual demo test (256 prompts, 1 batch)
-        if: ${{ github.event.inputs.glx_4x_dual_demo == 'true' || github.event.schedule == '0 4 * * *' }}
+      - name: Run DeepSeek V3 dual demo test - 256 prompts, 1 batch (dual setup on 4x Galaxy)
+        if: ${{ github.event.inputs.dual_demo_on_4x == 'true' || github.event.schedule == '0 4 * * *' }}
         uses: ./.github/actions/docker-run
         timeout-minutes: 40
         with:
@@ -347,9 +375,9 @@ jobs:
           install_wheel: true
           run_args: |
             ./tests/scripts/multihost/setup_shared_venv.sh
-            ./tests/scripts/multihost/run_quad_galaxy_tests.sh dual_demo_dual_on_4x
+            ./tests/scripts/multihost/run_quad_galaxy_tests.sh dual_demo_on_4x
       - name: Upload dual demo output artifacts
-        if: ${{ always() && (github.event.inputs.glx_4x_dual_demo == 'true' || github.event.schedule == '0 4 * * *') }}
+        if: ${{ always() && (github.event.inputs.dual_demo_on_4x == 'true' || github.event.schedule == '0 4 * * *') }}
         uses: actions/upload-artifact@v4
         with:
           name: dual-demo-output-${{ github.run_id }}
@@ -357,8 +385,8 @@ jobs:
             generated/artifacts/dual_demo_output.log
             generated/artifacts/dual_demo_full_results.json
           if-no-files-found: warn
-      - name: Run stress dual demo test (56 prompts, 20 batches)
-        if: ${{ github.event.inputs.glx_4x_dual_demo_stress == 'true' || github.event.schedule == '0 4 * * *' }}
+      - name: Run DeepSeek V3 dual demo stress test - 56 prompts, 20 batches (dual setup on 4x Galaxy)
+        if: ${{ github.event.inputs.dual_demo_stress_on_4x == 'true' || github.event.schedule == '0 4 * * *' }}
         uses: ./.github/actions/docker-run
         timeout-minutes: 90
         with:
@@ -381,7 +409,7 @@ jobs:
             ./tests/scripts/multihost/setup_shared_venv.sh
             ./tests/scripts/multihost/run_quad_galaxy_tests.sh dual_demo_stress_on_4x
       - name: Upload stress demo output artifacts
-        if: ${{ always() && (github.event.inputs.glx_4x_dual_demo_stress == 'true' || github.event.schedule == '0 4 * * *') }}
+        if: ${{ always() && (github.event.inputs.dual_demo_stress_on_4x == 'true' || github.event.schedule == '0 4 * * *') }}
         uses: actions/upload-artifact@v4
         with:
           name: dual-demo-stress-output-${{ github.run_id }}
