@@ -78,7 +78,7 @@ jobs:
               "model": "llama3.1-8b",
               "arch": "blackhole",
               "extra-tag": "pipeline-functional",
-              "cmd": "HF_MODEL=/localdev/blackhole_demos/huggingface_data/meta-llama/Llama-3.1-8B-Instruct TT_CACHE_PATH=/localdev/blackhole_demos/huggingface_data/meta-llama/Llama-3.1-8B-Instruct pytest models/tt_transformers/demo/simple_text_demo.py -k performance-ci-stress-1 --timeout=1800",
+              "cmd": "HF_MODEL=/localdev/blackhole_demos/huggingface_data/meta-llama/Llama-3.1-8B-Instruct TT_CACHE_PATH=/localdev/blackhole_demos/huggingface_data/meta-llama/Llama-3.1-8B-Instruct pytest models/tt_transformers/demo/simple_text_demo.py -k \"performance and stress\" --timeout=1800",
               "owner_id": "U03PUAKE719",
               "owner_name": "Miguel Tairum"
             },
@@ -214,7 +214,7 @@ jobs:
             owner_id: U03PUAKE719 # Miguel Tairum
           - name: "llama3.1-8b ${{ inputs.runner-label }} data-parallel=${{ inputs.num_devices }} stress"
             arch: blackhole
-            cmd: HF_MODEL=/localdev/blackhole_demos/huggingface_data/meta-llama/Llama-3.1-8B-Instruct TT_CACHE_PATH=/localdev/blackhole_demos/huggingface_data/meta-llama/Llama-3.1-8B-Instruct pytest models/tt_transformers/demo/simple_text_demo.py -k "performance-ci-stress-1" --data_parallel ${{ inputs.num_devices }} --max_generated_tokens 22000 --timeout=3600
+            cmd: HF_MODEL=/localdev/blackhole_demos/huggingface_data/meta-llama/Llama-3.1-8B-Instruct TT_CACHE_PATH=/localdev/blackhole_demos/huggingface_data/meta-llama/Llama-3.1-8B-Instruct pytest models/tt_transformers/demo/simple_text_demo.py -k "performance and stress" --data_parallel ${{ inputs.num_devices }} --max_generated_tokens 22000 --timeout=3600
             owner_id: U03PUAKE719 # Miguel Tairum
           - name: "llama3.1-8b ${{ inputs.runner-label }} batch-1 TP device perf decode (layers=10)"
             arch: blackhole
