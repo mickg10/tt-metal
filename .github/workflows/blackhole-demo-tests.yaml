@@ -11,7 +11,7 @@ on:
       model:
         description: 'Select model to test'
         required: false
-        default: 'all'
+        default: 'llama3.1-8b'
         type: choice
         options:
           - all
@@ -25,7 +25,7 @@ on:
       system-type:
         description: 'Select system type to test'
         required: false
-        default: "all"
+        default: "P150 (1xP150)"
         type: choice
         options:
           - all
