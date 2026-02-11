@@ -38,6 +38,7 @@ class DeepseekV3LMHead(nn.Module):
         return self.lm_head(hidden_states)
 
 
+@pytest.mark.timeout(1800)
 @pytest.mark.parametrize(
     "device_params",
     [

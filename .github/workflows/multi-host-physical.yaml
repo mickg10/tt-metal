@@ -269,7 +269,7 @@ jobs:
           install_wheel: true
           run_args: |
             ./tests/scripts/multihost/setup_shared_venv.sh
-            ./tests/scripts/multihost/run_quad_galaxy_tests.sh deepseekv3_unit_tests
+            ./tests/scripts/multihost/run_quad_galaxy_tests.sh deepseekv3_unit_tests_quad_on_4x
       - name: Run DeepSeek V3 module tests
         if: ${{ github.event.inputs.glx_4x_deepseekv3_module_tests == 'true' || github.event.schedule == '0 4 * * *' }}
         uses: ./.github/actions/docker-run
@@ -315,7 +315,7 @@ jobs:
           install_wheel: true
           run_args: |
             ./tests/scripts/multihost/setup_shared_venv.sh
-            ./tests/scripts/multihost/run_quad_galaxy_tests.sh teacher_forced
+            ./tests/scripts/multihost/run_quad_galaxy_tests.sh teacher_forced_dual_on_4x
       - name: Upload teacher forced accuracy artifacts
         if: ${{ always() && (github.event.inputs.glx_4x_teacher_forced == 'true' || github.event.schedule == '0 4 * * *') }}
         uses: actions/upload-artifact@v4
@@ -347,7 +347,7 @@ jobs:
           install_wheel: true
           run_args: |
             ./tests/scripts/multihost/setup_shared_venv.sh
-            ./tests/scripts/multihost/run_quad_galaxy_tests.sh dual_demo
+            ./tests/scripts/multihost/run_quad_galaxy_tests.sh dual_demo_dual_on_4x
       - name: Upload dual demo output artifacts
         if: ${{ always() && (github.event.inputs.glx_4x_dual_demo == 'true' || github.event.schedule == '0 4 * * *') }}
         uses: actions/upload-artifact@v4
@@ -379,7 +379,7 @@ jobs:
           install_wheel: true
           run_args: |
             ./tests/scripts/multihost/setup_shared_venv.sh
-            ./tests/scripts/multihost/run_quad_galaxy_tests.sh dual_demo_stress
+            ./tests/scripts/multihost/run_quad_galaxy_tests.sh dual_demo_stress_on_4x
       - name: Upload stress demo output artifacts
         if: ${{ always() && (github.event.inputs.glx_4x_dual_demo_stress == 'true' || github.event.schedule == '0 4 * * *') }}
         uses: actions/upload-artifact@v4

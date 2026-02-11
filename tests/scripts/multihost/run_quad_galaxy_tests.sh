@@ -54,12 +54,50 @@ setup_dual_galaxy_env() {
     export MESH_DEVICE="DUAL"
 }
 
+# Common setup for quad galaxy tests (all four hosts)
+setup_quad_galaxy_env() {
+    export RANK_BINDING_YAML="tests/tt_metal/distributed/config/quad_galaxy_rank_bindings.yaml"
+    export HOSTS="g05glx01,g05glx02,g05glx03,g05glx04"
+    export RANKFILE=/etc/mpirun/rankfile
+    mkdir -p logs
+    mkdir -p generated/artifacts
+
+    if ! test -f "$RANKFILE"; then
+        echo "File '$RANKFILE' does not exist."
+        exit 1
+    fi
+    if ! test -f "$RANK_BINDING_YAML"; then
+        echo "File '$RANK_BINDING_YAML' does not exist."
+        exit 1
+    fi
+
+    export DEEPSEEK_V3_HF_MODEL="/mnt/MLPerf/tt_dnn-models/deepseek-ai/DeepSeek-R1-0528"
+    export DEEPSEEK_V3_CACHE="/mnt/MLPerf/tt_dnn-models/deepseek-ai/DeepSeek-R1-0528-Cache/CI"
+    export MESH_DEVICE="QUAD"
+}
+
 # Run deepseek v3 module tests (models/demos/deepseek_v3/tests)
-run_quad_galaxy_deepseekv3_module_tests() {
+run_dual_galaxy_deepseekv3_module_tests() {
     fail=0
     setup_dual_galaxy_env
 
-    local TEST_CASE="source ./python_env/bin/activate && pytest -svvv models/demos/deepseek_v3/tests"
+    local TEST_CASE="source ./python_env/bin/activate && pytest -svvv --ignore=models/demos/deepseek_v3/tests/unit --ignore=models/demos/deepseek_v3/tests/fused_op_unit_tests models/demos/deepseek_v3/tests"
+
+    tt-run --rank-binding "$RANK_BINDING_YAML" \
+        --mpi-args "--host $HOSTS --map-by rankfile:file=$RANKFILE --mca btl self,tcp --mca btl_tcp_if_include cnx1 --bind-to none --output-filename logs/mpi_job --tag-output" \
+        bash -c "export DEEPSEEK_V3_HF_MODEL=$DEEPSEEK_V3_HF_MODEL && export DEEPSEEK_V3_CACHE=$DEEPSEEK_V3_CACHE && export MESH_DEVICE=$MESH_DEVICE && $TEST_CASE" ; fail+=$?
+
+    if [[ $fail -ne 0 ]]; then
+        exit 1
+    fi
+}
+
+# Run deepseek v3 module tests with quad galaxy setup (all four hosts)
+run_quad_galaxy_deepseekv3_module_tests() {
+    fail=0
+    setup_quad_galaxy_env
+
+      local TEST_CASE="source ./python_env/bin/activate && pytest -svvv --ignore=models/demos/deepseek_v3/tests/unit --ignore=models/demos/deepseek_v3/tests/fused_op_unit_tests models/demos/deepseek_v3/tests"
 
     tt-run --rank-binding "$RANK_BINDING_YAML" \
         --mpi-args "--host $HOSTS --map-by rankfile:file=$RANKFILE --mca btl self,tcp --mca btl_tcp_if_include cnx1 --bind-to none --output-filename logs/mpi_job --tag-output" \
@@ -71,7 +109,7 @@ run_quad_galaxy_deepseekv3_module_tests() {
 }
 
 # Run teacher forced accuracy test and save metrics to artifacts
-run_quad_galaxy_teacher_forced_test() {
+run_dual_galaxy_teacher_forced_test() {
     fail=0
     setup_dual_galaxy_env
 
@@ -94,7 +132,7 @@ run_quad_galaxy_teacher_forced_test() {
 }
 
 # Run dual demo test (256 prompts, 1 batch) - full_demo variant
-run_quad_galaxy_dual_demo_test() {
+run_dual_galaxy_dual_demo_test() {
     fail=0
     setup_dual_galaxy_env
 
@@ -110,7 +148,7 @@ run_quad_galaxy_dual_demo_test() {
 }
 
 # Run stress dual demo test (56 prompts, 20 batches) - stress_demo variant
-run_quad_galaxy_dual_demo_stress_test() {
+run_dual_galaxy_dual_demo_stress_test() {
     fail=0
     setup_dual_galaxy_env
 
@@ -126,11 +164,11 @@ run_quad_galaxy_dual_demo_stress_test() {
 }
 
 # Legacy function that runs all dual galaxy tests on quad galaxy
-run_dual_galaxy_deepseekv3_tests_on_quad_galaxy() {
-    run_quad_galaxy_deepseekv3_module_tests
-    run_quad_galaxy_teacher_forced_test
-    run_quad_galaxy_dual_demo_test
-    run_quad_galaxy_dual_demo_stress_test
+run_dual_galaxy_deepseekv3_integration_tests() {
+    run_dual_galaxy_deepseekv3_module_tests
+    run_dual_galaxy_teacher_forced_test
+    run_dual_galaxy_dual_demo_test
+    run_dual_galaxy_dual_demo_stress_test
 }
 
 run_quad_galaxy_deepseekv3_unit_tests() {
@@ -157,7 +195,7 @@ run_quad_galaxy_deepseekv3_unit_tests() {
 run_quad_galaxy_tests() {
   run_quad_galaxy_unit_tests
   run_quad_galaxy_deepseekv3_unit_tests
-  run_dual_galaxy_deepseekv3_tests_on_quad_galaxy
+  run_dual_galaxy_deepseekv3_integration_tests
 }
 
 main() {
@@ -185,33 +223,36 @@ main() {
   local test_function="${1:-all}"
 
   case "$test_function" in
-    "unit_tests")
+    "unit_tests_quad_on_4x")
       run_quad_galaxy_unit_tests
       ;;
-    "deepseekv3_unit_tests")
+    "deepseekv3_unit_tests_quad_on_4x")
       run_quad_galaxy_deepseekv3_unit_tests
       ;;
-    "deepseekv3_module_tests")
+    "deepseekv3_module_tests_dual_on_4x")
+      run_dual_galaxy_deepseekv3_module_tests
+      ;;
+    "deepseekv3_module_tests_quad_on_4x")
       run_quad_galaxy_deepseekv3_module_tests
       ;;
-    "teacher_forced")
-      run_quad_galaxy_teacher_forced_test
+    "teacher_forced_dual_on_4x")
+      run_dual_galaxy_teacher_forced_test
       ;;
-    "dual_demo")
-      run_quad_galaxy_dual_demo_test
+    "dual_demo_on_4x")
+      run_dual_galaxy_dual_demo_test
       ;;
-    "dual_demo_stress")
-      run_quad_galaxy_dual_demo_stress_test
+    "dual_demo_stress_on_4x")
+      run_dual_galaxy_dual_demo_stress_test
       ;;
-    "deepseekv3_integration_tests")
-      run_dual_galaxy_deepseekv3_tests_on_quad_galaxy
+    "deepseekv3_integration_tests_dual_on_4x")
+      run_dual_galaxy_deepseekv3_integration_tests
       ;;
     "all")
       run_quad_galaxy_tests
       ;;
     *)
       echo "Unknown test function: $test_function" 1>&2
-      echo "Available options: unit_tests, deepseekv3_unit_tests, deepseekv3_module_tests, teacher_forced, dual_demo, dual_demo_stress, deepseekv3_integration_tests, all" 1>&2
+      echo "Available options: unit_tests_quad_on_4x, deepseekv3_unit_tests_quad_on_4x, deepseekv3_module_tests_dual_on_4x, deepseekv3_module_tests_quad_on_4x, teacher_forced_dual_on_4x, dual_demo_on_4x, dual_demo_stress_on_4x, deepseekv3_integration_tests_dual_on_4x, all" 1>&2
       exit 1
       ;;
   esac

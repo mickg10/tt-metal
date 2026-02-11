@@ -250,7 +250,16 @@ def run_test_forward_pass_dpmodel(
 # see documentation for expand_test_cases_with_position_ids_ranges for more details
 BASE_TEST_CASES = [
     # mode, seq_len, batch_size_per_row, decode_position_ids
-    ("decode", 1, USERS_PER_ROW, None),
+    pytest.param(
+        "decode",
+        1,
+        USERS_PER_ROW,
+        None,
+        marks=pytest.mark.skip_for_device(
+            ["DUAL", "QUAD"],
+            reason="For DUAL and QUAD decode takes enormous time during kv cache prefill (#37585)",
+        ),
+    ),
 ] + [
     ("prefill", seq_len, 1, None)
     if seq_len == 128
@@ -269,6 +278,7 @@ EXPANDED_TEST_CASES = expand_test_cases_with_position_ids_ranges(BASE_TEST_CASES
 EXPANDED_TEST_IDS = build_expanded_test_ids(EXPANDED_TEST_CASES)
 
 
+@pytest.mark.timeout(1200)
 @pytest.mark.parametrize(
     "device_params",
     [
