@@ -70,7 +70,7 @@ on:
         required: false
         type: string
         default: 'all'
-        description: "Select model to test (all, llama3.1-8b, llama3.3-70b, qwen3-32b, flux.1-dev, wan2.2-t2v-a14b)"
+        description: "Select model to test"
       system-type:
         description: 'Select system type to test'
         required: false
