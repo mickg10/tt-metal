@@ -20,6 +20,7 @@ jobs:
   
   create-allocation:
     name: Create Allocation for 16x4 LINExRING
+    # needs: build-artifact
     timeout-minutes: 30
     outputs:
       ranksData: ${{ steps.get-allocation-data.outputs.ranksData }}
@@ -47,7 +48,7 @@ jobs:
 
       - name: Create allocation
         id: allocation
-        uses: tt-orchestration/create-allocation@main
+        uses: tenstorrent/tt-orchestration/.github/actions/create-allocation@main
         with:
           allocationName: ci-${{ github.run_id }}
           spec: |
@@ -60,7 +61,7 @@ jobs:
               ${{ steps.mgd.outputs.mgd }}
 
       - name: Get Allocation data
-        uses: tt-orchestration/get-allocation-data@main
+        uses: tenstorrent/tt-orchestration/.github/actions/get-allocation-data@main
         id: get-allocation-data
         with:
           allocationName: ci-${{ github.run_id }}
@@ -77,11 +78,11 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Delete environment
-        uses: tt-orchestration/delete-environment@main
+        uses: tenstorrent/tt-orchestration/.github/actions/delete-environment@main
         with:
           environmentName:  ci-${{ github.run_id }}
 
       - name: Delete allocation
-        uses: tt-orchestration/delete-allocation@main
+        uses: tenstorrent/tt-orchestration/.github/actions/delete-allocation@main
         with:
           allocationName:  ci-${{ github.run_id }}
