@@ -12,6 +12,7 @@ import torch
 from loguru import logger
 
 import ttnn
+from models.common.utility_functions import comp_pcc
 from models.demos.deepseek_v3.tt.rope import get_rot_transformation_mat
 from models.demos.deepseek_v3_b1.fused_ops.kv_cache_branch.op import KVCacheBranch
 from models.demos.deepseek_v3_b1.micro_ops.flash_mla.op import FlashMLADecode
@@ -316,8 +317,6 @@ def test_kv_cache_branch(device, epsilon, use_fp32, position_id):
     logger.info(f"Max absolute difference: {max_diff}")
     logger.info(f"Mean absolute difference: {mean_diff}")
 
-    from models.common.utility_functions import comp_pcc
-
     passing, pcc_message = comp_pcc(compare_kv_cache, torch_expected, 0.98)
     logger.info(pcc_message)
     assert passing, pcc_message
@@ -325,16 +324,19 @@ def test_kv_cache_branch(device, epsilon, use_fp32, position_id):
     logger.info("✓ KV cache branch test passed!)")
 
 
-@pytest.mark.parametrize("position_id", [0])
+@pytest.mark.parametrize("position_id", [0, 4, 1024, 1136])
 def test_kv_cache_dram_shard(device, position_id):
     """Test KV cache shard untilize tilize operation"""
-    max_seq_len = 8192
+    torch.manual_seed(0)
+    max_seq_len = 1152
 
-    core_grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 8), ttnn.CoreCoord(0, 8))})
+    nope_core_grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 8), ttnn.CoreCoord(0, 8))})
+    rope_core_grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(8, 8), ttnn.CoreCoord(8, 9))})
 
-    torch_new_cache = torch.randn((16, 32), dtype=torch.bfloat16)
+    # Input to nope kcache core
+    torch_nope_cache = torch.ones((16, 32), dtype=torch.bfloat16)
     input_shard_spec = ttnn.ShardSpec(
-        core_grid,
+        nope_core_grid,
         (16, 32),
         ttnn.ShardOrientation.ROW_MAJOR,
     )
@@ -342,8 +344,8 @@ def test_kv_cache_dram_shard(device, position_id):
 
     tile = ttnn.Tile([16, 32])
     # Create TTNN input tensor with WIDTH_SHARDED memory and tiny tile
-    ttnn_new_cache = ttnn.from_torch(
-        torch_new_cache,
+    ttnn_nope_cache = ttnn.from_torch(
+        torch_nope_cache,
         dtype=ttnn.bfloat16,
         layout=ttnn.TILE_LAYOUT,
         device=device,
@@ -351,9 +353,29 @@ def test_kv_cache_dram_shard(device, position_id):
         tile=tile,
     )
 
+    # Input to rope cores: 1 to 64 over the whole tensor
+    torch_rope_cache = torch.arange(1, 65, dtype=torch.bfloat16).reshape(1, 64)
+    rope_input_shard_spec = ttnn.ShardSpec(
+        rope_core_grid,
+        (1, 32),
+        ttnn.ShardOrientation.ROW_MAJOR,
+    )
+    rope_input_mem_config = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.L1, rope_input_shard_spec
+    )
+    rope_input_tile = ttnn.Tile([1, 32])
+    ttnn_rope_cache = ttnn.from_torch(
+        torch_rope_cache,
+        dtype=ttnn.bfloat16,
+        layout=ttnn.TILE_LAYOUT,
+        device=device,
+        memory_config=rope_input_mem_config,
+        tile=rope_input_tile,
+    )
+
     # Create TTNN input tensor with WIDTH_SHARDED memory and tiny tile
     ttnn_output = ttnn.from_torch(
-        torch_new_cache,
+        torch_nope_cache,
         dtype=ttnn.bfloat16,
         layout=ttnn.TILE_LAYOUT,
         device=device,
@@ -364,14 +386,16 @@ def test_kv_cache_dram_shard(device, position_id):
     # KV Cache tensor in DRAM sharded
     # Create KV cache (non-paged) based on max seq len
     program_config = FlashMLADecode.ProgramConfig(
-        k_chunk_size=256,
+        k_chunk_size=128,
         exp_approx_mode=False,  # Use exact exp for higher precision
     )
     logger.info(f"Creating KV cache with seq_len={max_seq_len}...")
     kvpe_dim = 576
     cache_shape = (1, 1, max_seq_len, kvpe_dim)
-    test_temp = torch.ones(1, 1, 1, 576, dtype=torch.bfloat16)
-    torch_kv_cache = torch.ones(cache_shape, dtype=torch.bfloat16)
+    torch_kv_cache = torch.zeros(cache_shape, dtype=torch.bfloat16)
+    for i in range(max_seq_len):
+        torch_kv_cache[:, :, i, :512] = torch.ones(1, 1, 1, 512, dtype=torch.bfloat16) * (2 * i + 1)
+        torch_kv_cache[:, :, i, 512:] = torch.ones(1, 1, 1, 64, dtype=torch.bfloat16) * (2 * i + 2)
 
     # ND sharding with ROUND_ROBIN_1D distribution across DRAM banks
     # Each shard = one k_chunk (k_chunk_size x kvpe_dim), distributed round-robin
@@ -401,24 +425,52 @@ def test_kv_cache_dram_shard(device, position_id):
         memory_config=kv_mem_config,
     )
 
-    _ = KVCacheUpdate.op(ttnn_new_cache, ttnn_kv_cache, ttnn_output, position_id)
+    _ = KVCacheUpdate.op(ttnn_nope_cache, ttnn_rope_cache, ttnn_kv_cache, ttnn_output, position_id)
 
     torch_kv_cache_output = ttnn.to_torch(ttnn_kv_cache)
-    compare_kv_cache = torch_kv_cache_output[:, :, position_id, :]
-    print("compared ", compare_kv_cache)
-    # Read back from kv cache tensor in DRAM to check PCC
-    torch_expected = torch_kv_cache[:, :, position_id, :]
-    print("original ", torch_kv_cache[:, :, position_id, :])
+    compare_kv_cache = torch_kv_cache_output[:, :, position_id]
+    # Split into nope (first 512 elements) and rope (last 64 elements)
+    nope_dim = 512
+    rope_dim = 64
 
-    max_diff = torch.max(torch.abs(torch_expected - compare_kv_cache)).item()
-    mean_diff = torch.mean(torch.abs(torch_expected - compare_kv_cache)).item()
-    logger.info(f"Max absolute difference: {max_diff}")
-    logger.info(f"Mean absolute difference: {mean_diff}")
+    compare_nope = compare_kv_cache[..., :nope_dim]
+    compare_rope = compare_kv_cache[..., nope_dim:]
+    expected_nope = torch_nope_cache.reshape(1, 512)
+    expected_rope = torch_rope_cache
 
-    from models.common.utility_functions import comp_pcc
+    # Check nope portion
+    nope_max_diff = torch.max(torch.abs(expected_nope - compare_nope)).item()
+    nope_mean_diff = torch.mean(torch.abs(expected_nope - compare_nope)).item()
+    logger.info(f"KV Cache NOPE absolute difference: {nope_max_diff}")
+    logger.info(f"KV Cache NOPE mean absolute difference: {nope_mean_diff}")
+    nope_passing, nope_pcc_message = comp_pcc(compare_nope, expected_nope, 0.98)
+    logger.info(f"KV Cache NOPE PCC: {nope_pcc_message}")
 
-    passing, pcc_message = comp_pcc(compare_kv_cache, torch_expected, 0.98)
-    logger.info(pcc_message)
-    assert passing, pcc_message
+    # Check rope portion
+    print(" ROPE expected: ", expected_rope)
+    print(" ROPE compare: ", compare_rope)
+    rope_max_diff = torch.max(torch.abs(expected_rope - compare_rope)).item()
+    rope_mean_diff = torch.mean(torch.abs(expected_rope - compare_rope)).item()
+    logger.info(f"KV Cache ROPE absolute difference: {rope_max_diff}")
+    logger.info(f"KV Cache ROPE mean absolute difference: {rope_mean_diff}")
+    rope_passing, rope_pcc_message = comp_pcc(compare_rope, expected_rope, 0.98)
+    logger.info(f"KV Cache ROPE PCC: {rope_pcc_message}")
+
+    assert nope_passing, f"KV Cache NOPE verification failed: {nope_pcc_message}"
+    assert rope_passing, f"KV Cache ROPE verification failed: {rope_pcc_message}"
+
+    # Check full KV cache with position_id removed: output shape [:, :, max_seq_len - 1, :]
+    full_unupdated_kv_cache = torch.cat(
+        [torch_kv_cache[:, :, :position_id], torch_kv_cache[:, :, position_id + 1 :]], dim=2
+    )
+    full_unupdated_kv_cache_output = torch.cat(
+        [torch_kv_cache_output[:, :, :position_id], torch_kv_cache_output[:, :, position_id + 1 :]], dim=2
+    )
+    assert full_unupdated_kv_cache.shape == (1, 1, max_seq_len - 1, full_unupdated_kv_cache.shape[-1])
+
+    full_unupdated_kv_cache_pcc, full_unupdated_kv_cache_pcc_message = comp_pcc(
+        full_unupdated_kv_cache_output, full_unupdated_kv_cache, 0.98
+    )
+    logger.info(f"Full KV cache PCC: {full_unupdated_kv_cache_pcc_message}")
 
     logger.info("✓ KV cache dram shard test passed!)")

@@ -36,44 +36,30 @@ class KVCacheUpdate:
 
     @staticmethod
     def op(
-        new_cache_tensor,
-        kv_cache_tensor,
-        output_tensor,
+        nope_cache_tensor,
+        rope_cache_tensor,
+        full_kv_cache_tensor,
+        output_tensor,  # not used
         position_id: int,
     ):
         """
         Run KV cache update as a standalone program.
 
         Args:
-            new_cache_tensor: L1 tensor backing NEW_CACHE_CB (tilized BFP8 input).
-            kv_cache_tensor: DRAM tensor for KV cache (buffer address + tensor accessor).
+            nope_cache_tensor: L1 tensor backing NOPE_CACHE_CB (tilized BFP8 input).
+            rope_cache_tensor: DRAM tensor for rope cache (buffer address + tensor accessor).
+            full_kv_cache_tensor: DRAM tensor for full KV cache (buffer address + tensor accessor).
             position_id: Write position index.
-            output_tensor: Optional L1 tensor to back the nope-core output CB (kv_cache_output_cb).
-                If provided, must be HEIGHT_SHARDED on nope_core_grid with 16 tiles of 32x32 BFP8
-                per core; kernel writes tilized result here and it is returned.
+            output_tensor: not used, validation is read back from full_kv_cache_tensor
 
         Returns:
             Output of generic_op (includes output_tensor when provided).
         """
-        nope_core_grid = ttnn.CoreRangeSet(
-            {
-                ttnn.CoreRange(
-                    ttnn.CoreCoord(0, 8),
-                    ttnn.CoreCoord(0, 8),
-                )
-            }
-        )
-        rope_core_grid = ttnn.CoreRangeSet(
-            {
-                ttnn.CoreRange(
-                    ttnn.CoreCoord(8, 8),
-                    ttnn.CoreCoord(8, 9),
-                )
-            }
-        )
+        nope_core_grid = nope_cache_tensor.memory_config().shard_spec.grid
+        rope_core_grid = rope_cache_tensor.memory_config().shard_spec.grid
         kv_cache_core_grid = nope_core_grid.merge(rope_core_grid)
 
-        tensor_accessor_args = ttnn.TensorAccessorArgs(kv_cache_tensor)
+        tensor_accessor_args = ttnn.TensorAccessorArgs(full_kv_cache_tensor)
         ncrisc_compile_time_args = tensor_accessor_args.get_compile_time_args()
         brisc_compile_time_args = tensor_accessor_args.get_compile_time_args()
 
@@ -97,6 +83,8 @@ class KVCacheUpdate:
             ("kv_cache_input_cb", KV_CACHE_INPUT_CB),
             ("kv_cache_output_cb", KV_CACHE_OUTPUT_CB),
             ("kv_cache_intermed_cb", KV_CACHE_INTERMED_CB),
+            ("kv_rmsnorm_output_cb", KV_RMSNORM_OUTPUT_CB),
+            ("krope_output_cb", KROPE_OUTPUT_CB),
         ]
 
         kv_cache_page_size = TILE_32x32.get_tile_size(ttnn.bfloat8_b)
@@ -122,42 +110,31 @@ class KVCacheUpdate:
             page_size=intermed_page_size,
             tile=ttnn.TileDescriptor(TILE_32x32),
         )
-        krope_output_cb_format = ttnn.CBFormatDescriptor(
-            buffer_index=KROPE_OUTPUT_CB,
-            data_format=ttnn.bfloat16,
-            page_size=krope_page_size,
-            tile=ttnn.TileDescriptor(TILE_1x32),
-        )
 
         # Output CB: tensor-backed on nope core when output_tensor provided, else L1-only
-        kv_cache_output_cb_descriptor = ttnn.cb_descriptor_from_sharded_tensor(OUTPUT_CB, output_tensor)
         cbs = [
-            ttnn.cb_descriptor_from_sharded_tensor(KV_RMSNORM_OUTPUT_CB, new_cache_tensor),
+            ttnn.cb_descriptor_from_sharded_tensor(KV_RMSNORM_OUTPUT_CB, nope_cache_tensor),
+            ttnn.cb_descriptor_from_sharded_tensor(KROPE_OUTPUT_CB, rope_cache_tensor),
+            ttnn.cb_descriptor_from_sharded_tensor(OUTPUT_CB, output_tensor),
             ttnn.CBDescriptor(
                 total_size=KV_CACHE_NUM_TILES * kv_cache_page_size,
-                core_ranges=nope_core_grid,
+                core_ranges=kv_cache_core_grid,
                 format_descriptors=[kv_cache_input_cb_format],
             ),
             ttnn.CBDescriptor(
                 total_size=KV_CACHE_NUM_TILES * kv_cache_page_size,
-                core_ranges=nope_core_grid,
+                core_ranges=kv_cache_core_grid,
                 format_descriptors=[kv_cache_output_cb_format],
             ),
             ttnn.CBDescriptor(
                 total_size=KV_CACHE_NUM_TILES * intermed_page_size,
-                core_ranges=nope_core_grid,
+                core_ranges=kv_cache_core_grid,
                 format_descriptors=[kv_cache_intermed_cb_format],
             ),
-            ttnn.CBDescriptor(
-                total_size=KROPE_WT * krope_page_size,
-                core_ranges=rope_core_grid,
-                format_descriptors=[krope_output_cb_format],
-            ),
-            kv_cache_output_cb_descriptor,
         ]
 
-        ncrisc_common_runtime_args = [kv_cache_tensor.buffer_address()]
-        brisc_common_runtime_args = [kv_cache_tensor.buffer_address(), position_id]
+        ncrisc_common_runtime_args = [full_kv_cache_tensor.buffer_address()]
+        brisc_common_runtime_args = [full_kv_cache_tensor.buffer_address(), position_id]
 
         kernel_desc = UnifiedKernelDescriptor(
             kernel_source="models/demos/deepseek_v3_b1/micro_ops/kv_cache_update/kernels/kv_cache_update_kernel.cpp",
@@ -188,7 +165,7 @@ class KVCacheUpdate:
             kernels=kernel_desc.get_kernel_descriptors(),
             cbs=cbs,
         )
-        io_tensors = [new_cache_tensor, output_tensor]
+        io_tensors = [nope_cache_tensor, rope_cache_tensor, output_tensor]
 
         output = ttnn.generic_op(io_tensors, program_descriptor)
 

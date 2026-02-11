@@ -1251,6 +1251,7 @@ FORCE_INLINE void noc_async_write_page(
             posted,
             noc);
     }
+    DPRINT << " NOC ASYNC WRITE PAGE addr: " << HEX() << addrgen.get_noc_addr(id, offset, noc) << ENDL();
     noc_async_write<NOC_MAX_BURST_SIZE + 1, false, posted>(
         src_local_l1_addr, addrgen.get_noc_addr(id, offset, noc), size ? size : page_size, noc);
 }

@@ -23,6 +23,9 @@ void kernel_main() {
     if (Core::is_nope_core) {
         unified_kernels::setup_sharded_buffer(get_named_compile_time_arg_val("kv_rmsnorm_output_cb"), 1);
     }
+    if (Core::is_rope_core) {
+        unified_kernels::setup_sharded_buffer(get_named_compile_time_arg_val("krope_output_cb"), 1);
+    }
 #elif defined(COMPILE_FOR_BRISC)
     deepseek_b1_ops::KVCacheUpdate::WriterArgs args{
         .kv_cache_buffer_base_addr = get_common_arg_val<uint32_t>(0), .position_id = get_common_arg_val<uint32_t>(1)};
@@ -32,5 +35,4 @@ void kernel_main() {
 
     deepseek_b1_ops::KVCacheUpdate::Op<Core::is_nope_core, Core::is_rope_core> op;
     op(args);
-    DPRINT << " DONE " << DEC() << ENDL();
 }
