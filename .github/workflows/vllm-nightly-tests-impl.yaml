@@ -326,7 +326,7 @@ jobs:
             {
               "name": "[WH-GLX][v1] Llama-8B DP=16",
               "model": "meta-llama/Llama-3.1-8B-Instruct",
-              "server-timeout": 10,
+              "server-timeout": 20,
               "benchmark-timeout": 5,
               "runner-label": "topology-6u",
               "arch": "arch-wormhole_b0",
