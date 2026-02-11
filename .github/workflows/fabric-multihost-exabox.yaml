@@ -1,0 +1,87 @@
+name: "Fabric Test on BH Halfquad"
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["fabric-multihost"] # Temp
+
+run-name: Fabric Test on BH Halfquad
+jobs:
+  build-artifact:
+    uses: ./.github/workflows/build-artifact.yaml
+    permissions:
+      packages: write
+    secrets: inherit
+    with:
+      build-wheel: true
+      platform: 'Ubuntu 22.04'
+      skip-tt-train: false
+      ref: ${{ github.sha }}
+  
+  create-allocation:
+    name: Create Allocation for 16x4 LINExRING
+    timeout-minutes: 30
+    outputs:
+      ranksData: ${{ steps.get-allocation-data.outputs.ranksData }}
+      mgd: ${{ steps.mgd.outputs.mgd }}
+    runs-on:
+      group: exabox
+      labels: exabox-multihost
+    steps:
+      - name: MGD
+        id: mgd
+        run: |
+          MGD_CONFIG='
+            mesh_descriptors {
+              name: \"M0\"
+              arch: BLACKHOLE
+              device_topology { dims: [ 16,4 ] dim_types: [ LINE,RING ] }
+              host_topology   { dims: [ 2,1 ] }
+              channels { count: 2 policy: RELAXED }
+            }
+            top_level_instance { mesh { mesh_descriptor: \"M0\" mesh_id: 0 } }
+          '
+          echo "mgd<<EOF" >> $GITHUB_OUTPUT
+          echo "$MGD_CONFIG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create allocation
+        id: allocation
+        uses: tt-orchestration/create-allocation@main
+        with:
+          allocationName: ci-${{ github.run_id }}
+          spec: |
+            allocationType: MGD
+            matchLabels:
+              exabox.tenstorrent.com/purpose: ci
+            topologyKeys:
+              - exabox.tenstorrent.com/quad-id
+            mgd: |-
+              ${{ steps.mgd.outputs.mgd }}
+
+      - name: Get Allocation data
+        uses: tt-orchestration/get-allocation-data@main
+        id: get-allocation-data
+        with:
+          allocationName: ci-${{ github.run_id }}
+
+  cleanup:
+    name: Cleanup
+    needs: create-allocation
+    if: always()
+    runs-on:
+      group: exabox
+      labels: exabox-multihost
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Delete environment
+        uses: tt-orchestration/delete-environment@main
+        with:
+          environmentName:  ci-${{ github.run_id }}
+
+      - name: Delete allocation
+        uses: tt-orchestration/delete-allocation@main
+        with:
+          allocationName:  ci-${{ github.run_id }}
