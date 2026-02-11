@@ -98,14 +98,14 @@ void SDMeshCommandQueue::enqueue_mesh_workload(MeshWorkload& mesh_workload, bool
             }
         }
     }
-    for (auto& [coord_range, program] : mesh_workload.get_programs()) {
-        for (const auto& coord : coord_range) {
-            if (mesh_device_->impl().is_local(coord)) {
-                auto* device = mesh_device_->impl().get_device(coord);
-                tt_metal::detail::WaitProgramDone(device, program);
-            }
-        }
-    }
+    // for (auto& [coord_range, program] : mesh_workload.get_programs()) {
+    //     for (const auto& coord : coord_range) {
+    //         if (mesh_device_->impl().is_local(coord)) {
+    //             auto* device = mesh_device_->impl().get_device(coord);
+    //             tt_metal::detail::WaitProgramDone(device, program);
+    //         }
+    //     }
+    // }
 }
 
 MeshEvent SDMeshCommandQueue::enqueue_record_event(

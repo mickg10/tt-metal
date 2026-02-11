@@ -144,7 +144,7 @@ public:
 
     std::vector<MeshCoreCoord> get_active_cores() const;
 
-    MeshDevice get_mesh_device() const;
+    MeshDevice* get_mesh_device() const;
 
 private:
     // Helper struct for pinned buffer NOC address info

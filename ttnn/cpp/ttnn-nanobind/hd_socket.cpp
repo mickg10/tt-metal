@@ -108,8 +108,15 @@ void py_module_types(nb::module_& mod) {
                     "write_tensor: tensor data size ({}) is not a multiple of page_size ({})",
                     data_span.size(),
                     page_size);
-                uint32_t num_pages = data_span.size() / page_size;
-                self.write(data_span.data(), num_pages);
+                TT_FATAL(
+                    data_span.size() % page_size == 0,
+                    "write_tensor: tensor data size ({}) is not a multiple of socket page_size ({})",
+                    data_span.size(),
+                    page_size);
+                uint32_t num_writes = data_span.size() / page_size;
+                for (uint32_t i = 0; i < num_writes; i++) {
+                    self.write(data_span.data() + i * page_size, 1);
+                }
             },
             nb::arg("tensor"),
             R"doc(
@@ -149,6 +156,15 @@ void py_module_types(nb::module_& mod) {
 
                 Returns:
                     MeshDevice: The mesh device this socket is bound to.
+            )doc")
+        .def(
+            "get_h2d_mode",
+            &tt::tt_metal::distributed::H2DSocket::get_h2d_mode,
+            R"doc(
+                Returns the H2D transfer mode of this socket.
+
+                Returns:
+                    H2DMode: The transfer mode (HOST_PUSH or DEVICE_PULL).
             )doc");
 
     nb::class_<tt::tt_metal::distributed::D2HSocket>(mod, "D2HSocket")
