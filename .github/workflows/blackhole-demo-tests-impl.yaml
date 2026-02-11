@@ -127,7 +127,6 @@ jobs:
     container:
       image: ${{ inputs.docker-image || 'docker-image-unresolved' }}
       env:
-        ARCH_NAME: ${{ matrix.test-group.arch }}
         LOGURU_LEVEL: INFO
         LD_LIBRARY_PATH: /work/build/lib
         PYTHONPATH: /work
@@ -234,7 +233,6 @@ jobs:
     container:
       image: ${{ inputs.docker-image || 'docker-image-unresolved' }}
       env:
-        ARCH_NAME: ${{ matrix.test-group.arch }}
         LOGURU_LEVEL: INFO
         LD_LIBRARY_PATH: /work/build/lib
         PYTHONPATH: /work
@@ -416,7 +414,6 @@ jobs:
     container:
       image: ${{ inputs.docker-image || 'docker-image-unresolved' }}
       env:
-        ARCH_NAME: ${{ matrix.test-group.arch }}
         LOGURU_LEVEL: INFO
         LD_LIBRARY_PATH: /work/build/lib
         PYTHONPATH: /work
@@ -587,7 +584,6 @@ jobs:
     container:
       image: ${{ inputs.docker-image || 'docker-image-unresolved' }}
       env:
-        ARCH_NAME: ${{ matrix.test-group.arch }}
         LOGURU_LEVEL: INFO
         LD_LIBRARY_PATH: /work/build/lib
         PYTHONPATH: /work
