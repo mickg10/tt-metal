@@ -41,6 +41,9 @@ on:
       dev-tag:
         description: "Docker tag for the dev Docker image for developing TT-Metalium et al"
         value: ${{ jobs.check-docker-images.outputs.dev-tag }}
+      dev-multihost-tag:
+        description: "Docker tag for the dev-multihost Docker image for developing TT-Metalium et al"
+        value: ${{ jobs.check-docker-images.outputs.dev-multihost-tag }}
       basic-dev-tag:
         description: "Docker tag for the basic dev Docker image for basic development"
         value: ${{ jobs.check-docker-images.outputs.basic-dev-tag }}
@@ -77,6 +80,8 @@ jobs:
       ci-test-tag: ${{ steps.tags.outputs.ci-test-tag }}
       dev-exists: ${{ steps.images.outputs.dev-exists }}
       dev-tag: ${{ steps.tags.outputs.dev-tag }}
+      dev-multihost-exists: ${{ steps.images.outputs.dev-multihost-exists }}
+      dev-multihost-tag: ${{ steps.tags.outputs.dev-multihost-tag }}
       basic-dev-exists: ${{ steps.images.outputs.basic-dev-exists }}
       basic-dev-tag: ${{ steps.tags.outputs.basic-dev-tag }}
       basic-ttnn-runtime-exists: ${{ steps.images.outputs.basic-ttnn-runtime-exists }}
@@ -106,6 +111,7 @@ jobs:
           echo "CI_BUILD_IMAGE_NAME=${DISTRO}-${VERSION}-ci-build-${ARCH}" >> $GITHUB_ENV
           echo "CI_TEST_IMAGE_NAME=${DISTRO}-${VERSION}-ci-test-${ARCH}" >> $GITHUB_ENV
           echo "DEV_IMAGE_NAME=${DISTRO}-${VERSION}-dev-${ARCH}" >> $GITHUB_ENV
+          echo "DEV_MULTIHOST_IMAGE_NAME=${DISTRO}-${VERSION}-dev-multihost-${ARCH}" >> $GITHUB_ENV
           echo "BASIC_DEV_IMAGE_NAME=${DISTRO}-${VERSION}-basic-dev-${ARCH}" >> $GITHUB_ENV
           echo "BASIC_TTNN_RUNTIME_IMAGE_NAME=${DISTRO}-${VERSION}-basic-ttnn-runtime-${ARCH}" >> $GITHUB_ENV
           echo "MANYLINUX_IMAGE_NAME=manylinux-${ARCH}" >> $GITHUB_ENV
@@ -119,7 +125,7 @@ jobs:
           echo "ci-build-tag=ghcr.io/${{ github.repository }}/tt-metalium/${{ env.CI_BUILD_IMAGE_NAME }}:${HASH}" >> $GITHUB_OUTPUT
           echo "ci-test-tag=ghcr.io/${{ github.repository }}/tt-metalium/${{ env.CI_TEST_IMAGE_NAME }}:${HASH}" >> $GITHUB_OUTPUT
           echo "dev-tag=ghcr.io/${{ github.repository }}/tt-metalium/${{ env.DEV_IMAGE_NAME }}:${HASH}" >> $GITHUB_OUTPUT
-
+          echo "dev-multihost-tag=ghcr.io/${{ github.repository }}/tt-metalium/${{ env.DEV_MULTIHOST_IMAGE_NAME }}:${HASH}" >> $GITHUB_OUTPUT
           BASIC_DEV_HASH=$(.github/scripts/dockerfile-hash.sh dockerfile/Dockerfile.basic-dev)
           echo "basic-dev-tag=ghcr.io/${{ github.repository }}/tt-metalium/${{ env.BASIC_DEV_IMAGE_NAME }}:${BASIC_DEV_HASH}" >> $GITHUB_OUTPUT
 
@@ -166,6 +172,14 @@ jobs:
           else
             echo "${{ steps.tags.outputs.manylinux-tag }} does not exist"
             echo "manylinux-exists=false" >> $GITHUB_OUTPUT
+          fi
+
+          if docker manifest inspect ${{ steps.tags.outputs.dev-multihost-tag }} > /dev/null 2>&1; then
+            echo "${{ steps.tags.outputs.dev-multihost-tag }} exists"
+            echo "dev-multihost-exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "${{ steps.tags.outputs.dev-multihost-tag }} does not exist"
+            echo "dev-multihost-exists=false" >> $GITHUB_OUTPUT
           fi
 
   # Build Ubuntu images
@@ -220,6 +234,19 @@ jobs:
           file: dockerfile/Dockerfile
           target: dev
           tags: ${{ needs.check-docker-images.outputs.dev-tag }}
+          build-args: UBUNTU_VERSION=${{ needs.check-docker-images.outputs.version }}
+          cache-to: type=inline
+          pull: true
+          outputs: |
+            type=registry,push=true,compression=zstd,compression-level=3,force-compression=true,oci-mediatypes=true
+      - name: Build and push Multihost Dev image
+        if: needs.check-docker-images.outputs.dev-multihost-exists != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ github.workspace }}
+          file: dockerfile/Dockerfile
+          target: dev-multihost
+          tags: ${{ needs.check-docker-images.outputs.dev-multihost-tag }}
           build-args: UBUNTU_VERSION=${{ needs.check-docker-images.outputs.version }}
           cache-to: type=inline
           pull: true

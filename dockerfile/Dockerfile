@@ -203,6 +203,17 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 
 #############################################################
+# SSH-ready DEV container to be used with multihost MPI jobs
+
+FROM dev AS dev-multihost
+RUN adduser --uid 1000 --shell /bin/bash user
+RUN usermod -aG sudo user
+RUN echo 'user ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/user && chmod 0440 /etc/sudoers.d/user
+
+RUN mkdir -p /run/sshd
+RUN echo "StrictModes no" | sudo tee -a /etc/ssh/sshd_config
+
+#############################################################
 
 FROM base AS release
 
