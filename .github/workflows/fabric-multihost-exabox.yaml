@@ -51,7 +51,7 @@ jobs:
 
       - name: Create allocation
         id: allocation
-        uses: .github/actions/ttop-create-allocation
+        uses: ./.github/actions/ttop-create-allocation
         with:
           allocationName: ci-${{ github.run_id }}
           spec: |
@@ -64,7 +64,7 @@ jobs:
               ${{ steps.mgd.outputs.mgd }}
 
       - name: Get Allocation data
-        uses: .github/actions/ttop-get-allocation-data
+        uses: ./.github/actions/ttop-get-allocation-data
         id: get-allocation-data
         with:
           allocationName: ci-${{ github.run_id }}
@@ -81,11 +81,11 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Delete environment
-        uses: .github/actions/delete-environment
+        uses: ./.github/actions/delete-environment
         with:
           environmentName:  ci-${{ github.run_id }}
 
       - name: Delete allocation
-        uses: .github/actions/delete-allocation
+        uses: ./.github/actions/delete-allocation
         with:
           allocationName:  ci-${{ github.run_id }}
