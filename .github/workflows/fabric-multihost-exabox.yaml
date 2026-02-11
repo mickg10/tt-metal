@@ -29,6 +29,9 @@ jobs:
       group: exabox
       labels: exabox-multihost
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: MGD
         id: mgd
         run: |
@@ -48,7 +51,7 @@ jobs:
 
       - name: Create allocation
         id: allocation
-        uses: tenstorrent/tt-orchestration/.github/actions/create-allocation@main
+        uses: .github/actions/ttop-create-allocation
         with:
           allocationName: ci-${{ github.run_id }}
           spec: |
@@ -61,7 +64,7 @@ jobs:
               ${{ steps.mgd.outputs.mgd }}
 
       - name: Get Allocation data
-        uses: tenstorrent/tt-orchestration/.github/actions/get-allocation-data@main
+        uses: .github/actions/ttop-get-allocation-data
         id: get-allocation-data
         with:
           allocationName: ci-${{ github.run_id }}
@@ -78,11 +81,11 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Delete environment
-        uses: tenstorrent/tt-orchestration/.github/actions/delete-environment@main
+        uses: .github/actions/delete-environment
         with:
           environmentName:  ci-${{ github.run_id }}
 
       - name: Delete allocation
-        uses: tenstorrent/tt-orchestration/.github/actions/delete-allocation@main
+        uses: .github/actions/delete-allocation
         with:
           allocationName:  ci-${{ github.run_id }}
