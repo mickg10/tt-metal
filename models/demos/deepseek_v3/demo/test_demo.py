@@ -16,7 +16,7 @@ CACHE_DIR = Path(os.getenv("DEEPSEEK_V3_CACHE", "/mnt/MLPerf/tt_dnn-models/deeps
     "repeat_batches, max_new_tokens, override_num_layers, max_prompts, profile_decode",
     [
         pytest.param(1, 10, 5, 56, False, id="short_demo"),
-        pytest.param(1, 13, 5, 1, True, id="profile_decode"),
+        pytest.param(1, 13, 5, 1, True, id="profile_decode", marks=pytest.mark.timeout(1800)),
     ],
 )
 def test_demo(repeat_batches, max_new_tokens, override_num_layers, max_prompts, profile_decode):
