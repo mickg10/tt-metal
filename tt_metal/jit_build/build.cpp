@@ -410,6 +410,16 @@ void JitBuildState::compile_one(
     const string& obj_temp_path) const {
     // ZoneScoped;
 
+    if (fs::exists(obj_temp_path)) {
+        TT_THROW(
+            "Race condition detected: temp object file already exists before compilation: {} "
+            "(out_dir={}, src={}, obj={})",
+            obj_temp_path,
+            out_dir,
+            src,
+            obj);
+    }
+
     string cmd{"cd " + out_dir + " && " + env_.gpp_};
     string defines = this->defines_;
 
