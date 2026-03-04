@@ -289,7 +289,11 @@ ttnn::Tensor ExecuteAllReduceAsync::invoke(
         composite_common::use_composite_all_gather(padded_tensor, composite_dim, out_memory_config);
     bool composite_reduce_scatter =
         composite_common::use_composite_reduce_scatter(padded_tensor, composite_dim, cluster_axis);
-    const bool composite_for_2d_mesh = tt::tt_fabric::GetFabricConfig() == tt::tt_fabric::FabricConfig::FABRIC_2D &&
+    // When cluster_axis is specified, the all_reduce is 1D along a single mesh axis,
+    // so it can use the native reduce_scatter + all_gather path even on 2D fabric.
+    // Only force composite for true 2D (no cluster_axis) all_reduce on FABRIC_2D.
+    const bool composite_for_2d_mesh = !cluster_axis.has_value() &&
+                                       tt::tt_fabric::GetFabricConfig() == tt::tt_fabric::FabricConfig::FABRIC_2D &&
                                        detail::is_true_2d_mesh(input_tensor, topology_);
 
     if (composite_all_gather || composite_reduce_scatter || (dim != composite_dim) || composite_for_2d_mesh) {
