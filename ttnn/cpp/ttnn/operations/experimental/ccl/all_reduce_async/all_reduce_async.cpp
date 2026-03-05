@@ -285,10 +285,7 @@ ttnn::Tensor ExecuteAllReduceAsync::invoke(
 
     // logic for taking the AG+local reduce code path
     auto composite_dim = (dim == padded_tensor.padded_shape().size()) ? 0 : dim;
-    // When cluster_axis is specified, this is a 1D reduction along a single mesh axis.
-    // Skip use_composite_all_gather which has a blanket FABRIC_2D check that would
-    // force the slow composite path even for 1D reductions on 2D meshes.
-    bool composite_all_gather = !cluster_axis.has_value() &&
+    bool composite_all_gather =
         composite_common::use_composite_all_gather(padded_tensor, composite_dim, out_memory_config);
     bool composite_reduce_scatter =
         composite_common::use_composite_reduce_scatter(padded_tensor, composite_dim, cluster_axis);
