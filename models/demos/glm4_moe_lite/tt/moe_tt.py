@@ -118,14 +118,37 @@ def _make_sparse_matmul_program_config(
     per_core_M: int = 1,
 ) -> ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig:
     grid = device.compute_with_storage_grid_size()
-    core_x = int(getattr(grid, "x"))
-    core_y = int(getattr(grid, "y"))
+    max_x = int(getattr(grid, "x"))
+    max_y = int(getattr(grid, "y"))
     n_tiles = (int(out_features) + ttnn.TILE_SIZE - 1) // ttnn.TILE_SIZE
-    # The sparse matmul 1D program assigns 2D blocks across a 2D core grid and requires the
-    # number of blocks not to exceed the number of available cores. Use a conservative
-    # per_core_N based on ceil-div to keep num_blocks_x small when out_features > num_cores.
-    num_cores = max(1, core_x * core_y)
-    per_core_N = max(1, int(math.ceil(n_tiles / num_cores)))
+
+    # The sparse_matmul 1D kernel requires num_blocks_total to fill a RECTANGULAR
+    # sub-grid. Otherwise the bounding box contains idle cores and the kernel
+    # asserts: num_cores_with_work != in0_mcast_receiver_num_cores.
+    #
+    # Find (core_x, core_y, per_core_N) such that:
+    #   num_blocks_x = ceil(n_tiles / per_core_N)
+    #   core_x * core_y == num_blocks_x  (exact rectangular fill)
+    #   core_x <= max_x, core_y <= max_y
+    core_x, core_y, best_pcn = 1, 1, n_tiles  # fallback: 1 core, all tiles
+    best_core_count = 1
+    for pcn in range(1, n_tiles + 1):
+        nbx = (n_tiles + pcn - 1) // pcn
+        if nbx > max_x * max_y:
+            continue
+        if nbx < best_core_count:
+            break  # Increasing pcn only decreases nbx; no further improvement possible
+        # Find widest grid_x that divides nbx exactly
+        for gx in range(min(max_x, nbx), 0, -1):
+            if nbx % gx == 0:
+                gy = nbx // gx
+                if gy <= max_y:
+                    # Prefer largest core count, then smallest per_core_N as tiebreaker
+                    if nbx > best_core_count or (nbx == best_core_count and pcn < best_pcn):
+                        core_x, core_y, best_pcn = gx, gy, pcn
+                        best_core_count = nbx
+                    break
+
     return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
         compute_with_storage_grid_size=ttnn.CoreCoord(core_x, core_y),
         in0_block_w=int(in0_block_w),
@@ -134,7 +157,7 @@ def _make_sparse_matmul_program_config(
         out_block_h=1,
         out_block_w=1,
         per_core_M=int(per_core_M),
-        per_core_N=int(per_core_N),
+        per_core_N=int(best_pcn),
         fuse_batch=False,
         fused_activation=None,
         mcast_in0=True,

@@ -14,7 +14,7 @@ def _env_bool(name: str) -> bool:
     return bool(raw) and raw not in {"0", "false", "no", "off"}
 
 
-_ORIG_TTNN_DEALLOCATE = ttnn.deallocate
+_ORIG_TTNN_DEALLOCATE = getattr(ttnn, "deallocate", None)
 
 
 def _noop_deallocate(*args: Any, **kwargs: Any) -> None:
@@ -31,6 +31,6 @@ def _noop_deallocate(*args: Any, **kwargs: Any) -> None:
 #
 # This flag is intended ONLY for correctness isolation (short runs). Disabling
 # deallocation can increase memory pressure and should not be used for perf runs.
-if _env_bool("GLM4_MOE_LITE_DISABLE_DEALLOC"):
+if _env_bool("GLM4_MOE_LITE_DISABLE_DEALLOC") and _ORIG_TTNN_DEALLOCATE is not None:
     ttnn.deallocate = _noop_deallocate  # type: ignore[assignment]
 

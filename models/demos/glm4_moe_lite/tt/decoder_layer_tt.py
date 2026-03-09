@@ -552,11 +552,6 @@ def run_decoder_layer_decode_one_step_update_cache_tt(
     concat_heads = _env_bool("GLM4_MOE_LITE_CONCAT_HEADS")
     skip_typecast = _env_bool("GLM4_MOE_LITE_SKIP_TYPECAST")
     attn_dp = _env_bool("GLM4_MOE_LITE_ATTN_DP")
-    head_parallel_kvb2 = (
-        _env_bool("GLM4_MOE_LITE_HEAD_PARALLEL_KVB2")
-        and tp_enabled
-        and tp_size > 1
-    )
     fuse_mlp_moe_reduce = _env_bool("GLM4_MOE_LITE_FUSE_MLP_MOE_REDUCE")
     fuse_shared_gate_up = _env_bool("GLM4_MOE_LITE_FUSE_SHARED_GATE_UP")
 
@@ -624,6 +619,11 @@ def run_decoder_layer_decode_one_step_update_cache_tt(
     tp_enabled = tp_axis is not None and os.environ.get("GLM4_MOE_LITE_TP", "").strip() == "1"
     mesh_rows, mesh_cols = _mesh_shape(device)
     tp_size = int((mesh_rows, mesh_cols)[tp_axis]) if tp_axis is not None else 1
+    head_parallel_kvb2 = (
+        _env_bool("GLM4_MOE_LITE_HEAD_PARALLEL_KVB2")
+        and tp_enabled
+        and tp_size > 1
+    )
 
     def _tp_row_parallel_linear_from_replicated(a: ttnn.Tensor, b: ttnn.Tensor) -> ttnn.Tensor:
         """Row-parallel matmul helper for TP-sharded weights.
@@ -1540,17 +1540,28 @@ def run_decoder_layer_decode_one_step_update_cache_tt(
     _profile_add(profile, "moe_experts_s", time.perf_counter() - t0 if profile is not None else 0.0)
 
     t0 = time.perf_counter() if profile is not None else 0.0
+
+    # When fuse_mlp_moe_reduce is True, do ONE global all_reduce on the combined
+    # (shared + routed) output.  The routed experts are EP-sharded across ALL
+    # devices (e.g. 32), so the reduce must be global (no cluster_axis).
+    # The shared expert partial is TP-sharded (e.g. 4 devices) but replicated
+    # across DP replicas.  A global sum would over-count it by dp_size, so we
+    # pre-scale shared_out by 1/dp_size before adding.  1/4 and 1/8 are exact
+    # in bfloat16.
+    if _skip_shared_reduce:
+        num_devices = mesh_rows * mesh_cols
+        dp_size = num_devices // max(1, tp_size)
+        if dp_size > 1:
+            shared_out = ttnn.multiply(shared_out, 1.0 / dp_size)
     mlp_out = ttnn.add(shared_out, routed_out, memory_config=moe_decode_mc)
     ttnn.deallocate(shared_out, force=False)
     ttnn.deallocate(routed_out, force=False)
 
-    # When fuse_mlp_moe_reduce is True, do ONE fused all_reduce on the combined output.
     if _skip_shared_reduce:
         mlp_out_reduced = ttnn.all_reduce(
             mlp_out,
             num_links=1,
             topology=ttnn.Topology.Linear,
-            cluster_axis=tp_axis,
             memory_config=decode_act_mc or ttnn.DRAM_MEMORY_CONFIG,
         )
         ttnn.deallocate(mlp_out, force=False)
@@ -1680,11 +1691,35 @@ def run_decoder_layer_prefill_update_cache_tt(
         return interleaved
 
     tp_axis = _tp_cluster_axis(device)
-    tp_enabled = tp_axis is not None and os.environ.get("GLM4_MOE_LITE_TP", "").strip() == "1"
+    tp_prefill_off = os.environ.get("GLM4_MOE_LITE_TP_PREFILL", "1").strip() == "0"
+    tp_enabled = tp_axis is not None and os.environ.get("GLM4_MOE_LITE_TP", "").strip() == "1" and not tp_prefill_off
     mesh_rows, mesh_cols = _mesh_shape(device)
     tp_size = int((mesh_rows, mesh_cols)[tp_axis]) if tp_axis is not None else 1
+    head_parallel_kvb2 = (
+        _env_bool("GLM4_MOE_LITE_HEAD_PARALLEL_KVB2")
+        and tp_enabled
+        and tp_size > 1
+    )
+    if tp_prefill_off:
+        logger.info("TP disabled for prefill (GLM4_MOE_LITE_TP_PREFILL=0)")
+
+    _tp_rpl_call_idx = [0]
 
     def _tp_row_parallel_linear_from_replicated(a: ttnn.Tensor, b: ttnn.Tensor) -> ttnn.Tensor:
+        idx = _tp_rpl_call_idx[0]
+        _tp_rpl_call_idx[0] += 1
+        a_shape = tuple(int(d) for d in a.shape)
+        last_dim = a_shape[-1] if a_shape else 0
+        shard = last_dim // tp_size if tp_size > 0 else 0
+        logger.info(
+            "[prefill-tp-debug] call={} a.shape={} tp_size={} shard_dim={} tile_ok={}",
+            idx, a_shape, tp_size, shard, shard % 32 == 0,
+        )
+        if shard % 32 != 0:
+            logger.error(
+                "[prefill-tp-debug] TILE MISALIGNMENT! call={} a.shape[-1]={} / tp_size={} = {} (not tile-aligned)",
+                idx, last_dim, tp_size, shard,
+            )
         a_tp = ttnn.mesh_partition(a, dim=3, cluster_axis=tp_axis)
         out = _mlp_linear(a_tp, b)
         ttnn.deallocate(a_tp, force=False)
@@ -1901,34 +1936,70 @@ def run_decoder_layer_prefill_update_cache_tt(
 
     t0 = time.perf_counter() if profile is not None else 0.0
     # Same per-batch loop as w_kv_b1 for w_kv_b2 (small per-head matmul).
-    if batch > 1:
-        kv_b2_fn = _tp_row_parallel_linear_from_replicated if tp_enabled else _mlp_linear
-        v_parts = []
-        for bi in range(batch):
-            a_bi = ttnn.slice(attn_latent, [bi, 0, 0, 0], [bi + 1, num_heads, seq_len, int(hparams.kv_lora_rank)])
-            v_bi = kv_b2_fn(a_bi, w.w_kv_b2)
-            ttnn.deallocate(a_bi, force=False)
-            v_parts.append(v_bi)
-        ttnn.deallocate(attn_latent, force=False)
-        v = ttnn.concat(v_parts, dim=0)  # [B,H,S,v_head_dim]
-        for p in v_parts:
-            ttnn.deallocate(p, force=False)
-    else:
-        if tp_enabled:
-            v = _tp_row_parallel_linear_from_replicated(attn_latent, w.w_kv_b2)
+    if head_parallel_kvb2:
+        # Head-parallel prefill: partition heads across TP BEFORE w_kv_b2 matmul.
+        # w_kv_b2 is already head-sharded (dim=1), so partition attn_latent heads to match.
+        if batch > 1:
+            v_parts = []
+            for bi in range(batch):
+                a_bi = ttnn.slice(attn_latent, [bi, 0, 0, 0], [bi + 1, num_heads, seq_len, int(hparams.kv_lora_rank)])
+                a_bi = ttnn.mesh_partition(a_bi, dim=1, cluster_axis=tp_axis)
+                v_bi = _mlp_linear(a_bi, w.w_kv_b2)
+                ttnn.deallocate(a_bi, force=False)
+                v_parts.append(v_bi)
+            ttnn.deallocate(attn_latent, force=False)
+            v = ttnn.concat(v_parts, dim=0)  # [B, H/tp, S, v_head_dim]
+            for p in v_parts:
+                ttnn.deallocate(p, force=False)
         else:
-            v = _mlp_linear(attn_latent, w.w_kv_b2)
-        ttnn.deallocate(attn_latent, force=False)
-
-    # Flatten back from [B,H,S_pad,v_head_dim] to [1,1,B*S_pad,H*v_head_dim]
-    # for the output projection (token-wise linear).
-    v = ttnn.permute(v, (0, 2, 1, 3))  # [B,S_pad,H,v_head_dim]
-    v = ttnn.reshape(v, (1, 1, total_seq, int(num_heads * hparams.v_head_dim)))  # [1,1,B*S_pad,H*v_head_dim]
-    if tp_enabled:
-        attn_out = _tp_row_parallel_linear_from_replicated(v, w.w_o)  # [1,1,B*S_pad,hidden]
+            attn_latent = ttnn.mesh_partition(attn_latent, dim=1, cluster_axis=tp_axis)
+            v = _mlp_linear(attn_latent, w.w_kv_b2)  # [B, H/tp, S, v_head_dim]
+            ttnn.deallocate(attn_latent, force=False)
+        # Flatten: [B, H/tp, S, v_head_dim] -> [1, 1, B*S, (H/tp)*v_head_dim]
+        heads_per_dev = int(hparams.num_attention_heads) // tp_size
+        flat_dim = heads_per_dev * int(hparams.v_head_dim)
+        v = ttnn.permute(v, (0, 2, 1, 3))  # [B, S, H/tp, v_head_dim]
+        v = ttnn.reshape(v, (1, 1, total_seq, flat_dim))  # [1, 1, B*S, (H/tp)*v_head_dim]
+        # Row-parallel w_o: v already has the right per-device head slice.
+        attn_out_partial = _mlp_linear(v, w.w_o)  # [1, 1, B*S, hidden] partial
+        ttnn.deallocate(v, force=False)
+        attn_out = ttnn.all_reduce(
+            attn_out_partial,
+            num_links=1,
+            topology=ttnn.Topology.Linear,
+            cluster_axis=tp_axis,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        ttnn.deallocate(attn_out_partial, force=False)
     else:
-        attn_out = _mlp_linear(v, w.w_o)  # [1,1,B*S_pad,hidden]
-    ttnn.deallocate(v, force=False)
+        if batch > 1:
+            kv_b2_fn = _tp_row_parallel_linear_from_replicated if tp_enabled else _mlp_linear
+            v_parts = []
+            for bi in range(batch):
+                a_bi = ttnn.slice(attn_latent, [bi, 0, 0, 0], [bi + 1, num_heads, seq_len, int(hparams.kv_lora_rank)])
+                v_bi = kv_b2_fn(a_bi, w.w_kv_b2)
+                ttnn.deallocate(a_bi, force=False)
+                v_parts.append(v_bi)
+            ttnn.deallocate(attn_latent, force=False)
+            v = ttnn.concat(v_parts, dim=0)  # [B,H,S,v_head_dim]
+            for p in v_parts:
+                ttnn.deallocate(p, force=False)
+        else:
+            if tp_enabled:
+                v = _tp_row_parallel_linear_from_replicated(attn_latent, w.w_kv_b2)
+            else:
+                v = _mlp_linear(attn_latent, w.w_kv_b2)
+            ttnn.deallocate(attn_latent, force=False)
+
+        # Flatten back from [B,H,S_pad,v_head_dim] to [1,1,B*S_pad,H*v_head_dim]
+        # for the output projection (token-wise linear).
+        v = ttnn.permute(v, (0, 2, 1, 3))  # [B,S_pad,H,v_head_dim]
+        v = ttnn.reshape(v, (1, 1, total_seq, int(num_heads * hparams.v_head_dim)))  # [1,1,B*S_pad,H*v_head_dim]
+        if tp_enabled:
+            attn_out = _tp_row_parallel_linear_from_replicated(v, w.w_o)  # [1,1,B*S_pad,hidden]
+        else:
+            attn_out = _mlp_linear(v, w.w_o)  # [1,1,B*S_pad,hidden]
+        ttnn.deallocate(v, force=False)
 
     x_attn_out = residual + attn_out
     ttnn.deallocate(attn_out, force=False)

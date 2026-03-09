@@ -74,6 +74,11 @@ class Glm4MoeLiteForCausalLM(nn.Module):
         optimizations: str = None,
     ):
         # TTModelLoader does not pass the model ID/path; docker_tt sets HF_MODEL.
+        import sys
+        print(f"[DEBUG] initialize_vllm_model called, PID={os.getpid()}", file=sys.stderr, flush=True)
+        print(f"[DEBUG] HF_MODEL={os.environ.get('HF_MODEL')!r}", file=sys.stderr, flush=True)
+        print(f"[DEBUG] GLM4_MOE_LITE_HF_MODEL={os.environ.get('GLM4_MOE_LITE_HF_MODEL')!r}", file=sys.stderr, flush=True)
+        print(f"[DEBUG] All env keys containing MODEL: {[k for k in os.environ if 'MODEL' in k.upper()]}", file=sys.stderr, flush=True)
         model_id = os.environ.get("HF_MODEL") or os.environ.get(
             "GLM4_MOE_LITE_HF_MODEL")
         if not model_id:
@@ -82,7 +87,10 @@ class Glm4MoeLiteForCausalLM(nn.Module):
                 "HuggingFace repo id (e.g. 'zai-org/GLM-4.7-Flash').")
 
         # Single source of truth for snapshot resolution: offline scan of the local HF cache.
-        snapshot_dir = resolve_best_effort_snapshot_dir(model_id)
+        # Allow MODEL_WEIGHTS_PATH to bypass HF cache lookup.
+        weights_path = os.environ.get("MODEL_WEIGHTS_PATH", "").strip()
+        hint_dir = Path(weights_path) if weights_path else None
+        snapshot_dir = resolve_best_effort_snapshot_dir(model_id, hint_dir=hint_dir)
 
         # Converted TT weights / compiled artifacts cache.
         default_cache_root = Path(os.path.expanduser("~/.cache/ttnn/models"))
@@ -222,7 +230,7 @@ class Glm4MoeLiteForCausalLM(nn.Module):
         self._kv_cache = kv_cache
         return kv_cache
 
-    def warmup_model_prefill(self, *, kv_cache, enable_trace, sampling_params):
+    def warmup_model_prefill(self, *, kv_cache, enable_trace, sampling_params=None, **kwargs):
         """vLLM TT backend warmup hook.
 
         The TT runner uses this to compile/trace common prefill paths early.
@@ -248,6 +256,23 @@ class Glm4MoeLiteForCausalLM(nn.Module):
             kv_cache=kv_cache,
             start_pos=torch.zeros((1,), dtype=torch.int32),
             enable_trace=False,
+            read_from_device=True,
+        )
+
+    def warmup_model_decode(self, *, kv_cache, enable_trace, max_batch_size, num_blocks, **kwargs):
+        """Warmup decode path for the TT model runner."""
+        self._ensure_tt_runner()
+
+        page_table = torch.zeros((max_batch_size, max(1, num_blocks)), dtype=torch.int32)
+        for i in range(max_batch_size):
+            page_table[i, 0] = i
+
+        _ = self.decode_forward(
+            tokens=torch.zeros((max_batch_size, 1), dtype=torch.int32),
+            page_table=page_table,
+            kv_cache=kv_cache,
+            start_pos=torch.zeros((max_batch_size,), dtype=torch.int32),
+            enable_trace=enable_trace,
             read_from_device=True,
         )
 
