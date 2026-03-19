@@ -49,8 +49,9 @@ def _tp_cluster_axis(device: Any) -> int | None:
         return None
     mesh_rows, mesh_cols = _get_mesh_shape(device)
     if mesh_rows > 1 and mesh_cols > 1:
-        # 2D mesh (TG): TP is axis 0 (rows=8)
-        return 0
+        from models.demos.glm4_moe.tt.layer_weights import _tp_axis_and_size
+        tp_axis, _ = _tp_axis_and_size(device)
+        return tp_axis
     if mesh_cols > 1:
         return 1
     if mesh_rows > 1:
@@ -64,39 +65,11 @@ def _sharded_rms_norm(x: ttnn.Tensor, norm_module: Any, hidden_size: int, num_co
     For hidden_size=5120, single-core RMSNorm overflows L1 by ~13.6 KB (1.51 MB vs 1.43 MB limit).
     Spreading across 8 cores reduces per-core memory to ~100 KB — well within L1.
 
-    For prefill (large sequence lengths), auto-scales num_cores up so each core's
-    shard fits within L1. The rms_norm kernel needs ~6 bytes per element in CBs
-    (input + output + intermediates).
-
     Uses ttnn.to_memory_config for sharding (works on TG mesh; interleaved_to_sharded hangs).
     """
     input_shape = [int(d) for d in x.shape]  # save for shape restoration
     h_logical = int(x.shape[-2])  # logical height (may NOT be tile-padded)
     h = ((h_logical + 31) // 32) * 32  # round up to tile boundary (32)
-
-    # Auto-scale num_cores for large sequences to fit within L1.
-    # L1 budget ~1.43 MB. rms_norm CBs ≈ 6 bytes per element (3x BF16 for in/out/scratch).
-    # Per-core shard: h * (hidden/num_cores) * 6 bytes must fit in L1.
-    L1_BUDGET = 1_400_000  # conservative (actual 1,499,136)
-    BYTES_PER_ELEM = 6  # empirical: ~3x BF16 for rms_norm CBs
-    tiles_w_total = hidden_size // 32
-    while num_cores < 64:
-        shard_w_candidate = hidden_size // num_cores
-        per_core_bytes = h * shard_w_candidate * BYTES_PER_ELEM
-        if per_core_bytes <= L1_BUDGET and tiles_w_total % num_cores == 0:
-            break
-        # Try doubling cores
-        next_cores = num_cores * 2
-        if tiles_w_total % next_cores != 0:
-            # Find next valid divisor
-            for c in range(num_cores + 1, 65):
-                if tiles_w_total % c == 0:
-                    next_cores = c
-                    break
-            else:
-                break
-        num_cores = next_cores
-
     tile_h = h // 32  # number of tile rows
     tiles_w = hidden_size // 32  # total tiles in width
     tiles_per_core = tiles_w // num_cores  # tiles per core
@@ -249,6 +222,8 @@ class Glm4MoeDecoderLayer:
         w = self.layer_weights
         device = self.device
         hparams = self.hparams
+        logger.info("[DBG] DL{} _forward_decode entry: x.shape={}, active_batch={}",
+                    self.layer_idx, list(x.shape), active_batch)
 
         tp_axis = _tp_cluster_axis(device)
         tp_enabled = tp_axis is not None
@@ -271,12 +246,22 @@ class Glm4MoeDecoderLayer:
         h = _sharded_rms_norm(x, w.input_layernorm, hparams.hidden_size)
 
         # ---- GQA Attention ----
+        logger.info("[DBG] DL{} before attention: h.shape={}", self.layer_idx, list(h.shape))
         attn_out = self.attention.forward(
             h, current_pos, rot_mats, mode="decode", page_table=page_table, kv_cache=kv_cache,
             active_batch=active_batch,
         )
+        logger.info("[DBG] DL{} after attention: attn_out.shape={}", self.layer_idx, list(attn_out.shape))
 
-        # ---- Residual ----
+        # ---- Attention residual ----
+        # TILE_LAYOUT pads batch to 32, so attn_out may be [1,1,32,H] while x is [1,1,B,H].
+        # ttnn.add supports broadcasting when B=1 (1→32 broadcast), but NOT when 1<B<32
+        # (e.g., 4→32 fails with "Invalid subtile broadcast type").
+        # Fix: reshape attn_out to match x's batch dim when they differ (metadata-only, no data copy).
+        x_shape = [int(d) for d in x.shape]
+        attn_shape = [int(d) for d in attn_out.shape]
+        if attn_shape[-2] != x_shape[-2] and x_shape[-2] > 1:
+            attn_out = ttnn.reshape(attn_out, x_shape, attn_shape)
         x = ttnn.add(x, attn_out, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         ttnn.deallocate(attn_out, force=False)
 
@@ -285,6 +270,7 @@ class Glm4MoeDecoderLayer:
         h = _sharded_rms_norm(x, w.post_attention_layernorm, hparams.hidden_size)
 
         # ---- MLP ----
+        logger.info("[DBG] DL{} before MLP: h.shape={}, is_dense={}", self.layer_idx, list(h.shape), self.is_dense_layer)
         if self.is_dense_layer:
             mlp_out = self._dense_mlp_forward(
                 h, w.w_mlp_gate, w.w_mlp_up, w.w_mlp_down,
@@ -303,6 +289,7 @@ class Glm4MoeDecoderLayer:
                 h, compute_kernel_config=mlp_compute_kernel_config,
                 tp_axis=tp_axis, tp_enabled=tp_enabled,
             )
+        logger.info("[DBG] DL{} after MLP: mlp_out.shape={}", self.layer_idx, list(mlp_out.shape))
 
         # ---- Residual ----
         res_shape = [int(d) for d in residual.shape]
@@ -317,11 +304,14 @@ class Glm4MoeDecoderLayer:
             if mlp_vol == res_vol:
                 mlp_out = ttnn.reshape(mlp_out, res_shape, mlp_shape)
             else:
-                mlp_out = ttnn.slice(mlp_out, starts=[0] * len(res_shape), ends=res_shape)
+                mlp_out = ttnn.slice(mlp_out, [0] * len(res_shape), res_shape)
 
+        logger.info("[DBG] DL{} residual add: residual.shape={}, mlp_out.shape={}",
+                    self.layer_idx, list(residual.shape), list(mlp_out.shape))
         x = ttnn.add(residual, mlp_out, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         ttnn.deallocate(mlp_out, force=False)
         ttnn.deallocate(residual, force=False)
+        logger.info("[DBG] DL{} _forward_decode exit: x.shape={}", self.layer_idx, list(x.shape))
         return x
 
     def _forward_prefill(
@@ -360,16 +350,8 @@ class Glm4MoeDecoderLayer:
 
         _dlsync("before rms_norm")
 
-        # ---- Pre-attention norm ----
-        # Prefill: use DRAM-interleaved RMSNorm (no L1 constraint at any seq_len).
-        # Sharded RMSNorm overflows L1 at seq>256 with hidden=5120.
-        # DRAM norm is ~0.2ms per call — negligible vs matmuls.
-        h = ttnn.rms_norm(
-            x,
-            epsilon=w.input_layernorm.eps,
-            weight=w.input_layernorm.weight,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        )
+        # ---- Pre-attention norm (sharded to avoid L1 overflow with hidden=5120) ----
+        h = _sharded_rms_norm(x, w.input_layernorm, hparams.hidden_size)
 
         _dlsync("after rms_norm, before attention")
 
@@ -384,14 +366,9 @@ class Glm4MoeDecoderLayer:
 
         _dlsync("after attention + residual")
 
-        # ---- Pre-MLP norm (DRAM-interleaved for prefill, same as pre-attn) ----
+        # ---- Pre-MLP norm (sharded to avoid L1 overflow with hidden=5120) ----
         residual = x
-        h = ttnn.rms_norm(
-            x,
-            epsilon=w.post_attention_layernorm.eps,
-            weight=w.post_attention_layernorm.weight,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        )
+        h = _sharded_rms_norm(x, w.post_attention_layernorm, hparams.hidden_size)
 
         _dlsync("after post_attn_norm, before MLP")
 
@@ -519,9 +496,16 @@ class Glm4MoeDecoderLayer:
 
         # ---- Fused reduce: scale shared by 1/DP, combine, single reduce ----
         fuse_reduce = _env_bool("GLM4_MOE_FUSE_SHARED_EP_REDUCE", default=True)
+        logger.info("[DBG] DL{} _moe_forward: shared_out.shape={}, routed_out.shape={}, fuse_reduce={}, tp_enabled={}, tp_axis={}",
+                    self.layer_idx,
+                    list(shared_out_partial.shape), list(routed_out_partial.shape),
+                    fuse_reduce, tp_enabled, tp_axis)
         if fuse_reduce and tp_enabled and tp_axis is not None:
             mesh_shape = _get_mesh_shape(device)
-            num_dp = mesh_shape[1]  # DP = cols = 4 for Galaxy TG
+            from models.demos.glm4_moe.tt.layer_weights import _tp_axis_and_size
+            tp_ax, _ = _tp_axis_and_size(device)
+            dp_ax = 1 - tp_ax
+            num_dp = mesh_shape[dp_ax]
             if num_dp > 1:
                 shared_out_partial = ttnn.mul(shared_out_partial, 1.0 / num_dp,
                                               memory_config=moe_decode_mc)
@@ -532,18 +516,25 @@ class Glm4MoeDecoderLayer:
             ttnn.deallocate(routed_out_partial, force=False)
 
             # EP reduce: 2-step device all_reduce or host-side fallback
+            # WARNING: Fused device-side 2-step reduce is INCORRECT because shared
+            # needs TP reduce but routed does NOT. Use FUSE_SHARED_EP_REDUCE=0 with
+            # EP_REDUCE_DEVICE=1. The host-side 32-way sum (below) IS correct for fused.
             _ep_reduce_device = _env_bool("GLM4_MOE_EP_REDUCE_DEVICE", default=False)
+            logger.info("[DBG] DL{} EP reduce (fused): ep_reduce_device={}, tp_ax={}, dp_ax={}, combined.shape={}",
+                        self.layer_idx, _ep_reduce_device, tp_ax, dp_ax, list(combined.shape))
             if _ep_reduce_device:
-                # 2-step device-side: axis=0 (8-way TP) then axis=1 (4-way DP)
+                # 2-step device-side: TP axis then DP axis
+                # BUG: TP-axis reduce multiplies routed by TP since it's already combined.
+                # Only correct when FUSE_SHARED_EP_REDUCE=0 (separate reduces path).
                 mlp_out = _simple_all_reduce(
-                    combined, device, cluster_axis=0,
+                    combined, device, cluster_axis=tp_ax,
                     memory_config=ttnn.DRAM_MEMORY_CONFIG,
                     ccl=self.tt_ccl,
                 )
                 mesh_shape2 = _get_mesh_shape(device)
-                if mesh_shape2[1] > 1:
+                if mesh_shape2[dp_ax] > 1:
                     mlp_out = _simple_all_reduce(
-                        mlp_out, device, cluster_axis=1,
+                        mlp_out, device, cluster_axis=dp_ax,
                         memory_config=ttnn.DRAM_MEMORY_CONFIG,
                         ccl=self.tt_ccl,
                     )
@@ -565,46 +556,41 @@ class Glm4MoeDecoderLayer:
                 )
         else:
             # Fallback: separate reduces (original behavior)
+            from models.demos.glm4_moe.tt.layer_weights import _tp_axis_and_size
+            tp_ax, _ = _tp_axis_and_size(device)
+            dp_ax = 1 - tp_ax
+            logger.info("[DBG] DL{} EP reduce (separate): tp_ax={}, dp_ax={}, shared.shape={}, routed.shape={}",
+                        self.layer_idx, tp_ax, dp_ax,
+                        list(shared_out_partial.shape), list(routed_out_partial.shape))
             if tp_enabled and tp_axis is not None:
                 shared_out_partial = _simple_all_reduce(
                     shared_out_partial, device, cluster_axis=tp_axis,
                     memory_config=ttnn.DRAM_MEMORY_CONFIG,
                     ccl=self.tt_ccl,
                 )
-            # EP reduce for routed experts
+            # EP reduce for routed experts: DP-axis all_reduce to reconstruct
+            # from the reduce_scatter done in MoE STEP 7.
+            # After reduce_scatter(axis=dp_ax, dim=3), each device still holds [1,1,T,H]
+            # as a PARTIAL sum. Need all_reduce (sum) on DP axis to get the full result.
+            # DO NOT include TP axis — data is identical across TP columns after
+            # all_to_all_combine, so TP-axis all_reduce would multiply by TP.
             _ep_reduce_device2 = _env_bool("GLM4_MOE_EP_REDUCE_DEVICE", default=False)
-            if _ep_reduce_device2 and device.__class__.__name__ == "MeshDevice":
-                # 2-step device-side: axis=0 (8-way TP) then axis=1 (4-way DP)
-                routed_out_partial = _simple_all_reduce(
-                    routed_out_partial, device, cluster_axis=0,
-                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                    ccl=self.tt_ccl,
-                )
+            if device.__class__.__name__ == "MeshDevice":
                 mesh_shape3 = _get_mesh_shape(device)
-                if mesh_shape3[1] > 1:
-                    routed_out_partial = _simple_all_reduce(
-                        routed_out_partial, device, cluster_axis=1,
-                        memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                        ccl=self.tt_ccl,
-                    )
-            elif device.__class__.__name__ == "MeshDevice":
-                # Host-side 32-way sum fallback
-                num_devices = device.get_num_devices()
-                if num_devices > 1:
-                    _orig_dtype2 = routed_out_partial.dtype
-                    dev_tensors2 = ttnn.get_device_tensors(routed_out_partial)
-                    host_sum2 = ttnn.to_torch(dev_tensors2[0].cpu())
-                    for i in range(1, len(dev_tensors2)):
-                        host_sum2 = host_sum2 + ttnn.to_torch(dev_tensors2[i].cpu())
-                    ttnn.deallocate(routed_out_partial, force=False)
-                    routed_out_partial = ttnn.from_torch(
-                        host_sum2,
-                        device=device,
-                        dtype=_orig_dtype2,
-                        layout=ttnn.TILE_LAYOUT,
-                        memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                        mesh_mapper=ttnn.ReplicateTensorToMesh(device),
-                    )
+                logger.info("[DBG] DL{} EP reduce (separate routed): ep_reduce_device={}, dp_ax={}, dp_size={}",
+                            self.layer_idx, _ep_reduce_device2, dp_ax, mesh_shape3[dp_ax])
+                if mesh_shape3[dp_ax] > 1:
+                    if _ep_reduce_device2:
+                        routed_out_partial = _simple_all_reduce(
+                            routed_out_partial, device, cluster_axis=dp_ax,
+                            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                            ccl=self.tt_ccl,
+                        )
+                    else:
+                        routed_out_partial = _simple_all_reduce_host(
+                            routed_out_partial, device, cluster_axis=dp_ax,
+                            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                        )
             mlp_out = ttnn.add(shared_out_partial, routed_out_partial,
                                memory_config=moe_decode_mc)
             ttnn.deallocate(shared_out_partial, force=False)

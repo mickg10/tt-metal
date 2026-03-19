@@ -100,18 +100,37 @@ def _make_sparse_matmul_program_config(
     per_core_M: int = 1,
 ) -> ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig:
     grid = device.compute_with_storage_grid_size()
-    core_x = int(getattr(grid, "x"))
-    core_y = int(getattr(grid, "y"))
+    max_x = int(getattr(grid, "x"))
+    max_y = int(getattr(grid, "y"))
     n_tiles = (int(out_features) + ttnn.TILE_SIZE - 1) // ttnn.TILE_SIZE
-    num_cores = max(1, core_x * core_y)
-    per_core_N = max(1, int(math.ceil(n_tiles / num_cores)))
-    # sparse_matmul requires a rectangular core grid (no holes in the bounding box).
-    # Increase per_core_N until ceil(n_tiles / per_core_N) is a multiple of core_x
-    # (full rows) or fits in a single row (<= core_x).
-    num_blocks = math.ceil(n_tiles / per_core_N)
-    while num_blocks > core_x and num_blocks % core_x != 0:
-        per_core_N += 1
-        num_blocks = math.ceil(n_tiles / per_core_N)
+
+    # The sparse_matmul 1D kernel requires num_blocks_total to fill a RECTANGULAR
+    # sub-grid. Otherwise the bounding box contains idle cores and the kernel
+    # asserts: num_cores_with_work != in0_mcast_receiver_num_cores.
+    #
+    # Find (core_x, core_y, per_core_N) such that:
+    #   num_blocks_x = ceil(n_tiles / per_core_N)
+    #   core_x * core_y == num_blocks_x  (exact rectangular fill)
+    #   core_x <= max_x, core_y <= max_y
+    core_x, core_y, best_pcn = 1, 1, n_tiles  # fallback: 1 core, all tiles
+    best_core_count = 1
+    for pcn in range(1, n_tiles + 1):
+        nbx = (n_tiles + pcn - 1) // pcn
+        if nbx > max_x * max_y:
+            continue
+        if nbx < best_core_count:
+            break  # Increasing pcn only decreases nbx; no further improvement possible
+        # Find widest grid_x that divides nbx exactly
+        for gx in range(min(max_x, nbx), 0, -1):
+            if nbx % gx == 0:
+                gy = nbx // gx
+                if gy <= max_y:
+                    # Prefer largest core count, then smallest per_core_N as tiebreaker
+                    if nbx > best_core_count or (nbx == best_core_count and pcn < best_pcn):
+                        core_x, core_y, best_pcn = gx, gy, pcn
+                        best_core_count = nbx
+                    break
+
     return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
         compute_with_storage_grid_size=ttnn.CoreCoord(core_x, core_y),
         in0_block_w=int(in0_block_w),
@@ -120,7 +139,7 @@ def _make_sparse_matmul_program_config(
         out_block_h=1,
         out_block_w=1,
         per_core_M=int(per_core_M),
-        per_core_N=int(per_core_N),
+        per_core_N=int(best_pcn),
         fuse_batch=False,
         fused_activation=None,
         mcast_in0=True,
@@ -164,9 +183,6 @@ class Glm4MoeMoERuntime:
     # Memory config for decode-path expert intermediates
     decode_memory_config: ttnn.MemoryConfig
 
-    # Fused gate+up program config (when GLM4_MOE_FUSE_EXPERTS_GATE_UP=1)
-    gate_up_fused_program_config: ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig | None
-
 
 def create_moe_runtime(*, device: Any, hparams: Glm4MoeHParams) -> Glm4MoeMoERuntime:
     """Create per-device MoE runtime constants for GLM-4.7-REAP.
@@ -181,13 +197,9 @@ def create_moe_runtime(*, device: Any, hparams: Glm4MoeHParams) -> Glm4MoeMoERun
     num_experts_per_device = num_experts // max(1, num_devices)
 
     mesh_rows, mesh_cols = _get_mesh_shape(device)
-    # Galaxy TG: Mesh(8,4). Dispatch along rows (axis=0), reduce along columns (axis=1).
-    if mesh_rows > 1:
-        dispatch_cluster_axis = 0
-    elif mesh_cols > 1:
-        dispatch_cluster_axis = 1
-    else:
-        dispatch_cluster_axis = 0
+    from models.demos.glm4_moe.tt.layer_weights import _tp_axis_and_size
+    tp_axis, _ = _tp_axis_and_size(device)
+    dispatch_cluster_axis = tp_axis if tp_axis is not None else 0
     reduce_cluster_axis = 1 - dispatch_cluster_axis
     num_dispatch_devices = int((mesh_rows, mesh_cols)[dispatch_cluster_axis])
 
@@ -260,16 +272,6 @@ def create_moe_runtime(*, device: Any, hparams: Glm4MoeHParams) -> Glm4MoeMoERun
     ep_l1 = _env_bool("GLM4_MOE_EP_L1", default=False)
     decode_memory_config = ttnn.L1_MEMORY_CONFIG if ep_l1 else ttnn.DRAM_MEMORY_CONFIG
 
-    fuse_gate_up = _env_bool("GLM4_MOE_FUSE_EXPERTS_GATE_UP", default=False)
-    gate_up_fused_program_config = None
-    if fuse_gate_up:
-        gate_up_fused_program_config = _make_sparse_matmul_program_config(
-            device=device,
-            out_features=int(hparams.moe_intermediate_size) * 2,
-            in0_block_w=8,
-            per_core_M=per_core_M,
-        )
-
     return Glm4MoeMoERuntime(
         expert_mapping_tensors=expert_mapping_tensors,
         remap_topk_mask=remap_topk_mask,
@@ -290,7 +292,6 @@ def create_moe_runtime(*, device: Any, hparams: Glm4MoeHParams) -> Glm4MoeMoERun
         hidden_size=int(hparams.hidden_size),
         moe_intermediate_size=int(hparams.moe_intermediate_size),
         decode_memory_config=decode_memory_config,
-        gate_up_fused_program_config=gate_up_fused_program_config,
     )
 
 
@@ -317,18 +318,11 @@ def moe_topk_tt(
     routed_scaling_factor = float(getattr(hparams, "routed_scaling_factor", 2.5))
     norm_topk_prob = bool(getattr(hparams, "norm_topk_prob", True))
 
-    # Use L1 memory for router ops in decode mode (small token count).
-    use_l1 = int(x.shape[2]) <= 64  # decode mode only (MoE sees full batch, not DP-split)
-    mc = ttnn.L1_MEMORY_CONFIG if use_l1 else None
-
-    linear_kwargs: dict[str, Any] = {}
-    if compute_kernel_config is not None:
-        linear_kwargs["compute_kernel_config"] = compute_kernel_config
-    if mc is not None:
-        linear_kwargs["memory_config"] = mc
-
-    logits = ttnn.linear(x, moe_w.w_gate, **linear_kwargs)  # [1,1,T,96]
-    scores = ttnn.sigmoid(logits, memory_config=mc) if mc else ttnn.sigmoid(logits)
+    if compute_kernel_config is None:
+        logits = ttnn.linear(x, moe_w.w_gate)  # [1,1,T,96]
+    else:
+        logits = ttnn.linear(x, moe_w.w_gate, compute_kernel_config=compute_kernel_config)
+    scores = ttnn.sigmoid(logits)
     ttnn.deallocate(logits, force=False)
 
     # scores_for_choice = scores + e_score_correction_bias
@@ -346,10 +340,7 @@ def moe_topk_tt(
             ttnn.deallocate(bias_rm, force=False)
         bias_owned = True
 
-    add_kwargs = {"dtype": ttnn.bfloat16}
-    if mc is not None:
-        add_kwargs["memory_config"] = mc
-    scores_with_bias = ttnn.add(scores, bias, **add_kwargs)
+    scores_with_bias = ttnn.add(scores, bias, dtype=ttnn.bfloat16)
     if bias_owned:
         ttnn.deallocate(bias, force=False)
 
@@ -362,22 +353,13 @@ def moe_topk_tt(
     ttnn.deallocate(scores, force=False)
 
     if norm_topk_prob:
-        sum_kwargs = {"dim": 3, "keepdim": True}
-        if mc is not None:
-            sum_kwargs["memory_config"] = mc
-        denom = ttnn.sum(topk_weights, **sum_kwargs)
+        denom = ttnn.sum(topk_weights, dim=3, keepdim=True)
         denom = ttnn.add(denom, 1e-20, output_tensor=denom)
-        div_kwargs = {}
-        if mc is not None:
-            div_kwargs["memory_config"] = mc
-        topk_weights = ttnn.div(topk_weights, denom, **div_kwargs)
+        topk_weights = ttnn.div(topk_weights, denom)
         ttnn.deallocate(denom, force=False)
 
     if routed_scaling_factor != 1.0:
-        mul_kwargs = {}
-        if mc is not None:
-            mul_kwargs["memory_config"] = mc
-        topk_weights = ttnn.mul(topk_weights, routed_scaling_factor, **mul_kwargs)
+        topk_weights = ttnn.mul(topk_weights, routed_scaling_factor)
 
     return topk_weights, topk_indices
 
@@ -412,6 +394,9 @@ def moe_sparse_experts_forward_tt(
     Default path for GLM-4.7-REAP on Galaxy: each device holds 3 experts,
     tokens are replicated, local experts compute contributions, then all-reduce.
     """
+    from loguru import logger as _moe_logger
+    _moe_logger.info("[DBG] moe_sparse_experts_forward_tt entry: hidden.shape={}, skip_final_reduce={}",
+                     list(hidden_states.shape), skip_final_reduce)
     packer_l1_acc = _env_bool("GLM4_MOE_PACKER_L1_ACC", default=False)
     sparse_fidelity = _parse_math_fidelity(
         os.environ.get("GLM4_MOE_MOE_SPARSE_FIDELITY", ""),
@@ -483,79 +468,41 @@ def moe_sparse_experts_forward_tt(
             device=device, out_features=int(rt.hidden_size),
             in0_block_w=8, per_core_M=num_blocks,
         )
-        _gate_up_fused_pc = (
-            _make_sparse_matmul_program_config(
-                device=device, out_features=int(rt.moe_intermediate_size) * 2,
-                in0_block_w=8, per_core_M=num_blocks,
-            )
-            if rt.gate_up_fused_program_config is not None
-            else None
-        )
     else:
         _gate_up_pc = rt.gate_up_program_config
         _down_pc = rt.down_program_config
-        _gate_up_fused_pc = rt.gate_up_fused_program_config
 
     sparse_mc = rt.decode_memory_config if total_tokens <= block else memory_config
     if sparse_mc is not ttnn.DRAM_MEMORY_CONFIG:
         expert_input = ttnn.to_memory_config(expert_input, sparse_mc)
 
-    # STEP 4: Expert compute (gate + up + SiLU + down).
-    if getattr(moe_w, "w1w3_experts", None) is not None and _gate_up_fused_pc is not None:
-        # Fused gate+up projection: single sparse_matmul -> split -> SiLU-gated multiply.
-        w1w3_out = ttnn.sparse_matmul(
-            expert_input, moe_w.w1w3_experts,
-            sparsity=sparsity,
-            memory_config=sparse_mc,
-            program_config=_gate_up_fused_pc,
-            is_input_a_sparse=False,
-            is_input_b_sparse=True,
-            dtype=ttnn.bfloat16,
-            compute_kernel_config=compute_kernel_config,
-            output_tile=ttnn.Tile([block, ttnn.TILE_SIZE]),
-        )
-        ttnn.deallocate(expert_input, force=False)
-
-        # Split fused output [.., 2*moe_intermediate] into gate (w1) and up (w3) halves.
-        moe_inter = int(rt.moe_intermediate_size)
-        ndim = len(w1w3_out.shape)
-        begin_gate = [0] * ndim
-        end_gate = [int(w1w3_out.shape[i]) for i in range(ndim)]
-        end_gate[-1] = moe_inter
-        begin_up = [0] * ndim
-        begin_up[-1] = moe_inter
-        end_up = [int(w1w3_out.shape[i]) for i in range(ndim)]
-
-        gate_view = ttnn.slice(w1w3_out, begin_gate, end_gate)
-        up_view = ttnn.slice(w1w3_out, begin_up, end_up)
-        w1_out = ttnn.clone(gate_view, memory_config=sparse_mc)
-        w3_out = ttnn.clone(up_view, memory_config=sparse_mc)
-        ttnn.deallocate(w1w3_out, force=False)
-    else:
-        # Separate gate (w1) and up (w3) projections.
-        w1_out = ttnn.sparse_matmul(
-            expert_input, moe_w.w1_experts,
-            sparsity=sparsity,
-            memory_config=sparse_mc,
-            program_config=_gate_up_pc,
-            is_input_a_sparse=False,
-            is_input_b_sparse=True,
-            dtype=ttnn.bfloat16,
-            compute_kernel_config=compute_kernel_config,
-            output_tile=ttnn.Tile([block, ttnn.TILE_SIZE]),
-        )
-        w3_out = ttnn.sparse_matmul(
-            expert_input, moe_w.w3_experts,
-            sparsity=sparsity,
-            memory_config=sparse_mc,
-            program_config=_gate_up_pc,
-            is_input_a_sparse=False,
-            is_input_b_sparse=True,
-            dtype=ttnn.bfloat16,
-            compute_kernel_config=compute_kernel_config,
-            output_tile=ttnn.Tile([block, ttnn.TILE_SIZE]),
-        )
-        ttnn.deallocate(expert_input, force=False)
+    _moe_logger.info("[DBG] moe_sparse: before expert compute: expert_input.shape={}, num_blocks={}, block={}",
+                     list(expert_input.shape), num_blocks, block)
+    # Gate projection (w1).
+    w1_out = ttnn.sparse_matmul(
+        expert_input, moe_w.w1_experts,
+        sparsity=sparsity,
+        memory_config=sparse_mc,
+        program_config=_gate_up_pc,
+        is_input_a_sparse=False,
+        is_input_b_sparse=True,
+        dtype=ttnn.bfloat16,
+        compute_kernel_config=compute_kernel_config,
+        output_tile=ttnn.Tile([block, ttnn.TILE_SIZE]),
+    )
+    # Up projection (w3).
+    w3_out = ttnn.sparse_matmul(
+        expert_input, moe_w.w3_experts,
+        sparsity=sparsity,
+        memory_config=sparse_mc,
+        program_config=_gate_up_pc,
+        is_input_a_sparse=False,
+        is_input_b_sparse=True,
+        dtype=ttnn.bfloat16,
+        compute_kernel_config=compute_kernel_config,
+        output_tile=ttnn.Tile([block, ttnn.TILE_SIZE]),
+    )
+    ttnn.deallocate(expert_input, force=False)
 
     # SiLU(gate) * up.
     x_ff = ttnn.mul(w1_out, w3_out, memory_config=sparse_mc, input_tensor_a_activations=[ttnn.UnaryOpType.SILU])
@@ -581,6 +528,8 @@ def moe_sparse_experts_forward_tt(
     )
     ttnn.deallocate(x_ff, force=False)
     ttnn.deallocate(sparsity, force=False)
+    _moe_logger.info("[DBG] moe_sparse: after expert compute (down proj): expert_output_sparse.shape={}",
+                     list(expert_output_sparse.shape))
 
     # Prepare expert output for aggregation.
     _eos_target = (num_blocks, int(rt.num_experts_per_device), block, hidden_size)
@@ -613,6 +562,8 @@ def moe_sparse_experts_forward_tt(
     #   "full_ar" (default) — single all_reduce(no cluster_axis) across all 32 devices
     #   "2step"  — 2-step: all_reduce(axis=0) then all_reduce(axis=1)
     #   "host"   — host-side CPU fallback (2-step per axis)
+    _moe_logger.info("[DBG] moe_sparse: before EP reduce: skip_final_reduce={}, num_devices={}, routed_out.shape={}",
+                     skip_final_reduce, num_devices, list(routed_out.shape))
     if not skip_final_reduce and num_devices > 1:
         ep_reduce = os.environ.get("GLM4_MOE_EP_REDUCE", "full_ar").strip().lower()
         if ep_reduce == "full_ar":
@@ -622,13 +573,19 @@ def moe_sparse_experts_forward_tt(
             routed_out = result
         elif ep_reduce == "2step":
             from models.demos.glm4_moe.tt.attention_tt import _simple_all_reduce
-            routed_out = _simple_all_reduce(routed_out, device, cluster_axis=0, memory_config=memory_config)
-            routed_out = _simple_all_reduce(routed_out, device, cluster_axis=1, memory_config=memory_config)
+            from models.demos.glm4_moe.tt.layer_weights import _tp_axis_and_size
+            _tp_ax, _ = _tp_axis_and_size(device)
+            _dp_ax = 1 - (_tp_ax if _tp_ax is not None else 0)
+            routed_out = _simple_all_reduce(routed_out, device, cluster_axis=_tp_ax, memory_config=memory_config)
+            routed_out = _simple_all_reduce(routed_out, device, cluster_axis=_dp_ax, memory_config=memory_config)
         else:
             # host fallback
             from models.demos.glm4_moe.tt.attention_tt import _simple_all_reduce_host
-            routed_out = _simple_all_reduce_host(routed_out, device, cluster_axis=0, memory_config=memory_config)
-            routed_out = _simple_all_reduce_host(routed_out, device, cluster_axis=1, memory_config=memory_config)
+            from models.demos.glm4_moe.tt.layer_weights import _tp_axis_and_size
+            _tp_ax2, _ = _tp_axis_and_size(device)
+            _dp_ax2 = 1 - (_tp_ax2 if _tp_ax2 is not None else 0)
+            routed_out = _simple_all_reduce_host(routed_out, device, cluster_axis=_tp_ax2, memory_config=memory_config)
+            routed_out = _simple_all_reduce_host(routed_out, device, cluster_axis=_dp_ax2, memory_config=memory_config)
 
     # Slice back to unpadded token count.
     unpadded = int(input_shape[0]) * int(input_shape[2])
@@ -681,6 +638,9 @@ def moe_a2a_experts_forward_tt(
     topk_expert_indices = ttnn.reshape(topk_expert_indices, (1, 1, tokens_per_device, int(rt.num_experts_per_tok)))
 
     # STEP 1: all_to_all_dispatch (ROW_MAJOR inputs).
+    from loguru import logger as _a2a_logger
+    _a2a_logger.info("[DBG] moe_a2a STEP 1: before all_to_all_dispatch: hidden.shape={}, cluster_axis={}, num_links={}, topology={}",
+                     list(hidden_states.shape), rt.dispatch_cluster_axis, rt.num_links, rt.topology)
     hidden_rm = ttnn.to_layout(hidden_states, ttnn.ROW_MAJOR_LAYOUT)
     ttnn.deallocate(hidden_states, force=False)
     topk_indices_rm = ttnn.to_layout(topk_expert_indices, ttnn.ROW_MAJOR_LAYOUT)
@@ -698,6 +658,7 @@ def moe_a2a_experts_forward_tt(
     )
     ttnn.deallocate(hidden_rm, force=False)
     ttnn.deallocate(topk_indices_rm, force=False)
+    _a2a_logger.info("[DBG] moe_a2a STEP 1: after dispatch: dispatch_output.shape={}", list(dispatch_output.shape))
 
     # STEP 2: Token->expert remap for sparsity.
     remap_mask = ttnn.repeat(rt.remap_topk_mask, ttnn.Shape((1, 1, tokens_per_device, 1)))
@@ -726,74 +687,34 @@ def moe_a2a_experts_forward_tt(
             device=device, out_features=int(rt.hidden_size),
             in0_block_w=8, per_core_M=num_blocks,
         )
-        _gate_up_fused_pc = (
-            _make_sparse_matmul_program_config(
-                device=device, out_features=int(rt.moe_intermediate_size) * 2,
-                in0_block_w=8, per_core_M=num_blocks,
-            )
-            if rt.gate_up_fused_program_config is not None
-            else None
-        )
     else:
         _gate_up_pc = rt.gate_up_program_config
         _down_pc = rt.down_program_config
-        _gate_up_fused_pc = rt.gate_up_fused_program_config
 
     sparse_mc = rt.decode_memory_config if total_tokens <= block else memory_config
 
     # STEP 4: Expert compute (gate + up + SiLU + down).
-    if getattr(moe_w, "w1w3_experts", None) is not None and _gate_up_fused_pc is not None:
-        # Fused gate+up projection: single sparse_matmul -> split -> SiLU-gated multiply.
-        w1w3_out = ttnn.sparse_matmul(
-            expert_input, moe_w.w1w3_experts,
-            sparsity=sparsity,
-            memory_config=sparse_mc,
-            program_config=_gate_up_fused_pc,
-            is_input_a_sparse=False, is_input_b_sparse=True,
-            dtype=ttnn.bfloat16,
-            compute_kernel_config=compute_kernel_config,
-            output_tile=ttnn.Tile([block, ttnn.TILE_SIZE]),
-        )
-        ttnn.deallocate(expert_input, force=False)
-
-        # Split fused output [.., 2*moe_intermediate] into gate (w1) and up (w3) halves.
-        moe_inter = int(rt.moe_intermediate_size)
-        ndim = len(w1w3_out.shape)
-        begin_gate = [0] * ndim
-        end_gate = [int(w1w3_out.shape[i]) for i in range(ndim)]
-        end_gate[-1] = moe_inter
-        begin_up = [0] * ndim
-        begin_up[-1] = moe_inter
-        end_up = [int(w1w3_out.shape[i]) for i in range(ndim)]
-
-        gate_view = ttnn.slice(w1w3_out, begin_gate, end_gate)
-        up_view = ttnn.slice(w1w3_out, begin_up, end_up)
-        w1_out = ttnn.clone(gate_view, memory_config=sparse_mc)
-        w3_out = ttnn.clone(up_view, memory_config=sparse_mc)
-        ttnn.deallocate(w1w3_out, force=False)
-    else:
-        # Separate gate (w1) and up (w3) projections.
-        w1_out = ttnn.sparse_matmul(
-            expert_input, moe_w.w1_experts,
-            sparsity=sparsity,
-            memory_config=sparse_mc,
-            program_config=_gate_up_pc,
-            is_input_a_sparse=False, is_input_b_sparse=True,
-            dtype=ttnn.bfloat16,
-            compute_kernel_config=compute_kernel_config,
-            output_tile=ttnn.Tile([block, ttnn.TILE_SIZE]),
-        )
-        w3_out = ttnn.sparse_matmul(
-            expert_input, moe_w.w3_experts,
-            sparsity=sparsity,
-            memory_config=sparse_mc,
-            program_config=_gate_up_pc,
-            is_input_a_sparse=False, is_input_b_sparse=True,
-            dtype=ttnn.bfloat16,
-            compute_kernel_config=compute_kernel_config,
-            output_tile=ttnn.Tile([block, ttnn.TILE_SIZE]),
-        )
-        ttnn.deallocate(expert_input, force=False)
+    w1_out = ttnn.sparse_matmul(
+        expert_input, moe_w.w1_experts,
+        sparsity=sparsity,
+        memory_config=sparse_mc,
+        program_config=_gate_up_pc,
+        is_input_a_sparse=False, is_input_b_sparse=True,
+        dtype=ttnn.bfloat16,
+        compute_kernel_config=compute_kernel_config,
+        output_tile=ttnn.Tile([block, ttnn.TILE_SIZE]),
+    )
+    w3_out = ttnn.sparse_matmul(
+        expert_input, moe_w.w3_experts,
+        sparsity=sparsity,
+        memory_config=sparse_mc,
+        program_config=_gate_up_pc,
+        is_input_a_sparse=False, is_input_b_sparse=True,
+        dtype=ttnn.bfloat16,
+        compute_kernel_config=compute_kernel_config,
+        output_tile=ttnn.Tile([block, ttnn.TILE_SIZE]),
+    )
+    ttnn.deallocate(expert_input, force=False)
 
     x_ff = ttnn.mul(w1_out, w3_out, memory_config=sparse_mc, input_tensor_a_activations=[ttnn.UnaryOpType.SILU])
     ttnn.deallocate(w1_out, force=False)
@@ -827,6 +748,8 @@ def moe_a2a_experts_forward_tt(
     )
 
     # STEP 5: all_to_all_combine.
+    _a2a_logger.info("[DBG] moe_a2a STEP 5: before all_to_all_combine: expert_output.shape={}",
+                     list(expert_output.shape))
     expert_output = ttnn.to_layout(expert_output, ttnn.ROW_MAJOR_LAYOUT)
     dispatch_metadata = ttnn.reshape(
         dispatch_metadata,
@@ -866,15 +789,22 @@ def moe_a2a_experts_forward_tt(
     routed_out = ttnn.sum(weighted, dim=0, keepdim=True)
     ttnn.deallocate(weighted, force=False)
 
-    # STEP 7: reduce_scatter on cluster_axis=1 (TP dimension).
-    routed_out = ttnn.experimental.reduce_scatter_minimal_async(
-        routed_out,
-        cluster_axis=rt.reduce_cluster_axis,
-        dim=3,
-        num_links=rt.num_links,
-        topology=rt.topology,
-        memory_config=memory_config,
-    )
+    # STEP 7: reduce_scatter on cluster_axis (DP axis for BH Galaxy).
+    # Can be skipped via env var for debugging — EP reduce in decoder_layer handles it.
+    _skip_rs = os.environ.get("GLM4_MOE_SKIP_STEP7_RS", "0").strip() != "0"
+    _a2a_logger.info("[DBG] moe_a2a STEP 7: reduce_scatter: skip={}, API=reduce_scatter_minimal_async, "
+                     "cluster_axis={}, dim=3, num_links={}, topology={}, routed_out.shape={}",
+                     _skip_rs, rt.reduce_cluster_axis, rt.num_links, rt.topology, list(routed_out.shape))
+    if not _skip_rs:
+        routed_out = ttnn.experimental.reduce_scatter_minimal_async(
+            routed_out,
+            cluster_axis=rt.reduce_cluster_axis,
+            dim=3,
+            num_links=rt.num_links,
+            topology=rt.topology,
+            memory_config=memory_config,
+        )
+        _a2a_logger.info("[DBG] moe_a2a STEP 7: after reduce_scatter: routed_out.shape={}", list(routed_out.shape))
 
     return routed_out
 

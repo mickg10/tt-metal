@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
 # SPDX-License-Identifier: Apache-2.0
 
-"""vLLM entrypoint for GLM-4.7-REAP-218B / GLM-4.7 Full on TT hardware.
+"""vLLM entrypoint for GLM-4.7-REAP-218B on TT hardware.
 
 Implements the vLLM TT model interface expected by TTModelRunner:
 - initialize_vllm_model() classmethod for model loading
@@ -12,7 +12,7 @@ Implements the vLLM TT model interface expected by TTModelRunner:
 KV cache format: standard GQA with separate K and V tensors
   (num_blocks, n_local_kv_heads=1, block_size=64, head_dim=128), dtype BF8
 
-MTP support via GLM4_MOE_MTP=1 (GLM-4.7 Full only, not REAP).
+No MTP support (not applicable to REAP).
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ class Glm4MoeForCausalLM(nn.Module):
     KV cache: separate K and V, dtype BF8, paged.
     """
 
-    model_capabilities = {"supports_prefix_caching": True}
+    model_capabilities = {"supports_prefix_caching": False}
 
     def __init__(
         self,
@@ -68,7 +68,6 @@ class Glm4MoeForCausalLM(nn.Module):
         self._kv_cache: Optional[list] = None
         self._kv_cache_shape: Optional[tuple] = None
         self._tt_runner: Optional[Glm4MoeTT] = None
-        self._last_draft_token_ids: Optional[torch.Tensor] = None
 
     @classmethod
     def initialize_vllm_model(
@@ -92,7 +91,8 @@ class Glm4MoeForCausalLM(nn.Module):
 
         default_cache_root = Path(os.path.expanduser("~/.cache/ttnn/models"))
         cache_dir_env = os.environ.get("GLM4_MOE_CACHE_DIR", "").strip()
-        cache_dir = Path(cache_dir_env) if cache_dir_env else (default_cache_root / "glm4_moe" / "vllm")
+        model_name = Path(model_id).name
+        cache_dir = Path(cache_dir_env) if cache_dir_env else (default_cache_root / "glm4_moe" / "vllm" / model_name)
         cache_dir.mkdir(parents=True, exist_ok=True)
 
         logger.info(
@@ -211,47 +211,13 @@ class Glm4MoeForCausalLM(nn.Module):
             kv_cache.append([tt_k, tt_v])
 
         self._kv_cache = kv_cache
-
-        # Allocate 1 extra KV cache layer for MTP (layer num_hidden_layers)
-        mtp_enabled = os.environ.get("GLM4_MOE_MTP", "").strip() == "1"
-        if mtp_enabled:
-            logger.info("Allocating MTP KV cache layer (layer {})", num_layers_to_alloc)
-            tt_k_mtp = ttnn.as_tensor(
-                cache_k,
-                device=self.mesh_device,
-                mesh_mapper=mesh_mapper,
-                layout=ttnn.TILE_LAYOUT,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                dtype=tt_dtype,
-                cache_file_name=None,
-            )
-            tt_v_mtp = ttnn.as_tensor(
-                cache_v,
-                device=self.mesh_device,
-                mesh_mapper=mesh_mapper,
-                layout=ttnn.TILE_LAYOUT,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                dtype=tt_dtype,
-                cache_file_name=None,
-            )
-            kv_cache.append([tt_k_mtp, tt_v_mtp])
-
         return kv_cache
 
     def _get_tp_size(self) -> int:
-        """Return TP size from mesh device.
-
-        Galaxy TG Mesh(8,4): TP=axis 0 (rows=8), DP=axis 1 (cols=4).
-        T3K Mesh(1,8): TP=axis 1 (cols=8).
-        """
-        if self.mesh_device.__class__.__name__ != "MeshDevice":
-            return 1
-        mesh_rows = int(self.mesh_device.shape[0])
-        mesh_cols = int(self.mesh_device.shape[1])
-        if mesh_rows > 1 and mesh_cols > 1:
-            # 2D mesh (TG): TP is axis 0 (rows)
-            return mesh_rows
-        return mesh_cols if mesh_cols > 1 else mesh_rows
+        """Return TP size from mesh device."""
+        from models.demos.glm4_moe.tt.layer_weights import _tp_axis_and_size
+        _, tp_size = _tp_axis_and_size(self.mesh_device)
+        return tp_size
 
     # -------------------------------------------------------------------
     # Warmup
@@ -275,11 +241,14 @@ class Glm4MoeForCausalLM(nn.Module):
         )
 
     def warmup_model_decode(self, *, kv_cache, enable_trace, max_batch_size, num_blocks, **kwargs):
-        """vLLM TT backend decode warmup hook."""
+        """vLLM TT backend decode warmup hook.
+
+        NOTE: V1 batch>1 is BLOCKED for REAP-218B (ttnn.all_reduce cluster_axis=1 crash).
+        We warmup with batch=1 only regardless of max_batch_size.
+        """
         self._ensure_tt_runner()
 
-        warmup_batch = max_batch_size
-        logger.info("=== warmup_model_decode: starting, batch={}, enable_trace={} ===", warmup_batch, enable_trace)
+        warmup_batch = 1  # batch>1 may crash; use 1 for diagnostic
         page_table = torch.zeros((warmup_batch, max(1, num_blocks)), dtype=torch.int32)
         page_table[:, 0] = 0
 
@@ -291,19 +260,13 @@ class Glm4MoeForCausalLM(nn.Module):
             enable_trace=enable_trace,
             read_from_device=True,
         )
-        logger.info("=== warmup_model_decode: completed ===")
 
     # -------------------------------------------------------------------
     # Prefill Forward
     # -------------------------------------------------------------------
 
     def prefill_forward(self, *args, **kwargs):
-        """Prefill: process prompt tokens, fill KV cache, return logits for last token.
-
-        Supports prefix caching: when start_pos > 0 for a request, the first
-        start_pos tokens are already in KV cache (shared blocks from a prior
-        request). We skip those tokens and only prefill from start_pos onward.
-        """
+        """Prefill: process prompt tokens, fill KV cache, return logits for last token."""
         tokens: torch.Tensor = kwargs["tokens"]
         prompt_lens = kwargs["prompt_lens"]
         page_table: torch.Tensor = kwargs["page_table"]
@@ -316,25 +279,10 @@ class Glm4MoeForCausalLM(nn.Module):
         if all(int(x) == 0 for x in prompt_lens):
             return torch.zeros((batch, 1, vocab), dtype=torch.float32)
 
-        # Prefix caching: trim cached prefix tokens from input.
-        # start_pos[i] = number of tokens already in KV cache for request i.
-        # We only need to prefill tokens[i, start_pos[i]:prompt_lens[i]].
         if start_pos is not None:
             start_pos_t = torch.as_tensor(start_pos, dtype=torch.int32) if not isinstance(start_pos, torch.Tensor) else start_pos.to(torch.int32)
             if (start_pos_t != 0).any():
-                prompt_lens = list(prompt_lens)
-                # Clone to avoid overlapping tensor writes (sp:pl → :new_len overlap)
-                new_tokens = torch.zeros_like(tokens)
-                for i in range(batch):
-                    sp = int(start_pos_t[i])
-                    pl = int(prompt_lens[i])
-                    if sp > 0 and sp < pl:
-                        new_len = pl - sp
-                        new_tokens[i, :new_len] = tokens[i, sp:pl]
-                        prompt_lens[i] = new_len
-                    else:
-                        new_tokens[i] = tokens[i]
-                tokens = new_tokens
+                raise ValueError(f"Prefix caching not supported; got non-zero start_pos: {start_pos_t.tolist()}")
 
         self._ensure_tt_runner()
 
@@ -373,12 +321,6 @@ class Glm4MoeForCausalLM(nn.Module):
             sampling_params=sampling_params,
             enable_trace=enable_trace,
         )
-
-        # Extract MTP draft tokens from the runner
-        self._last_draft_token_ids = None
-        if hasattr(self._tt_runner, '_last_draft_token_ids'):
-            self._last_draft_token_ids = self._tt_runner._last_draft_token_ids
-            object.__setattr__(self._tt_runner, '_last_draft_token_ids', None)
 
         if read_from_device:
             tt_host = self.read_decode_output(tt_out, async_read=False)
@@ -465,21 +407,6 @@ class Glm4MoeForCausalLM(nn.Module):
         return next_ids_torch
 
     # -------------------------------------------------------------------
-    # MTP Speculative Decode
-    # -------------------------------------------------------------------
-
-    def get_spec_token_ids(self, num_reqs: int) -> list[list[int]] | None:
-        """Return MTP draft tokens from the last decode step, or None."""
-        draft = self._last_draft_token_ids
-        if draft is None:
-            return None
-        result = [[int(draft[b].item())] for b in range(min(int(draft.shape[0]), num_reqs))]
-        while len(result) < num_reqs:
-            result.append([])
-        self._last_draft_token_ids = None
-        return result
-
-    # -------------------------------------------------------------------
     # Internal
     # -------------------------------------------------------------------
 
@@ -495,4 +422,3 @@ class Glm4MoeForCausalLM(nn.Module):
             max_batch_size=self.max_batch_size,
             hparams=self.hparams,
         )
-        logger.info("=== TT runner created successfully, model init complete ===")

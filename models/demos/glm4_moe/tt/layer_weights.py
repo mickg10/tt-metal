@@ -15,83 +15,52 @@ import ttnn
 
 from models.common.rmsnorm import RMSNorm
 from models.demos.glm4_moe.tt.config import Glm4MoeHParams
-from models.demos.deepseek_v3.utils.dequantize import dequantize_tensor
 
 
-def _env_fp8_dequant() -> bool:
-    """Return True if FP8 dequant is enabled. Default off; auto-enabled on first FP8 weight."""
-    return os.environ.get("GLM4_MOE_FP8_DEQUANT", "0").strip() == "1"
+def _upcast_fp8(t: torch.Tensor, scale_inv: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Upcast FP8 tensors to BF16 for ttnn compatibility.
 
-
-_FP8_AUTO_DETECTED = False  # set True on first FP8 weight encounter
-
-
-def _maybe_dequant_fp8(
-    state: dict[str, torch.Tensor],
-    key: str,
-    weight: torch.Tensor,
-    block_size: tuple[int, int] = (128, 128),
-) -> torch.Tensor:
-    """If weight is FP8, dequantize using scale from state dict. Returns BF16.
-
-    Scale key convention (tried in order):
-    1. {key}_scale_inv  (DSv3 convention)
-    2. {key}_scale      (REAP/compressed_tensors convention — already the dequant multiplier)
-
-    For {key} like "model.layers.0.self_attn.q_proj.weight", we strip ".weight"
-    and look for the scale under the base key.
-
-    Per-row scales [R, 1] are broadcast directly (block_shape=[1, C]).
-    Block-wise scales [ceil(R/bh), ceil(C/bw)] use the given block_size.
+    Supports two scale formats:
+    - Per-row/per-tensor: scale shape [R, 1] or [R] — simple broadcast multiply
+    - Block-wise (DSv3): scale shape [ceil(R/128), ceil(C/128)] — block dequantization
     """
-    global _FP8_AUTO_DETECTED
-
-    if weight.dtype != torch.float8_e4m3fn:
-        return weight
-
-    explicit = _env_fp8_dequant()
-    if not explicit and not _FP8_AUTO_DETECTED:
-        _FP8_AUTO_DETECTED = True
-        logger.info("FP8 weights auto-detected — enabling dequantization")
-
-    # Derive base key: strip trailing ".weight" if present
-    base_key = key.rsplit(".weight", 1)[0] if key.endswith(".weight") else key
-
-    # Try scale key conventions
-    inv_scale = None
-    for scale_suffix in (".weight_scale_inv", "_scale_inv"):
-        scale_key = base_key + scale_suffix
-        if scale_key in state:
-            inv_scale = state[scale_key].float()
-            break
-
-    if inv_scale is None:
-        # Try _scale (already the dequant multiplier, no inversion needed)
-        for scale_suffix in (".weight_scale", "_scale"):
-            scale_key = base_key + scale_suffix
-            if scale_key in state:
-                inv_scale = state[scale_key].float()
-                logger.info("  FP8 dequant: using scale from {} (no inversion needed)", scale_key)
-                break
-
-    if inv_scale is None:
-        raise ValueError(
-            f"FP8 weight at {key} but no scale found. Tried: "
-            f"{base_key}.weight_scale_inv, {base_key}_scale_inv, "
-            f"{base_key}.weight_scale, {base_key}_scale"
-        )
-
-    # Detect per-row vs block-wise by scale shape
-    rows, cols = weight.shape
-    if inv_scale.shape == (rows, 1) or inv_scale.shape == (rows,):
-        # Per-row scale: reshape to [R, 1], block_shape = [1, cols]
-        inv_scale = inv_scale.reshape(rows, 1)
-        effective_block_size = (1, cols)
+    if not (hasattr(t, 'dtype') and t.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)):
+        return t
+    if scale_inv is None:
+        logger.warning("_upcast_fp8: no scale_inv provided for FP8 tensor shape={}, values may be incorrect!", tuple(t.shape))
+        return t.to(torch.bfloat16)
+    # Detect scale type: per-row (shape matches rows) vs block-wise (smaller shape)
+    is_per_row = (
+        scale_inv.ndim <= 2
+        and scale_inv.shape[0] == t.shape[0]
+        and (scale_inv.ndim == 1 or scale_inv.shape[-1] == 1)
+    )
+    if is_per_row:
+        # Per-row scale: dequant = fp8_val * scale (broadcast over columns)
+        result = t.float() * scale_inv.float()
+        return result.to(torch.bfloat16)
     else:
-        effective_block_size = block_size
+        # Block-wise scale (DSv3 convention with 128x128 blocks)
+        from models.demos.deepseek_v3.utils.dequantize import dequantize_tensor
+        block_shape = (128, 128)
+        result = dequantize_tensor(t, scale_inv, block_shape)
+        return result.to(torch.bfloat16)
 
-    result = dequantize_tensor(weight, inv_scale, effective_block_size)
-    return result.to(torch.bfloat16)
+
+def _dequant_weight(state, key: str) -> torch.Tensor:
+    """Load a weight tensor from state dict and dequantize if FP8.
+
+    Looks for '{key}_scale' (compressed-tensors) or '{key}_scale_inv' (DSv3) in the state dict.
+    """
+    t = state[key]
+    scale = None
+    for suffix in ("_scale", "_scale_inv"):
+        try:
+            scale = state[f"{key}{suffix}"]
+            break
+        except KeyError:
+            pass
+    return _upcast_fp8(t, scale_inv=scale)
 
 
 def _is_mesh_device(device: Any) -> bool:
@@ -108,8 +77,18 @@ def _tp_axis_and_size(device: Any) -> tuple[int | None, int]:
         return (None, 1)
     mesh_rows, mesh_cols = int(device.shape[0]), int(device.shape[1])
     if mesh_rows > 1 and mesh_cols > 1:
-        # 2D mesh (TG): TP is axis 0 (rows=8), DP is axis 1 (cols=4)
-        return (0, mesh_rows)
+        # 2D mesh: TP axis from env var GLM4_MOE_TP, or default to larger axis
+        tp_env = int(os.environ.get("GLM4_MOE_TP", "") or "0")
+        if tp_env > 0:
+            if mesh_cols == tp_env:
+                return (1, mesh_cols)  # BH Galaxy: TP=4 on cols (axis 1)
+            elif mesh_rows == tp_env:
+                return (0, mesh_rows)  # WH Galaxy: TP=8 on rows (axis 0)
+        # Default: larger axis is TP (backward compat)
+        if mesh_rows >= mesh_cols:
+            return (0, mesh_rows)
+        else:
+            return (1, mesh_cols)
     if mesh_cols > 1:
         return (1, mesh_cols)
     if mesh_rows > 1:
@@ -127,8 +106,11 @@ def _tp_mesh_mapper(device: Any, *, shard_dim: int) -> Any | None:
         return None
     mesh_rows, mesh_cols = int(device.shape[0]), int(device.shape[1])
     if mesh_rows > 1 and mesh_cols > 1:
-        # 2D mesh (TG): TP is axis 0 (rows=8), DP is axis 1 (cols=4)
-        return ttnn.ShardTensor2dMesh(device, dims=(int(shard_dim), None), mesh_shape=list(device.shape))
+        tp_axis, _ = _tp_axis_and_size(device)
+        if tp_axis == 1:
+            return ttnn.ShardTensor2dMesh(device, dims=(None, int(shard_dim)), mesh_shape=list(device.shape))
+        else:
+            return ttnn.ShardTensor2dMesh(device, dims=(int(shard_dim), None), mesh_shape=list(device.shape))
     if mesh_cols > 1:
         return ttnn.ShardTensor2dMesh(device, dims=(None, int(shard_dim)), mesh_shape=list(device.shape))
     if mesh_rows > 1:
@@ -150,8 +132,6 @@ def _env_experts_dtype() -> ttnn.DataType:
     override = os.environ.get("GLM4_MOE_EXPERTS_TT_DTYPE", "").strip().lower()
     if not override:
         return ttnn.bfloat8_b
-    if override in {"bf4", "bfloat4_b"}:
-        return ttnn.bfloat4_b
     if override in {"bf8", "bfloat8_b"}:
         return ttnn.bfloat8_b
     if override in {"bf16", "bfloat16"}:
@@ -159,23 +139,6 @@ def _env_experts_dtype() -> ttnn.DataType:
     if override in {"f32", "fp32", "float32"}:
         return ttnn.float32
     raise ValueError(f"Invalid GLM4_MOE_EXPERTS_TT_DTYPE={override!r}")
-
-
-def _env_expert_projection_dtype(proj_name: str) -> ttnn.DataType:
-    """Per-projection dtype override. Falls back to GLM4_MOE_EXPERTS_TT_DTYPE."""
-    env_key = f"GLM4_MOE_EXPERTS_{proj_name.upper()}_DTYPE"
-    override = os.environ.get(env_key, "").strip().lower()
-    if not override:
-        return _env_experts_dtype()
-    if override in {"bf4", "bfloat4_b"}:
-        return ttnn.bfloat4_b
-    if override in {"bf8", "bfloat8_b"}:
-        return ttnn.bfloat8_b
-    if override in {"bf16", "bfloat16"}:
-        return ttnn.bfloat16
-    if override in {"f32", "fp32", "float32"}:
-        return ttnn.float32
-    raise ValueError(f"Invalid {env_key}={override!r}")
 
 
 def _env_dense_dtype() -> ttnn.DataType:
@@ -193,31 +156,6 @@ def _env_dense_dtype() -> ttnn.DataType:
     if override in {"f32", "fp32", "float32"}:
         return ttnn.float32
     raise ValueError(f"Invalid GLM4_MOE_DENSE_TT_DTYPE={override!r}")
-
-
-def _env_dram_shard() -> bool:
-    """Return True if DRAM-sharded weights are enabled for attention projections."""
-    return os.environ.get("GLM4_MOE_DRAM_SHARD", "0").strip() == "1"
-
-
-def _dram_shard_weight(weight: ttnn.Tensor, device) -> ttnn.Tensor:
-    """Convert a [1,1,K,N] weight to DRAM WIDTH_SHARDED format for decode perf.
-
-    Distributes N dimension across all DRAM banks for full bandwidth utilization.
-    Uses host round-trip because interleaved_to_sharded kernel dispatch to DRAM core
-    coordinates exceeds the harvested TENSIX grid (see glm4_moe_lite layer_weights.py).
-    """
-    from models.demos.deepseek_v3.utils.config_helpers import dram_sharded_weight_config
-
-    K = int(weight.shape[2])
-    N = int(weight.shape[3])
-
-    dram_grid = device.dram_grid_size()
-
-    dram_mc = dram_sharded_weight_config(K, N, dram_grid)
-    host_weight = ttnn.from_device(weight)
-    ttnn.deallocate(weight, force=True)
-    return host_weight.to(device, dram_mc)
 
 
 def _env_attn_dtype() -> ttnn.DataType:
@@ -346,16 +284,14 @@ class MoELayerTTWeights:
     - w1_experts (gate_proj): per-device [1,experts_per_device,hidden,moe_intermediate]
     - w3_experts (up_proj):   per-device [1,experts_per_device,hidden,moe_intermediate]
     - w2_experts (down_proj): per-device [1,experts_per_device,moe_intermediate,hidden]
-    - w1w3_experts (fused gate+up): [1,experts_per_device,hidden,2*moe_intermediate] (optional)
     """
 
     w_gate: ttnn.Tensor
     e_score_correction_bias: ttnn.Tensor
-    w1_experts: Optional[ttnn.Tensor]  # None when fused gate+up is active
+    w1_experts: ttnn.Tensor
     w2_experts: ttnn.Tensor
-    w3_experts: Optional[ttnn.Tensor]  # None when fused gate+up is active
+    w3_experts: ttnn.Tensor
     e_score_correction_bias_tile: Optional[ttnn.Tensor] = None
-    w1w3_experts: Optional[ttnn.Tensor] = None
 
 
 @dataclass(frozen=True)
@@ -486,12 +422,9 @@ def convert_decoder_layer_weights(
 
     # ---- Fused QKV Weights (following tt_transformers/attention.py pattern) ----
     # Load Q [12288, 5120], K [1024, 5120], V [1024, 5120]
-    _qk = f"model.layers.{layer_idx}.self_attn.q_proj.weight"
-    _kk = f"model.layers.{layer_idx}.self_attn.k_proj.weight"
-    _vk = f"model.layers.{layer_idx}.self_attn.v_proj.weight"
-    wq_full = _maybe_dequant_fp8(state, _qk, state[_qk])
-    wk_full = _maybe_dequant_fp8(state, _kk, state[_kk])
-    wv_full = _maybe_dequant_fp8(state, _vk, state[_vk])
+    wq_full = _dequant_weight(state, f"model.layers.{layer_idx}.self_attn.q_proj.weight")  # [12288, 5120]
+    wk_full = _dequant_weight(state, f"model.layers.{layer_idx}.self_attn.k_proj.weight")  # [1024, 5120]
+    wv_full = _dequant_weight(state, f"model.layers.{layer_idx}.self_attn.v_proj.weight")  # [1024, 5120]
 
     # Chunk by TP=8 along output dim (head dim), transpose, and fuse per device
     # Q: [12288, 5120] -> 8 chunks of [1536, 5120] -> transpose -> [5120, 1536]
@@ -532,9 +465,9 @@ def convert_decoder_layer_weights(
     logger.info("  [DEBUG L{}] w_qkv done", layer_idx)
 
     # ---- Fused QKV Bias ----
-    bq_full = state[f"model.layers.{layer_idx}.self_attn.q_proj.bias"]  # [12288]
-    bk_full = state[f"model.layers.{layer_idx}.self_attn.k_proj.bias"]  # [1024]
-    bv_full = state[f"model.layers.{layer_idx}.self_attn.v_proj.bias"]  # [1024]
+    bq_full = _dequant_weight(state, f"model.layers.{layer_idx}.self_attn.q_proj.bias")  # [12288]
+    bk_full = _dequant_weight(state, f"model.layers.{layer_idx}.self_attn.k_proj.bias")  # [1024]
+    bv_full = _dequant_weight(state, f"model.layers.{layer_idx}.self_attn.v_proj.bias")  # [1024]
 
     bq_chunks = torch.chunk(bq_full, tp_size, dim=0)
     bk_chunks = torch.chunk(bk_full, tp_size, dim=0)
@@ -563,10 +496,9 @@ def convert_decoder_layer_weights(
     # HF: [5120, 12288] -> TT: [1, 1, 12288, 5120], shard dim=2 (input) by TP
     # Each device gets [1, 1, 1536, 5120]
     wo_mapper = _tp_mesh_mapper(device, shard_dim=2) if tp_size > 1 else _replicate_mapper(device)
-    _ok = f"model.layers.{layer_idx}.self_attn.o_proj.weight"
     w_o = _linear_weight_tt(
         device=device,
-        torch_weight_out_in=_maybe_dequant_fp8(state, _ok, state[_ok]),
+        torch_weight_out_in=_dequant_weight(state, f"model.layers.{layer_idx}.self_attn.o_proj.weight"),
         cache_file=c("w_o", tp_variant),
         dtype=attn_dtype,
         mesh_mapper=wo_mapper,
@@ -590,10 +522,8 @@ def convert_decoder_layer_weights(
 
     mlp_variant = tp_variant
 
-    _gate_k = f"{mlp_prefix}gate_proj.weight"
-    _up_k = f"{mlp_prefix}up_proj.weight"
-    _gate_w = _maybe_dequant_fp8(state, _gate_k, state[_gate_k])
-    _up_w = _maybe_dequant_fp8(state, _up_k, state[_up_k])
+    _gate_w = _dequant_weight(state, f"{mlp_prefix}gate_proj.weight")
+    _up_w = _dequant_weight(state, f"{mlp_prefix}up_proj.weight")
 
     if dense_layer:
         # Dense layers (0-2): keep separate gate/up for _dense_mlp_forward.
@@ -634,10 +564,9 @@ def convert_decoder_layer_weights(
         w_mlp_gate = w_mlp_gate_up  # placeholder (unused when w_gate_up is set)
         w_mlp_up = w_mlp_gate_up    # placeholder (unused when w_gate_up is set)
     logger.info("  [DEBUG L{}] mlp gate/up done (dense={})", layer_idx, dense_layer)
-    _down_k = f"{mlp_prefix}down_proj.weight"
     w_mlp_down = _linear_weight_tt(
         device=device,
-        torch_weight_out_in=_maybe_dequant_fp8(state, _down_k, state[_down_k]),
+        torch_weight_out_in=_dequant_weight(state, f"{mlp_prefix}down_proj.weight"),
         cache_file=c("w_mlp_down", mlp_variant),
         dtype=dense_dtype,
         mesh_mapper=mlp_down_mapper,
@@ -658,14 +587,14 @@ def convert_decoder_layer_weights(
         # Gate: [96, 5120] -> [1, 1, 5120, 96] replicated
         w_gate = _linear_weight_tt(
             device=device,
-            torch_weight_out_in=state[f"model.layers.{layer_idx}.mlp.gate.weight"],
+            torch_weight_out_in=_dequant_weight(state, f"model.layers.{layer_idx}.mlp.gate.weight"),
             cache_file=c("w_moe_gate"),
             dtype=ttnn.bfloat16,
         )
         _msync("after gate weight")
 
         # e_score_correction_bias: center before BF16 cast to preserve ordering
-        e_bias_torch = state[f"model.layers.{layer_idx}.mlp.gate.e_score_correction_bias"].to(dtype=torch.float32)
+        e_bias_torch = _dequant_weight(state, f"model.layers.{layer_idx}.mlp.gate.e_score_correction_bias").to(dtype=torch.float32)
         e_bias_centered = e_bias_torch - float(e_bias_torch.min().item())
         e_bias = _vector_weight_tt(
             device=device,
@@ -687,27 +616,19 @@ def convert_decoder_layer_weights(
         _msync("after e_bias_tile as_tensor")
 
         # Stack and shard expert weights across all 32 devices (EP=32)
-        w1_dtype = _env_expert_projection_dtype("W1")
-        w2_dtype = _env_expert_projection_dtype("W2")
-        w3_dtype = _env_expert_projection_dtype("W3")
+        experts_dtype = _env_experts_dtype()
         num_experts = int(hparams.n_routed_experts)
         moe_intermediate = int(hparams.moe_intermediate_size)
         hidden = int(hparams.hidden_size)
-        dtype_tag = f"{w1_dtype.name}_{w2_dtype.name}_{w3_dtype.name}"
-        experts_variant = f"ep{num_devices}_{dtype_tag}_v1"
-        if layer_idx == int(hparams.first_k_dense_replace):
-            logger.info(f"  Expert dtypes: w1={w1_dtype.name}, w2={w2_dtype.name}, w3={w3_dtype.name}")
+        experts_variant = f"ep{num_devices}_e{num_experts}_v1"
 
         w1_list: list[torch.Tensor] = []
         w3_list: list[torch.Tensor] = []
         w2_list: list[torch.Tensor] = []
         for expert_id in range(num_experts):
-            _w1k = f"model.layers.{layer_idx}.mlp.experts.{expert_id}.gate_proj.weight"
-            _w3k = f"model.layers.{layer_idx}.mlp.experts.{expert_id}.up_proj.weight"
-            _w2k = f"model.layers.{layer_idx}.mlp.experts.{expert_id}.down_proj.weight"
-            w1 = _maybe_dequant_fp8(state, _w1k, state[_w1k])
-            w3 = _maybe_dequant_fp8(state, _w3k, state[_w3k])
-            w2 = _maybe_dequant_fp8(state, _w2k, state[_w2k])
+            w1 = _dequant_weight(state, f"model.layers.{layer_idx}.mlp.experts.{expert_id}.gate_proj.weight")
+            w3 = _dequant_weight(state, f"model.layers.{layer_idx}.mlp.experts.{expert_id}.up_proj.weight")
+            w2 = _dequant_weight(state, f"model.layers.{layer_idx}.mlp.experts.{expert_id}.down_proj.weight")
             if tuple(w1.shape) != (moe_intermediate, hidden):
                 raise ValueError(
                     f"Unexpected gate_proj shape for layer{layer_idx} expert{expert_id}: {tuple(w1.shape)}, "
@@ -732,45 +653,34 @@ def convert_decoder_layer_weights(
         w3_stacked = torch.stack(w3_list, dim=0)  # [96, hidden, moe_intermediate]
         w2_stacked = torch.stack(w2_list, dim=0)  # [96, moe_intermediate, hidden]
 
+        import time as _time
         _msync("after expert stacking")
-
-        fuse_gate_up = os.environ.get("GLM4_MOE_FUSE_EXPERTS_GATE_UP", "").strip() == "1"
-
-        if fuse_gate_up:
-            # Fused gate+up: single w1w3 tensor replaces separate w1 and w3 (saves DRAM).
-            w1w3_stacked = torch.cat([w1_stacked, w3_stacked], dim=2)  # [E, hidden, 2*moe_intermediate]
-            w1w3_experts_tt = _experts_weight_tt(
-                device=device,
-                torch_weights=w1w3_stacked,
-                cache_file=c("w1w3_experts", experts_variant),
-                dtype=w1_dtype,
-            )
-            _msync("after w1w3_experts")
-            w1_experts: Optional[ttnn.Tensor] = None
-            w3_experts: Optional[ttnn.Tensor] = None
-        else:
-            w1_experts = _experts_weight_tt(
-                device=device,
-                torch_weights=w1_stacked,
-                cache_file=c("w1_experts", experts_variant),
-                dtype=w1_dtype,
-            )
-            _msync("after w1_experts")
-            w3_experts = _experts_weight_tt(
-                device=device,
-                torch_weights=w3_stacked,
-                cache_file=c("w3_experts", experts_variant),
-                dtype=w3_dtype,
-            )
-            _msync("after w3_experts")
-            w1w3_experts_tt = None
-
+        _t0 = _time.time()
+        w1_experts = _experts_weight_tt(
+            device=device,
+            torch_weights=w1_stacked,
+            cache_file=c("w1_experts", experts_variant),
+            dtype=experts_dtype,
+        )
+        logger.info("  [L{}] w1_experts tilized ({:.1f}s)", layer_idx, _time.time() - _t0)
+        _msync("after w1_experts")
+        _t0 = _time.time()
+        w3_experts = _experts_weight_tt(
+            device=device,
+            torch_weights=w3_stacked,
+            cache_file=c("w3_experts", experts_variant),
+            dtype=experts_dtype,
+        )
+        logger.info("  [L{}] w3_experts tilized ({:.1f}s)", layer_idx, _time.time() - _t0)
+        _msync("after w3_experts")
+        _t0 = _time.time()
         w2_experts = _experts_weight_tt(
             device=device,
             torch_weights=w2_stacked,
             cache_file=c("w2_experts", experts_variant),
-            dtype=w2_dtype,
+            dtype=experts_dtype,
         )
+        logger.info("  [L{}] w2_experts tilized ({:.1f}s)", layer_idx, _time.time() - _t0)
         _msync("after w2_experts")
 
         moe = MoELayerTTWeights(
@@ -780,7 +690,6 @@ def convert_decoder_layer_weights(
             w2_experts=w2_experts,
             w3_experts=w3_experts,
             e_score_correction_bias_tile=e_bias_tile,
-            w1w3_experts=w1w3_experts_tt,
         )
 
     return DecoderLayerTTWeights(

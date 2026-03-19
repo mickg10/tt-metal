@@ -31,8 +31,6 @@ import logging
 _REDUCE_IMPL = os.environ.get("GLM4_MOE_REDUCE_IMPL", "host").strip().lower()
 _REDUCE_IMPL_AXIS1 = os.environ.get("GLM4_MOE_REDUCE_IMPL_AXIS1", "").strip().lower()
 _REDUCE_LOG_ONCE = set()
-_QK_L1 = os.environ.get("GLM4_MOE_QK_L1", "1").strip() != "0"
-_ROPE_PAD = os.environ.get("GLM4_MOE_ROPE_PAD", "1").strip() != "0"
 
 logger = logging.getLogger(__name__)
 
@@ -187,13 +185,18 @@ def _simple_all_reduce(tensor, mesh_device, cluster_axis, memory_config=None, cc
         result = _simple_all_reduce_host(tensor, mesh_device, cluster_axis, memory_config)
 
     # CCL ops (reduce_scatter, all_gather, all_reduce) can lose the logical shape,
-    # returning physical-padded dims (e.g., TILE_LAYOUT pads batch to 32) instead of
-    # the true logical shape. Restore it so downstream ops (ttnn.add, etc.) don't fail
-    # with "Invalid subtile broadcast type" due to mismatched batch dims.
-    # PERF: Use int comparison to avoid false positives from ttnn Shape objects.
-    # For bs=1, CCL ops don't change the shape — skip reshape entirely.
+    # returning physical-padded dims (e.g., TILE_LAYOUT pads batch 1→32) instead of
+    # the true logical shape.
+    #
+    # For bs=1 decode: SKIP restoration. Let tensors expand to [1,1,32,5120] and stay
+    # there — all 32 rows are identical (tile padding), and `active_batch` (not tensor
+    # shape) controls batch-sensitive ops. Avoids 184 ttnn.slice ops/step (~32ms ITL).
+    # P0b proved this works (broken restoration → implicit 32-row propagation → 164ms ITL).
+    #
+    # For bs>1: restore to prevent "Invalid subtile broadcast type" from mismatched
+    # batch dims in ttnn.add (e.g., 4≠32 fails, but 1→32 broadcast is OK).
     out_shape = [int(d) for d in result.shape]
-    if out_shape != input_logical_shape:
+    if out_shape != input_logical_shape and input_logical_shape[-2] > 1:
         out_vol = 1
         in_vol = 1
         for d in out_shape:
@@ -201,15 +204,12 @@ def _simple_all_reduce(tensor, mesh_device, cluster_axis, memory_config=None, cc
         for d in input_logical_shape:
             in_vol *= d
         if out_vol == in_vol:
-            # Same volume — safe to reshape (just metadata change).
             result = ttnn.reshape(result, input_logical_shape, out_shape)
         else:
-            # CCL padded a dimension (e.g., batch 1→32 in TILE_LAYOUT).
-            # Slice back to the original logical shape.
             result = ttnn.slice(
                 result,
-                starts=[0] * len(input_logical_shape),
-                ends=input_logical_shape,
+                [0] * len(input_logical_shape),
+                input_logical_shape,
             )
 
     return result
@@ -270,14 +270,16 @@ class Glm4MoeAttention(LightweightModule):
         self.hidden_size = hparams.hidden_size  # 5120
 
         # Device topology
-        self.num_devices = configuration["num_devices"]  # 32 for Galaxy TG
+        self.num_devices = configuration["num_devices"]  # 32 for Galaxy
         self.TG = self.num_devices == 32
-        self.num_devices_per_group = self.n_kv_heads if self.TG else self.num_devices  # 8
-        self.num_device_groups = self.num_devices // self.num_devices_per_group  # 4
+        self.tp_size = configuration.get("tp_size", self.num_devices)
+        self.tp_axis = configuration.get("tp_axis", 0)
+        self.num_devices_per_group = self.tp_size  # TP=4 for BH, TP=8 for WH
+        self.num_device_groups = self.num_devices // self.num_devices_per_group
 
-        # Per-device head counts (TP=8)
-        self.n_local_heads = self.n_heads // self.num_devices_per_group  # 12
-        self.n_local_kv_heads = self.n_kv_heads // self.num_devices_per_group  # 1
+        # Per-device head counts
+        self.n_local_heads = self.n_heads // self.num_devices_per_group
+        self.n_local_kv_heads = self.n_kv_heads // self.num_devices_per_group
 
         # Batch sizing
         self.max_batch_size = configuration["max_batch_size"]
@@ -296,10 +298,14 @@ class Glm4MoeAttention(LightweightModule):
         # Paged attention config
         self.paged_attention_config = paged_attention_config
 
-        # SDPA decode program config: limit cores to 64 (8x8) for Galaxy Wormhole
-        # Galaxy has 72 cores (8x9) but SDPA tree reduction supports max 64 cores per KV head
+        # SDPA decode program config
+        arch = os.environ.get("ARCH_NAME", "wormhole_b0")
+        if arch == "blackhole":
+            sdpa_grid = (12, 10)  # BH: 130 cores, use 120
+        else:
+            sdpa_grid = (8, 8)  # WH: 72 cores, use 64
         self.sdpa_decode_program_config = ttnn.SDPAProgramConfig(
-            compute_with_storage_grid_size=(8, 8),
+            compute_with_storage_grid_size=sdpa_grid,
             exp_approx_mode=False,
             q_chunk_size=0,
             k_chunk_size=0,
@@ -312,7 +318,6 @@ class Glm4MoeAttention(LightweightModule):
         self.ccl_dtype = configuration.get("ccl_dtype", ttnn.bfloat16)
 
         # Compute kernel config — HiFi2 for attention precision through 92 layers
-        import os
         _attn_fidelity_raw = os.environ.get("GLM4_MOE_ATTN_FIDELITY", "hifi2").strip().lower()
         _fidelity_map = {"lofi": ttnn.MathFidelity.LoFi, "hifi2": ttnn.MathFidelity.HiFi2,
                          "hifi3": ttnn.MathFidelity.HiFi3, "hifi4": ttnn.MathFidelity.HiFi4}
@@ -321,6 +326,14 @@ class Glm4MoeAttention(LightweightModule):
         self.compute_kernel_config = ttnn.WormholeComputeKernelConfig(
             math_fidelity=_attn_fidelity,
             math_approx_mode=_attn_approx,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=True,
+        )
+        # Separate config for SDPA decode — fp32_dest_acc causes hang (halves dest regs),
+        # but we need exact exp() (not approx) and HiFi4 for precision through 92 layers.
+        self.sdpa_compute_kernel_config = ttnn.WormholeComputeKernelConfig(
+            math_fidelity=ttnn.MathFidelity.HiFi4,
+            math_approx_mode=False,
             fp32_dest_acc_en=False,
             packer_l1_acc=True,
         )
@@ -341,53 +354,43 @@ class Glm4MoeAttention(LightweightModule):
         self._grid_size = mesh_device.compute_with_storage_grid_size()
         self._shard_cfg_cache: dict[int, dict] = {}  # batch -> {q, k, rope, trans}
 
-        # DRAM-sharded matmul configs (when GLM4_MOE_DRAM_SHARD=1)
-        self._use_dram_shard = os.environ.get("GLM4_MOE_DRAM_SHARD", "0").strip() == "1"
-        if self._use_dram_shard:
-            self._setup_dram_sharded_configs()
-
-        # TG user selection matrices (for slicing batch from all-reduce output).
-        # Pre-computed per batch bucket because slice_mat and user_selection_matrix
-        # dimensions depend on the runtime batch size (B_phys, Bg vary per bucket).
-        self._slice_mats: dict[int, object] = {}
-        self._user_sel_mats: dict[int, object] = {}
+        # TG user selection matrices (for slicing batch from all-reduce output)
         if self.TG:
-            self._tg_init_batch_mats(self.max_batch_size)
+            B = self.max_batch_size  # logical total batch (e.g. 4, 8, 32)
+            Bg = self.batch_size_per_device_group  # per DP group (B // 4)
+            Ng = self.num_device_groups  # 4 for Galaxy TG
+            # Physical batch dim in TILE_LAYOUT is always padded to multiples of 32.
+            # slice_mat width must match physical_batch from WIDTH_SHARDED QKV output.
+            B_phys = ((B + 31) // 32) * 32  # tile-padded batch (always 32 for B<=32)
 
-    def _tg_init_batch_mats(self, batch_size: int):
-        """Lazily create slice_mat and user_selection_matrix for a given batch size."""
-        if batch_size in self._slice_mats:
-            return
-        Ng = self.num_device_groups  # 4 for Galaxy TG
-        Bg = max(batch_size // Ng, 1)  # per DP group
-        B_phys = ((batch_size + 31) // 32) * 32  # tile-padded
+            # slice_mat: [1, num_devices, Bg, B_phys] — each device selects its DP group's batch entries
+            weight = torch.zeros(1, self.num_devices, Bg, B_phys)
+            for i in range(self.num_devices):
+                # DP group index depends on mesh topology:
+                # BH Galaxy (tp_axis=1): DP group = row = i // tp_size
+                # WH Galaxy (tp_axis=0): DP group = column = i % num_device_groups
+                col = i // self.num_devices_per_group if self.tp_axis == 1 else i % Ng
+                weight[:, i, :, col * Bg : (col + 1) * Bg] = torch.eye(Bg)
 
-        # slice_mat: [1, num_devices, Bg, B_phys] — each device selects its DP group's batch entries
-        weight = torch.zeros(1, self.num_devices, Bg, B_phys)
-        for i in range(self.num_devices):
-            col = i % Ng
-            weight[:, i, :, col * Bg : (col + 1) * Bg] = torch.eye(Bg)
-        self._slice_mats[batch_size] = ttnn.from_torch(
-            weight,
-            dtype=ttnn.bfloat4_b,
-            layout=ttnn.TILE_LAYOUT,
-            device=self.mesh_device,
-            mesh_mapper=ttnn.ShardTensorToMesh(self.mesh_device, dim=1),
-        )
-
-        # user_selection_matrix: [Ng*Bg, Ng*B_phys] — reorders batch after all-gather across DP groups
-        Bg_phys = ((Bg + 31) // 32) * 32
-        user_sel = torch.eye(Bg, Bg)
-        user_sel = torch.nn.functional.pad(user_sel, (0, Bg_phys - Bg), "constant", 0)
-        user_sel = [user_sel] * Ng
-        user_sel = torch.block_diag(*user_sel)
-        self._user_sel_mats[batch_size] = ttnn.from_torch(
-            user_sel,
-            dtype=ttnn.bfloat4_b,
-            layout=ttnn.TILE_LAYOUT,
-            device=self.mesh_device,
-            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
-        )
+            self.slice_mat = ttnn.from_torch(
+                weight,
+                dtype=ttnn.bfloat4_b,
+                layout=ttnn.TILE_LAYOUT,
+                device=self.mesh_device,
+                mesh_mapper=ttnn.ShardTensorToMesh(self.mesh_device, dim=1),
+            )
+            # user_selection_matrix: [B_phys, B_phys] — reorders batch after all-gather across DP groups
+            user_selection_matrix = torch.eye(Bg, Bg)
+            user_selection_matrix = torch.nn.functional.pad(user_selection_matrix, (0, B_phys - Bg), "constant", 0)
+            user_selection_matrix = [user_selection_matrix] * Ng
+            user_selection_matrix = torch.block_diag(*user_selection_matrix)
+            self.user_selection_matrix = ttnn.from_torch(
+                user_selection_matrix,
+                dtype=ttnn.bfloat4_b,
+                layout=ttnn.TILE_LAYOUT,
+                device=self.mesh_device,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
+            )
 
     def _get_shard_cfgs(self, batch: int) -> dict:
         """Return per-batch shard configs (lazily created and cached)."""
@@ -415,73 +418,7 @@ class Glm4MoeAttention(LightweightModule):
         self._shard_cfg_cache[batch] = cfgs
         return cfgs
 
-    def _setup_dram_sharded_configs(self):
-        """Pre-compute DRAM-sharded matmul configs and weight copies for decode attention.
-
-        Creates DRAM WIDTH_SHARDED copies of QKV and O weights for decode (full DRAM bank
-        utilization), while keeping the original interleaved weights for prefill.
-        """
-        from models.demos.deepseek_v3.utils.config_helpers import (
-            dram_sharded_weight_config,
-            get_activation_sharding_core_counts_for_dram_matmul,
-            get_dram_sharded_matmul_config,
-        )
-
-        grid = self._grid_size
-        max_cores = grid.x * grid.y  # 72 for Galaxy WH (8x9)
-        _DS_BATCH = 32  # tile-padded batch for decode
-
-        def _ds_act_mc(width: int) -> ttnn.MemoryConfig:
-            cores = max(get_activation_sharding_core_counts_for_dram_matmul(width, max_cores))
-            return ttnn.create_sharded_memory_config_(
-                shape=(_DS_BATCH, width // cores),
-                core_grid=ttnn.num_cores_to_corerangeset(
-                    cores, ttnn.CoreCoord(grid.x, grid.y), row_wise=True,
-                ),
-                strategy=ttnn.TensorMemoryLayout.WIDTH_SHARDED,
-                orientation=ttnn.ShardOrientation.ROW_MAJOR,
-                tile_layout=True,
-                use_height_and_width_as_shard_shape=True,
-            )
-
-        def _shard_weight(weight):
-            """Create a DRAM WIDTH_SHARDED copy of a weight tensor."""
-            K, N = int(weight.shape[2]), int(weight.shape[3])
-            dram_grid = self.mesh_device.dram_grid_size()
-            dram_mc = dram_sharded_weight_config(K, N, dram_grid)
-            host_w = ttnn.from_device(weight)
-            return host_w.to(self.mesh_device, dram_mc)
-
-        # QKV matmul: [1,1,B,5120] × [1,1,5120,1792] → [1,1,B,1792]
-        K_qkv = int(self.wqkv.shape[2])
-        N_qkv = int(self.wqkv.shape[3])
-        qkv_in = max(get_activation_sharding_core_counts_for_dram_matmul(K_qkv, max_cores))
-        qkv_out = max(get_activation_sharding_core_counts_for_dram_matmul(N_qkv, max_cores))
-        self._ds_qkv_act_mc = _ds_act_mc(K_qkv)
-        self._ds_qkv_prog_cfg = get_dram_sharded_matmul_config(
-            m=_DS_BATCH, k=K_qkv, n=N_qkv,
-            input_num_shards=qkv_in, output_num_shards=qkv_out,
-        )
-        self._ds_wqkv = _shard_weight(self.wqkv)
-
-        # O projection: [1,1,B,1536] × [1,1,1536,5120] → [1,1,B,5120]
-        K_o = int(self.wo.shape[2])
-        N_o = int(self.wo.shape[3])
-        o_in = max(get_activation_sharding_core_counts_for_dram_matmul(K_o, max_cores))
-        o_out = max(get_activation_sharding_core_counts_for_dram_matmul(N_o, max_cores))
-        self._ds_o_act_mc = _ds_act_mc(K_o)
-        self._ds_o_prog_cfg = get_dram_sharded_matmul_config(
-            m=_DS_BATCH, k=K_o, n=N_o,
-            input_num_shards=o_in, output_num_shards=o_out,
-        )
-        self._ds_wo = _shard_weight(self.wo)
-
-        logger.info(
-            "DRAM-sharded attention configs: QKV K=%d N=%d in=%d out=%d, O K=%d N=%d in=%d out=%d",
-            K_qkv, N_qkv, qkv_in, qkv_out, K_o, N_o, o_in, o_out,
-        )
-
-    def _apply_partial_rope_decode(self, x, cos, sin, trans_mat, sin_neg=None):
+    def _apply_partial_rope_decode(self, x, cos, sin, trans_mat):
         """Apply partial rotary embedding (decode mode, NeoX-style).
 
         Only the first rotary_dim (64) dims get rotary encoding;
@@ -489,9 +426,6 @@ class Glm4MoeAttention(LightweightModule):
 
         Uses NeoX-style rotation: rotate_half(x) = cat(-x[..., d//2:], x[..., :d//2]).
         GLM-4.7 uses NeoX-style RoPE (confirmed from HuggingFace transformers glm4_moe).
-
-        When sin_neg is provided (pre-computed [-sin[:half], sin[half:]]), uses addcmul
-        fusion to eliminate neg op: 10 → 8 device ops per call.
         """
         # x: [1, batch, n_heads, head_dim] = [1, B, H, 128]  (DRAM interleaved after QK norm)
         batch = int(x.shape[1])
@@ -501,29 +435,19 @@ class Glm4MoeAttention(LightweightModule):
         x_rot = ttnn.slice(x, [0, 0, 0, 0], [1, batch, n_heads, self.rotary_dim])
         x_pass = ttnn.slice(x, [0, 0, 0, self.rotary_dim], [1, batch, n_heads, self.head_dim])
 
-        # NeoX-style rotate_half
+        # NeoX-style rotate_half: [-x2, x1] where x1 = first half, x2 = second half
         half = self.rotary_dim // 2
         x1 = ttnn.slice(x_rot, [0, 0, 0, 0], [1, batch, n_heads, half])
         x2 = ttnn.slice(x_rot, [0, 0, 0, half], [1, batch, n_heads, self.rotary_dim])
+        rotated = ttnn.concat([ttnn.neg(x2), x1], dim=-1, memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
-        if sin_neg is not None:
-            # Optimized path: sin_neg = [-sin[:half], sin[half:]] pre-computed on host.
-            # rearranged = [x2, x1] (no neg needed — absorbed into sin_neg).
-            # x_rot_out = x_rot * cos + rearranged * sin_neg
-            rearranged = ttnn.concat([x2, x1], dim=-1, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-            x_rot = ttnn.add(
-                ttnn.multiply(x_rot, cos),
-                ttnn.multiply(rearranged, sin_neg),
-            )
-            ttnn.deallocate(rearranged)
-        else:
-            # Original path: rotated = [-x2, x1], then x_rot*cos + rotated*sin
-            rotated = ttnn.concat([ttnn.neg(x2), x1], dim=-1, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-            x_rot = ttnn.add(
-                ttnn.multiply(x_rot, cos),
-                ttnn.multiply(rotated, sin),
-            )
-            ttnn.deallocate(rotated)
+        # output = x_rot * cos + rotate_half(x_rot) * sin
+        # cos/sin: [1, batch, 1, rotary_dim] — broadcasts over n_heads dim
+        x_rot = ttnn.add(
+            ttnn.multiply(x_rot, cos),
+            ttnn.multiply(rotated, sin),
+        )
+        ttnn.deallocate(rotated)
 
         # Concat back: [rotary_dim | pass_dim] = full head_dim
         x = ttnn.concat([x_rot, x_pass], dim=-1, memory_config=ttnn.DRAM_MEMORY_CONFIG)
@@ -595,24 +519,13 @@ class Glm4MoeAttention(LightweightModule):
         """
 
         # 1. QKV linear
-        if self._use_dram_shard:
-            x_sharded = ttnn.to_memory_config(x, self._ds_qkv_act_mc)
-            xqkv = ttnn.linear(
-                x_sharded,
-                self._ds_wqkv,
-                program_config=self._ds_qkv_prog_cfg,
-                memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
-                compute_kernel_config=self.compute_kernel_config,
-            )
-            ttnn.deallocate(x_sharded, force=False)
-        else:
-            xqkv = ttnn.linear(
-                x,
-                self.wqkv,
-                memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
-                dtype=self.ccl_dtype if self.TG else ttnn.bfloat16,
-                compute_kernel_config=self.compute_kernel_config,
-            )
+        xqkv = ttnn.linear(
+            x,
+            self.wqkv,
+            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+            dtype=self.ccl_dtype if self.TG else ttnn.bfloat16,
+            compute_kernel_config=self.compute_kernel_config,
+        )
 
         # Add QKV bias
         xqkv = xqkv + self.wqkv_bias
@@ -621,6 +534,18 @@ class Glm4MoeAttention(LightweightModule):
 
         # Column-parallel QKV: each device has its own output slice, no all-reduce needed.
         xqkv = ttnn.to_memory_config(xqkv, ttnn.DRAM_MEMORY_CONFIG)
+
+        # DEBUG: dump QKV output magnitude
+        import sys as _dbg_sys4
+        if os.environ.get("GLM4_MOE_DEBUG_DECODE", "0") != "0" and self.mesh_device.__class__.__name__ == "MeshDevice":
+            _qkv_devs = ttnn.get_device_tensors(xqkv)
+            _qkv0 = ttnn.to_torch(_qkv_devs[0].cpu())
+            print(f"  [DBG QKV] d0 shape={list(_qkv0.shape)}, abs_max={_qkv0.abs().max().item():.4f}, "
+                  f"d0[:8]={_qkv0[0,0,0,:8].float().tolist()}", flush=True, file=_dbg_sys4.stderr)
+            _wqkv_devs = ttnn.get_device_tensors(self.wqkv)
+            _wqkv0 = ttnn.to_torch(_wqkv_devs[0].cpu())
+            print(f"  [DBG W_QKV] d0 shape={list(_wqkv0.shape)}, abs_max={_wqkv0.abs().max().item():.4f}, "
+                  f"abs_mean={_wqkv0.abs().float().mean().item():.6f}", flush=True, file=_dbg_sys4.stderr)
 
         # Use caller-provided active_batch (reliable) instead of x.shape[-2] which
         # can be inflated to 32 by tile-padding in ttnn.add / sharded_to_interleaved.
@@ -635,14 +560,12 @@ class Glm4MoeAttention(LightweightModule):
         # Reshape to expose physical batch as logical so matmul inner dims match.
         if tg_batch_sliced:
             # Multi-user: slice batch to this DP group entries via matmul.
-            # Lazily create slice_mat/user_sel_mat for this batch size if needed.
-            self._tg_init_batch_mats(active_batch)
             xqkv_shape = [int(d) for d in xqkv.shape]
-            B_phys = ((active_batch + 31) // 32) * 32
+            B_phys = ((self.max_batch_size + 31) // 32) * 32
             if xqkv_shape[-2] != B_phys:
-                xqkv = ttnn.reshape(xqkv, (1, 1, B_phys, xqkv_shape[-1]), (1, 1, B_phys, xqkv_shape[-1]))
+                xqkv = ttnn.reshape(xqkv, (1, 1, B_phys, xqkv_shape[-1]))
             xqkv = ttnn.matmul(
-                self._slice_mats[active_batch],
+                self.slice_mat,
                 xqkv,
                 dtype=ttnn.bfloat16,
                 memory_config=ttnn.L1_MEMORY_CONFIG,
@@ -658,11 +581,10 @@ class Glm4MoeAttention(LightweightModule):
         #    q/k/v with batch=32 which breaks paged_update_cache (page_table has batch=1).
         #    Mirrors tt_transformers/tt/attention.py lines 497-501.
         _fqkv_shape = xqkv.shape
-        B_phys_local = ((logical_batch_after_slice + 31) // 32) * 32
         xqkv = ttnn.reshape(
             xqkv,
             (1, 1, logical_batch_after_slice, int(_fqkv_shape[3])),
-            (1, 1, B_phys_local, int(_fqkv_shape[3])),
+            (1, 1, 32, int(_fqkv_shape[3])),
         )
 
         # Split into Q, K, V heads (output must be HEIGHT_SHARDED per ttnn API)
@@ -677,19 +599,14 @@ class Glm4MoeAttention(LightweightModule):
 
         # 4. QK Norm (RMSNorm per head, dim=128)
         # RMSNorm requires interleaved input (HEIGHT_SHARDED not supported by layernorm op)
-        # GLM4_MOE_QK_L1=1 (default): keep Q/K in L1 interleaved instead of DRAM round-trip.
-        # Q=98KB, K=8KB — trivially fit L1. RMSNorm accepts L1 interleaved.
-        _qk_mc = ttnn.L1_MEMORY_CONFIG if _QK_L1 else ttnn.DRAM_MEMORY_CONFIG
-        q = ttnn.to_memory_config(q, _qk_mc)
-        k = ttnn.to_memory_config(k, _qk_mc)
+        q = ttnn.to_memory_config(q, ttnn.DRAM_MEMORY_CONFIG)
+        k = ttnn.to_memory_config(k, ttnn.DRAM_MEMORY_CONFIG)
         q = self.q_norm(q, mode="decode")
         k = self.k_norm(k, mode="decode")
 
         # 5. Partial RoPE (rotary_dim=64 of head_dim=128)
-        # sin_neg precomputed: saves 1 neg op per partial RoPE call (2/layer × 92 layers = 184 ops).
-        sin_neg = rot_mats[3] if len(rot_mats) > 3 else None
-        q = self._apply_partial_rope_decode(q, rot_mats[0], rot_mats[1], rot_mats[2], sin_neg=sin_neg)
-        k = self._apply_partial_rope_decode(k, rot_mats[0], rot_mats[1], rot_mats[2], sin_neg=sin_neg)
+        q = self._apply_partial_rope_decode(q, rot_mats[0], rot_mats[1], rot_mats[2])
+        k = self._apply_partial_rope_decode(k, rot_mats[0], rot_mats[1], rot_mats[2])
 
         # Convert back to HEIGHT_SHARDED for paged_update_cache and SDPA
         # (partial RoPE returns DRAM interleaved after concat)
@@ -719,6 +636,7 @@ class Glm4MoeAttention(LightweightModule):
             cur_pos_tensor=current_pos,
             scale=self.scale,
             program_config=self.sdpa_decode_program_config,
+            compute_kernel_config=self.sdpa_compute_kernel_config,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
         ttnn.deallocate(q)
@@ -739,50 +657,50 @@ class Glm4MoeAttention(LightweightModule):
         # Pattern from tt_transformers/tt/attention.py lines 667-687.
         if tg_batch_sliced:
             attn_shape = [int(d) for d in attn_output.shape]
-            B_phys = ((logical_batch_after_slice + 31) // 32) * 32
+            B_phys = ((self.max_batch_size + 31) // 32) * 32
             if attn_shape[-2] != B_phys:
-                attn_output = ttnn.reshape(attn_output, (1, 1, B_phys, attn_shape[-1]), (1, 1, B_phys, attn_shape[-1]))
+                attn_output = ttnn.reshape(attn_output, (1, 1, B_phys, attn_shape[-1]))
 
             # Gather across DP groups (cluster_axis=1) on batch dim
+            dp_axis = 1 - self.tp_axis
             attn_output = _simple_all_gather(
-                attn_output, self.mesh_device, cluster_axis=1, dim=2,
+                attn_output, self.mesh_device, cluster_axis=dp_axis, dim=2,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
 
             attn_output = ttnn.to_memory_config(attn_output, ttnn.L1_MEMORY_CONFIG)
             attn_output = ttnn.matmul(
-                self._user_sel_mats[active_batch],
+                self.user_selection_matrix,
                 attn_output,
-                core_grid=ttnn.CoreGrid(y=4, x=8),
+                core_grid=ttnn.CoreGrid(y=10, x=12) if os.environ.get("ARCH_NAME") == "blackhole" else ttnn.CoreGrid(y=4, x=8),
                 dtype=ttnn.bfloat16,
                 memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
             )
-            B_phys_out = ((active_batch + 31) // 32) * 32
-            attn_output = ttnn.reshape(attn_output, (1, 1, active_batch, attn_shape[-1]), (1, 1, B_phys_out, attn_shape[-1]))
+            attn_output = ttnn.reshape(attn_output, (1, 1, active_batch, attn_shape[-1]))
+
+        # DEBUG: dump attn_output (SDPA result after concat_heads) and O proj weight magnitude
+        import sys as _dbg_sys3
+        _dbg_attn2 = os.environ.get("GLM4_MOE_DEBUG_DECODE", "0") != "0"
+        if _dbg_attn2 and self.mesh_device.__class__.__name__ == "MeshDevice":
+            _ao_devs = ttnn.get_device_tensors(attn_output)
+            _ao0 = ttnn.to_torch(_ao_devs[0].cpu())
+            _wo_devs = ttnn.get_device_tensors(self.wo)
+            _wo0 = ttnn.to_torch(_wo_devs[0].cpu())
+            print(f"  [DBG ATTN-OUT] d0 shape={list(_ao0.shape)}, abs_max={_ao0.abs().max().item():.4f}, "
+                  f"d0[:8]={_ao0[0,0,0,:8].float().tolist()}", flush=True, file=_dbg_sys3.stderr)
+            print(f"  [DBG W_O] d0 shape={list(_wo0.shape)}, abs_max={_wo0.abs().max().item():.4f}, "
+                  f"abs_mean={_wo0.abs().float().mean().item():.6f}", flush=True, file=_dbg_sys3.stderr)
 
         # 10. Output projection (BF16 output for precision through 92 layers)
-        if self._use_dram_shard:
-            ao_sharded = ttnn.to_memory_config(attn_output, self._ds_o_act_mc)
-            ttnn.deallocate(attn_output)
-            dense_out = ttnn.linear(
-                ao_sharded,
-                self._ds_wo,
-                program_config=self._ds_o_prog_cfg,
-                memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
-                dtype=ttnn.bfloat16,
-                compute_kernel_config=self.compute_kernel_config,
-            )
-            ttnn.deallocate(ao_sharded, force=False)
-        else:
-            dense_out = ttnn.matmul(
-                attn_output,
-                self.wo,
-                core_grid=ttnn.CoreGrid(y=4, x=8) if self.TG else None,
-                memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
-                dtype=ttnn.bfloat16,
-                compute_kernel_config=self.compute_kernel_config,
-            )
-            ttnn.deallocate(attn_output)
+        dense_out = ttnn.matmul(
+            attn_output,
+            self.wo,
+            core_grid=(ttnn.CoreGrid(y=10, x=12) if os.environ.get("ARCH_NAME") == "blackhole" else ttnn.CoreGrid(y=4, x=8)) if self.TG else None,
+            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+            dtype=ttnn.bfloat16,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+        ttnn.deallocate(attn_output)
 
         # DEBUG: force synchronize to isolate if compute pipeline or reduce hangs
         import os as _os
@@ -791,14 +709,37 @@ class Glm4MoeAttention(LightweightModule):
             ttnn.synchronize_device(self.mesh_device)
             logger.info("  [DEBUG] synchronize complete, proceeding to all_reduce")
 
-        # 11. All-reduce on cluster_axis=0 (TP reduction for row-parallel O projection)
+        # DEBUG: dump pre-reduce hidden states per TP device
+        import sys as _dbg_sys2
+        _dbg_attn = os.environ.get("GLM4_MOE_DEBUG_DECODE", "0") != "0"
+        if _dbg_attn and self.mesh_device.__class__.__name__ == "MeshDevice":
+            _pre_devs = ttnn.get_device_tensors(dense_out)
+            _pre0 = ttnn.to_torch(_pre_devs[0].cpu())
+            _pre1 = ttnn.to_torch(_pre_devs[1].cpu())
+            print(f"  [DBG ATTN PRE-REDUCE] d0[:8]={_pre0[0,0,0,:8].float().tolist()}", flush=True, file=_dbg_sys2.stderr)
+            print(f"  [DBG ATTN PRE-REDUCE] d1[:8]={_pre1[0,0,0,:8].float().tolist()}", flush=True, file=_dbg_sys2.stderr)
+            print(f"  [DBG ATTN PRE-REDUCE] d0-d1 max_diff={((_pre0-_pre1).abs().max().item()):.6f}", flush=True, file=_dbg_sys2.stderr)
+
+        # 11. All-reduce on TP axis (TP reduction for row-parallel O projection)
         dense_out = _simple_all_reduce(
             dense_out,
             self.mesh_device,
-            cluster_axis=0,
+            cluster_axis=self.tp_axis,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             ccl=self.tt_ccl,
         )
+
+        # DEBUG: dump post-reduce hidden states
+        if _dbg_attn and self.mesh_device.__class__.__name__ == "MeshDevice":
+            _post_devs = ttnn.get_device_tensors(dense_out)
+            _post0 = ttnn.to_torch(_post_devs[0].cpu())
+            _post1 = ttnn.to_torch(_post_devs[1].cpu())
+            _post4 = ttnn.to_torch(_post_devs[4].cpu()) if len(_post_devs) > 4 else None
+            print(f"  [DBG ATTN POST-REDUCE] d0[:8]={_post0[0,0,0,:8].float().tolist()}", flush=True, file=_dbg_sys2.stderr)
+            print(f"  [DBG ATTN POST-REDUCE] d1[:8]={_post1[0,0,0,:8].float().tolist()}", flush=True, file=_dbg_sys2.stderr)
+            diff_01 = (_post0-_post1).abs().max().item()
+            diff_04 = (_post0-_post4).abs().max().item() if _post4 is not None else -1
+            print(f"  [DBG ATTN POST-REDUCE] d0-d1 max_diff={diff_01:.6f}, d0-d4 max_diff={diff_04:.6f}", flush=True, file=_dbg_sys2.stderr)
 
         return dense_out
 
@@ -899,14 +840,18 @@ class Glm4MoeAttention(LightweightModule):
         v_8b = ttnn.typecast(v, dtype=values.dtype)
         ttnn.deallocate(v)
 
-        # BUGFIX: Always fill ALL devices' KV caches in prefill.
-        # _prefill_prepare_tensor_for_kv_cache selects only one DP column (8 devices),
-        # but batch=1 decode uses all 32 devices without DP sharding — the 24 unfilled
-        # devices produce garbage attention, corrupting the EP reduce sum.
+        # For TG with multi-user batch split across DP groups, select the correct
+        # column's tensors for KV cache fill. But for batch=1 (tg_batch_sliced=False),
+        # ALL 32 devices participate in decode and need the cache filled.
         # K,V are identical across DP columns (same TP position data), so filling
-        # all devices is correct and harmless for batch>1 (unused data is never read).
-        k_fill = k_8b
-        v_fill = v_8b
+        # all devices directly is correct and avoids device-mapping issues.
+        tg_batch_sliced = self.TG and self.max_batch_size > self.batch_size_per_device_group
+        if self.TG and tg_batch_sliced:
+            k_fill = self._prefill_prepare_tensor_for_kv_cache(k_8b, user_id)
+            v_fill = self._prefill_prepare_tensor_for_kv_cache(v_8b, user_id)
+        else:
+            k_fill = k_8b
+            v_fill = v_8b
 
         fill_page_table = chunk_page_table if chunk_page_table is not None else page_table
         if fill_page_table is not None:
@@ -979,13 +924,13 @@ class Glm4MoeAttention(LightweightModule):
 
         _sync("after O projection")
 
-        # 10. All-reduce on cluster_axis=0 (TP reduction for row-parallel O projection)
+        # 10. All-reduce on TP axis (TP reduction for row-parallel O projection)
         # NOTE: Prefill runs outside trace — do NOT pass ccl to avoid async CCL ops
         # conflicting with the existing captured trace's semaphore state.
         output = _simple_all_reduce(
             output,
             self.mesh_device,
-            cluster_axis=0,
+            cluster_axis=self.tp_axis,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
 
@@ -1025,9 +970,18 @@ class Glm4MoeAttention(LightweightModule):
             )
 
     def _prefill_prepare_tensor_for_kv_cache(self, key_or_value_layer, user_id):
-        """For TG: select tensors from the correct column chips for KV cache fill."""
+        """For TG: select tensors from the correct TP group for KV cache fill."""
         tensor_copy = ttnn.clone(key_or_value_layer)
         tensors = ttnn.get_device_tensors(tensor_copy)
-        single_column_tensors = tensors[user_id // self.batch_size_per_device_group :: 4]
-        multi_device_tensor = ttnn.combine_device_tensors(tensors=single_column_tensors)
+        dp_group = user_id // self.batch_size_per_device_group
+        if self.tp_axis == 1:  # TP on columns (BH Galaxy): TP group = contiguous block
+            start = dp_group * self.num_devices_per_group
+            tp_group_tensors = tensors[start : start + self.num_devices_per_group]
+            logger.info("[DBG KV_FILL] tp_axis=1, user_id={}, dp_group={}, start={}, num_devs={}, selected={}/{}",
+                        user_id, dp_group, start, self.num_devices_per_group, len(tp_group_tensors), len(tensors))
+        else:  # TP on rows (WH Galaxy): TP group = strided
+            tp_group_tensors = tensors[dp_group :: self.num_device_groups]
+            logger.info("[DBG KV_FILL] tp_axis=0, user_id={}, dp_group={}, stride={}, selected={}/{}",
+                        user_id, dp_group, self.num_device_groups, len(tp_group_tensors), len(tensors))
+        multi_device_tensor = ttnn.combine_device_tensors(tensors=tp_group_tensors)
         return multi_device_tensor

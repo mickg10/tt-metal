@@ -202,8 +202,31 @@ class CCL:
         # Merge static config with runtime CCL parameters
         return {**ccl_config, **ccl_params}
 
+    def reset_global_semaphores(self):
+        """Reset ALL device-side GlobalSemaphore values to 0.
+
+        Must be called before each trace capture and trace replay to prevent
+        stale semaphore values from causing CCL race conditions.
+        """
+        for axis_sems in self.gather_sems:
+            for sems in axis_sems:
+                for sem in sems:
+                    ttnn.reset_global_semaphore_value(sem, 0)
+        for axis_sems in self.reduce_scatter_sems:
+            for sems in axis_sems:
+                for sem in sems:
+                    ttnn.reset_global_semaphore_value(sem, 0)
+        for axis_sems in self.barrier_sems:
+            for sem in axis_sems:
+                ttnn.reset_global_semaphore_value(sem, 0)
+
     def reset_sem_counters(self):
         """Reset the semaphore counters for all axes."""
         self.gather_sem_cnt = [0 for _ in range(self.num_axes)]
         self.reduce_scatter_sem_cnt = [0 for _ in range(self.num_axes)]
         self.barrier_sem_cnt = [0 for _ in range(self.num_axes)]
+        # NOTE: Do NOT reset device-side GlobalSemaphore values here.
+        # CCL kernels self-clean (reset to 0) at end of each op.
+        # Calling reset_global_semaphore_value() injects CQ commands that
+        # desynchronize async CCL semaphores during trace replay.
+        # See: kv-cache-quality-investigation.md Session 11

@@ -44,6 +44,12 @@ def resolve_best_effort_snapshot_dir(model_id: str, *, hint_dir: Optional[Path] 
         if (hint_dir / "model.safetensors.index.json").is_file() and snapshot_has_safetensors_weights(hint_dir):
             return hint_dir
 
+    # If model_id is a local path with weights, use it directly
+    local_path = Path(model_id)
+    if local_path.is_dir() and (local_path / "model.safetensors.index.json").is_file() and snapshot_has_safetensors_weights(local_path):
+        logger.info("Using local model directory as snapshot dir: {}", str(local_path))
+        return local_path
+
     repo_dir = model_repo_cache_dir(model_id)
     snapshots_dir = repo_dir / "snapshots"
     if not snapshots_dir.is_dir():
