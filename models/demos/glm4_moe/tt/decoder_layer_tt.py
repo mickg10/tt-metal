@@ -350,8 +350,16 @@ class Glm4MoeDecoderLayer:
 
         _dlsync("before rms_norm")
 
-        # ---- Pre-attention norm (sharded to avoid L1 overflow with hidden=5120) ----
-        h = _sharded_rms_norm(x, w.input_layernorm, hparams.hidden_size)
+        # ---- Pre-attention norm ----
+        # Prefill: use DRAM-interleaved RMSNorm (no L1 constraint at any seq_len).
+        # Sharded RMSNorm overflows L1 at seq>256 with hidden=5120.
+        # DRAM norm is ~0.2ms per call — negligible vs matmuls.
+        h = ttnn.rms_norm(
+            x,
+            epsilon=w.input_layernorm.eps,
+            weight=w.input_layernorm.weight,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
 
         _dlsync("after rms_norm, before attention")
 
@@ -366,9 +374,14 @@ class Glm4MoeDecoderLayer:
 
         _dlsync("after attention + residual")
 
-        # ---- Pre-MLP norm (sharded to avoid L1 overflow with hidden=5120) ----
+        # ---- Pre-MLP norm ----
         residual = x
-        h = _sharded_rms_norm(x, w.post_attention_layernorm, hparams.hidden_size)
+        h = ttnn.rms_norm(
+            x,
+            epsilon=w.post_attention_layernorm.eps,
+            weight=w.post_attention_layernorm.weight,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
 
         _dlsync("after post_attn_norm, before MLP")
 

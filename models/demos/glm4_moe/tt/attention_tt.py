@@ -841,11 +841,17 @@ class Glm4MoeAttention(LightweightModule):
         ttnn.deallocate(v)
 
         # For TG with multi-user batch split across DP groups, select the correct
-        # column's tensors for KV cache fill. But for batch=1 (tg_batch_sliced=False),
-        # ALL 32 devices participate in decode and need the cache filled.
-        # K,V are identical across DP columns (same TP position data), so filling
-        # all devices directly is correct and avoids device-mapping issues.
-        tg_batch_sliced = self.TG and self.max_batch_size > self.batch_size_per_device_group
+        # TP group's tensors for KV cache fill. But for single-user prefill (the common
+        # case during decode warmup), ALL 32 devices participate in decode and need the
+        # cache filled. We must check the ACTUAL active user count, not max_batch_size,
+        # because max_batch_size=32 would always trigger DP-sliced fill even for bs=1.
+        #
+        # FIX (Session 18): Changed from `self.max_batch_size > self.batch_size_per_device_group`
+        # to checking actual concurrent users. Prefill is called per-user, so we always
+        # fill all devices. The DP-sliced path is only needed when multiple users are
+        # prefilled concurrently AND the batch is split across DP groups (future batched prefill).
+        # For now, always fill all devices — decode reads from ALL 32 devices regardless.
+        tg_batch_sliced = False  # Always fill all devices; DP-sliced fill causes decode garbling
         if self.TG and tg_batch_sliced:
             k_fill = self._prefill_prepare_tensor_for_kv_cache(k_8b, user_id)
             v_fill = self._prefill_prepare_tensor_for_kv_cache(v_8b, user_id)
