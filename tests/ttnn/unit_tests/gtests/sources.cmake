@@ -11,6 +11,10 @@ set(UNIT_TESTS_TTNN_SMOKE_SOURCES
     test_multiprod_queue.cpp
 )
 
+set(UNIT_TESTS_TTNN_PAGED_CACHE_SOURCES
+    test_paged_update_cache_bh.cpp
+)
+
 set(UNIT_TESTS_TTNN_BASIC_SOURCES
     test_add.cpp
     test_add_int.cpp

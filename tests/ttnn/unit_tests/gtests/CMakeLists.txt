@@ -61,6 +61,15 @@ target_link_libraries(
         TTNN::Test::Basic
 )
 
+# unit_tests_ttnn_paged_cache (BH Galaxy paged_update_cache bug regression)
+add_library(unit_tests_ttnn_paged_cache_lib OBJECT)
+target_sources(unit_tests_ttnn_paged_cache_lib PRIVATE ${UNIT_TESTS_TTNN_PAGED_CACHE_SOURCES})
+target_include_directories(unit_tests_ttnn_paged_cache_lib PRIVATE ${PROJECT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(unit_tests_ttnn_paged_cache_lib PRIVATE test_common_libs TTNN::CPP)
+target_precompile_headers(unit_tests_ttnn_paged_cache_lib REUSE_FROM TTNN::PCH)
+add_executable(unit_tests_ttnn_paged_cache)
+target_link_libraries(unit_tests_ttnn_paged_cache PRIVATE unit_tests_ttnn_paged_cache_lib)
+
 # unit_tests_ttnn_ccl
 
 add_library(unit_tests_ttnn_ccl_lib OBJECT)
