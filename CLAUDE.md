@@ -149,3 +149,40 @@ When starting containers, use `docker compose up -d` (creates fresh) not `docker
   with `num_links=rt.num_links, topology=rt.topology`. The standard `ttnn.reduce_scatter` produces
   GARBLED OUTPUT on BH Galaxy. Do NOT switch to the standard API.
 - **warmup_batch**: Keep at 1 until batch>1 is verified. `max_batch_size` warmup crashes devices.
+- **sems_per_axis**: MUST be 4 (not 2) in `ccl.py`. EP reduce adds extra all_reduce ops per MoE layer; sems_per_axis=2 causes semaphore reuse corruption in trace replay.
+- **EP reduce config**: Use `FUSE_SHARED_EP_REDUCE=1, EP_REDUCE_DEVICE=1` for traced decode. Host-side reduce (DEVICE=0) crashes trace capture. Non-fused path (FUSE=0) needs BOTH TP+DP axis reduces for routed experts.
+- **moe_expert_token_remap**: Program factory must set dummy runtime args for ALL cores (not just utilized cores). Without this, unused cores crash with "runtime arg index out of bounds" on BH.
+
+## MANDATORY: Run Validation After ANY Code Change
+
+**After ANY code change, container restart, config change, or model switch, run the validation harness.**
+
+```bash
+# From any machine with access to the vLLM endpoint:
+cd /home/ttuser/src_docker/plan/_testing
+
+# Quick smoke test (infra + basic generation):
+python validate.py 0 1 --url http://localhost:8088/v1 --model /home/mick/models/GLM-4.7-FP8
+
+# Full validation (all 6 stages):
+python validate.py all --url http://localhost:8088/v1 --model /home/mick/models/GLM-4.7-FP8
+
+# Agentic code generation (8 algorithm problems):
+python solve.py all --url http://localhost:8088/v1
+
+# Capture full session traces (for replay/regression):
+python capture_proxy.py --port 9088 --backend http://localhost:8088
+# Then point clients at :9088 — all requests/responses logged to JSONL
+```
+
+**Stages**: 0=Infrastructure, 1=Basic Generation, 2=Reasoning, 3=Code Gen, 4=Agentic, 5=Performance
+
+**Results**: Written to `plan/_testing/results/<model>_<timestamp>.jsonl` — review for quality.
+
+**Rules**:
+- Run at least stages 0+1 after every code change (2 min)
+- Run stages 0-3 after fixing any decode/MoE/attention bug (10 min)
+- Run `solve.py all` after any change that could affect longer context or tool use
+- Run stage 5 after any performance optimization
+- Save results JSONL for regression tracking
+- The capture_proxy.py JSONL traces can be replayed for regression testing
