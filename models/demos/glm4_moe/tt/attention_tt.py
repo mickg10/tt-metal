@@ -535,18 +535,6 @@ class Glm4MoeAttention(LightweightModule):
         # Column-parallel QKV: each device has its own output slice, no all-reduce needed.
         xqkv = ttnn.to_memory_config(xqkv, ttnn.DRAM_MEMORY_CONFIG)
 
-        # DEBUG: dump QKV output magnitude
-        import sys as _dbg_sys4
-        if os.environ.get("GLM4_MOE_DEBUG_DECODE", "0") != "0" and self.mesh_device.__class__.__name__ == "MeshDevice":
-            _qkv_devs = ttnn.get_device_tensors(xqkv)
-            _qkv0 = ttnn.to_torch(_qkv_devs[0].cpu())
-            print(f"  [DBG QKV] d0 shape={list(_qkv0.shape)}, abs_max={_qkv0.abs().max().item():.4f}, "
-                  f"d0[:8]={_qkv0[0,0,0,:8].float().tolist()}", flush=True, file=_dbg_sys4.stderr)
-            _wqkv_devs = ttnn.get_device_tensors(self.wqkv)
-            _wqkv0 = ttnn.to_torch(_wqkv_devs[0].cpu())
-            print(f"  [DBG W_QKV] d0 shape={list(_wqkv0.shape)}, abs_max={_wqkv0.abs().max().item():.4f}, "
-                  f"abs_mean={_wqkv0.abs().float().mean().item():.6f}", flush=True, file=_dbg_sys4.stderr)
-
         # Use caller-provided active_batch (reliable) instead of x.shape[-2] which
         # can be inflated to 32 by tile-padding in ttnn.add / sharded_to_interleaved.
         if active_batch is None:
@@ -611,6 +599,7 @@ class Glm4MoeAttention(LightweightModule):
         # Convert back to HEIGHT_SHARDED for paged_update_cache and SDPA
         # (partial RoPE returns DRAM interleaved after concat)
         _shard_cfgs = self._get_shard_cfgs(logical_batch_after_slice)
+
         q = ttnn.interleaved_to_sharded(q, _shard_cfgs["q"])
         k = ttnn.interleaved_to_sharded(k, _shard_cfgs["k"])
 
@@ -624,10 +613,11 @@ class Glm4MoeAttention(LightweightModule):
         ttnn.experimental.paged_update_cache(
             values, v, update_idxs_tensor=current_pos, page_table=page_table
         )
+
         ttnn.deallocate(k)
         ttnn.deallocate(v)
 
-        # 7. SDPA (paged) — limit to 64 cores for Galaxy Wormhole tree reduction
+        # 7. SDPA (paged)
         attn_output = ttnn.transformer.paged_scaled_dot_product_attention_decode(
             q,
             keys,
@@ -639,6 +629,7 @@ class Glm4MoeAttention(LightweightModule):
             compute_kernel_config=self.sdpa_compute_kernel_config,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
+
         ttnn.deallocate(q)
 
         # 8. Concat heads (requires HEIGHT_SHARDED input)
@@ -678,19 +669,6 @@ class Glm4MoeAttention(LightweightModule):
             )
             attn_output = ttnn.reshape(attn_output, (1, 1, active_batch, attn_shape[-1]))
 
-        # DEBUG: dump attn_output (SDPA result after concat_heads) and O proj weight magnitude
-        import sys as _dbg_sys3
-        _dbg_attn2 = os.environ.get("GLM4_MOE_DEBUG_DECODE", "0") != "0"
-        if _dbg_attn2 and self.mesh_device.__class__.__name__ == "MeshDevice":
-            _ao_devs = ttnn.get_device_tensors(attn_output)
-            _ao0 = ttnn.to_torch(_ao_devs[0].cpu())
-            _wo_devs = ttnn.get_device_tensors(self.wo)
-            _wo0 = ttnn.to_torch(_wo_devs[0].cpu())
-            print(f"  [DBG ATTN-OUT] d0 shape={list(_ao0.shape)}, abs_max={_ao0.abs().max().item():.4f}, "
-                  f"d0[:8]={_ao0[0,0,0,:8].float().tolist()}", flush=True, file=_dbg_sys3.stderr)
-            print(f"  [DBG W_O] d0 shape={list(_wo0.shape)}, abs_max={_wo0.abs().max().item():.4f}, "
-                  f"abs_mean={_wo0.abs().float().mean().item():.6f}", flush=True, file=_dbg_sys3.stderr)
-
         # 10. Output projection (BF16 output for precision through 92 layers)
         dense_out = ttnn.matmul(
             attn_output,
@@ -702,24 +680,6 @@ class Glm4MoeAttention(LightweightModule):
         )
         ttnn.deallocate(attn_output)
 
-        # DEBUG: force synchronize to isolate if compute pipeline or reduce hangs
-        import os as _os
-        if _os.environ.get("GLM4_MOE_DEBUG_SYNC", "0") != "0":
-            logger.info("  [DEBUG] synchronizing before all_reduce, dense_out.shape=%s", list(dense_out.shape))
-            ttnn.synchronize_device(self.mesh_device)
-            logger.info("  [DEBUG] synchronize complete, proceeding to all_reduce")
-
-        # DEBUG: dump pre-reduce hidden states per TP device
-        import sys as _dbg_sys2
-        _dbg_attn = os.environ.get("GLM4_MOE_DEBUG_DECODE", "0") != "0"
-        if _dbg_attn and self.mesh_device.__class__.__name__ == "MeshDevice":
-            _pre_devs = ttnn.get_device_tensors(dense_out)
-            _pre0 = ttnn.to_torch(_pre_devs[0].cpu())
-            _pre1 = ttnn.to_torch(_pre_devs[1].cpu())
-            print(f"  [DBG ATTN PRE-REDUCE] d0[:8]={_pre0[0,0,0,:8].float().tolist()}", flush=True, file=_dbg_sys2.stderr)
-            print(f"  [DBG ATTN PRE-REDUCE] d1[:8]={_pre1[0,0,0,:8].float().tolist()}", flush=True, file=_dbg_sys2.stderr)
-            print(f"  [DBG ATTN PRE-REDUCE] d0-d1 max_diff={((_pre0-_pre1).abs().max().item()):.6f}", flush=True, file=_dbg_sys2.stderr)
-
         # 11. All-reduce on TP axis (TP reduction for row-parallel O projection)
         dense_out = _simple_all_reduce(
             dense_out,
@@ -728,18 +688,6 @@ class Glm4MoeAttention(LightweightModule):
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             ccl=self.tt_ccl,
         )
-
-        # DEBUG: dump post-reduce hidden states
-        if _dbg_attn and self.mesh_device.__class__.__name__ == "MeshDevice":
-            _post_devs = ttnn.get_device_tensors(dense_out)
-            _post0 = ttnn.to_torch(_post_devs[0].cpu())
-            _post1 = ttnn.to_torch(_post_devs[1].cpu())
-            _post4 = ttnn.to_torch(_post_devs[4].cpu()) if len(_post_devs) > 4 else None
-            print(f"  [DBG ATTN POST-REDUCE] d0[:8]={_post0[0,0,0,:8].float().tolist()}", flush=True, file=_dbg_sys2.stderr)
-            print(f"  [DBG ATTN POST-REDUCE] d1[:8]={_post1[0,0,0,:8].float().tolist()}", flush=True, file=_dbg_sys2.stderr)
-            diff_01 = (_post0-_post1).abs().max().item()
-            diff_04 = (_post0-_post4).abs().max().item() if _post4 is not None else -1
-            print(f"  [DBG ATTN POST-REDUCE] d0-d1 max_diff={diff_01:.6f}, d0-d4 max_diff={diff_04:.6f}", flush=True, file=_dbg_sys2.stderr)
 
         return dense_out
 

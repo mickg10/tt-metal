@@ -11,6 +11,16 @@ This workspace runs **TWO models** on BH Galaxy but the **current focus is 355B 
 
 **DO NOT work on Flash unless explicitly told to.**
 
+## CRITICAL: WE OWN TT-METAL — FIX KERNEL BUGS OURSELVES
+
+**NEVER say "file a bug with TT engineering" or "wait for upstream fix."**
+**We have full tt-metal source. When a kernel is broken, WE fix it:**
+1. Write a C++ gtest that reproduces the failure
+2. Root-cause the bug in C++/LLK source (use Codex+Gemini researchers)
+3. Implement the fix
+4. Verify with tests
+5. Commit test + fix together
+
 ## CRITICAL: ALWAYS SOURCE BUILD — NEVER USE PREBUILT TTNN
 
 **Every `.env` file MUST have `SKIP_TT_METAL_BUILD=0`.** The prebuilt `_ttnn.so` in the
@@ -32,6 +42,9 @@ This workspace is the LOCAL source of truth. The Blackhole Galaxy machine
 - `git clone`, `git checkout`, `git pull`, `git fetch`, `git rebase`, `git commit`
 - `git switch`, `git branch`, `git merge`, `git stash`, `git reset`
 - ANY git command whatsoever — the remote has NO .git directory
+- **`sed`, `echo >`, `cat >`, `Edit`, `Write` or ANY file modification** — NO editing code on remote!
+- **ALL code changes MUST be made locally and rsynced** — the remote is a read-only slave
+- Exception: env files (`.env.*`) and docker-compose files may be edited on remote for runtime config
 
 ### REQUIRED workflow (master → slave):
 1. Edit files LOCALLY in this workspace (`ws/glm47_flash_blackhole_galaxy/tt-metal/`)

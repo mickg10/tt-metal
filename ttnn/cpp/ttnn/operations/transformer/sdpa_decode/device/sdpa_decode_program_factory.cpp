@@ -404,7 +404,11 @@ SdpaDecodeProgramFactory::cached_program_t SdpaDecodeProgramFactory::create(
     // ========== Tile Configurations ==========
     const auto half_tile = tt::tt_metal::Tile({16, 32});
     const auto full_tile = tt::tt_metal::Tile({32, 32});
-    const bool use_half_tile = is_causal && num_q_heads <= 16 && q_df == tt::DataFormat::Float16_b;
+    // NOTE: Disabled on Blackhole due to DRAM-to-L1 alignment issues with tiny (16x32) tiles.
+    // On BH, consecutive tiny tiles in a CB are not 64-byte aligned (e.g. 544-byte bfp8 tiles),
+    // causing data corruption. See matmul workarounds for details. Issue #27193.
+    const bool use_half_tile = is_causal && num_q_heads <= 16 && q_df == tt::DataFormat::Float16_b
+                               && device->arch() != tt::ARCH::BLACKHOLE;
     const auto q_tile = use_half_tile ? half_tile : full_tile;
     const auto k_tile = full_tile;
     const auto v_tile = full_tile;

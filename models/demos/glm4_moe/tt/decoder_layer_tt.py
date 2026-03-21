@@ -581,17 +581,31 @@ class Glm4MoeDecoderLayer:
                     memory_config=ttnn.DRAM_MEMORY_CONFIG,
                     ccl=self.tt_ccl,
                 )
-            # EP reduce for routed experts: DP-axis all_reduce to reconstruct
-            # from the reduce_scatter done in MoE STEP 7.
-            # After reduce_scatter(axis=dp_ax, dim=3), each device still holds [1,1,T,H]
-            # as a PARTIAL sum. Need all_reduce (sum) on DP axis to get the full result.
-            # DO NOT include TP axis — data is identical across TP columns after
-            # all_to_all_combine, so TP-axis all_reduce would multiply by TP.
+            # EP reduce for routed experts: need BOTH TP-axis and DP-axis all_reduce.
+            # After reduce_scatter(axis=dp_ax, dim=3) + sparse matmul, each device holds
+            # a PARTIAL sum. The sparse path does NOT replicate across TP columns (unlike
+            # the fused path), so we need TP-axis reduce to sum partials across TP devices,
+            # then DP-axis reduce to reconstruct from the reduce_scatter.
             _ep_reduce_device2 = _env_bool("GLM4_MOE_EP_REDUCE_DEVICE", default=False)
             if device.__class__.__name__ == "MeshDevice":
                 mesh_shape3 = _get_mesh_shape(device)
-                logger.info("[DBG] DL{} EP reduce (separate routed): ep_reduce_device={}, dp_ax={}, dp_size={}",
-                            self.layer_idx, _ep_reduce_device2, dp_ax, mesh_shape3[dp_ax])
+                logger.info("[DBG] DL{} EP reduce (separate routed): ep_reduce_device={}, tp_ax={}, dp_ax={}, tp_size={}, dp_size={}",
+                            self.layer_idx, _ep_reduce_device2, tp_ax, dp_ax,
+                            mesh_shape3[tp_ax], mesh_shape3[dp_ax])
+                # TP-axis reduce first (sum partials across TP columns)
+                if tp_enabled and tp_axis is not None and mesh_shape3[tp_ax] > 1:
+                    if _ep_reduce_device2:
+                        routed_out_partial = _simple_all_reduce(
+                            routed_out_partial, device, cluster_axis=tp_ax,
+                            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                            ccl=self.tt_ccl,
+                        )
+                    else:
+                        routed_out_partial = _simple_all_reduce_host(
+                            routed_out_partial, device, cluster_axis=tp_ax,
+                            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                        )
+                # DP-axis reduce (reconstruct from reduce_scatter)
                 if mesh_shape3[dp_ax] > 1:
                     if _ep_reduce_device2:
                         routed_out_partial = _simple_all_reduce(

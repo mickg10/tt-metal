@@ -202,6 +202,22 @@ MoeExpertTokenRemapDeviceOperation::Multicore::create_at(
     std::vector<CoreCoord> utilized_cores = corerange_to_cores(all_cores, std::nullopt);
     TT_FATAL(utilized_cores.size() == core_page_increments.size(), "Internal error");
 
+    // Set dummy (no-op) runtime args for ALL cores first.
+    // The kernel is deployed on total_cores (full grid) but only utilized_cores get real work.
+    // Cores without runtime args would crash with "runtime arg index out of bounds".
+    // Dummy args: page_idx_start == page_idx_end == 0 → kernel does no work.
+    {
+        const std::array<uint32_t, num_reader_rt_args> dummy_reader_args = {0, 0, 0, 0, 0};
+        const std::array<uint32_t, num_writer_rt_args> dummy_writer_args = {0, 0, 0, 0, 0};
+        auto all_core_coords = corerange_to_cores(
+            CoreRangeSet(CoreRange({0, 0}, {num_cores_x - 1, num_cores_y - 1})), std::nullopt);
+        for (const auto& core : all_core_coords) {
+            tt::tt_metal::SetRuntimeArgs(program, ternary_reader_kernel_id, core, dummy_reader_args);
+            tt::tt_metal::SetRuntimeArgs(program, binary_writer_kernel_id, core, dummy_writer_args);
+        }
+    }
+
+    // Now set real runtime args for utilized cores (overwrites the dummies).
     auto cit = utilized_cores.begin();
     for (auto increment : core_page_increments) {
         page_idx_end += increment;

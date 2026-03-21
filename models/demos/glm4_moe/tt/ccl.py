@@ -30,7 +30,11 @@ class CCL:
         self.num_cores = self.grid.x * self.grid.y
         self.core_range_set = ttnn.num_cores_to_corerangeset(self.num_cores, self.grid, row_wise=True)
         self.num_axes = len(list(self.mesh_device.shape))
-        self.sems_per_axis = 2
+        # GLM-4.7 355B with EP reduce uses up to 3 all_reduce calls per layer per axis
+        # (attention TP + shared MoE TP + routed MoE TP/DP). With sems_per_axis=2,
+        # ops 1 and 3 share the same semaphore, causing trace replay corruption.
+        # Use 4 to avoid any wrap-around within a single layer.
+        self.sems_per_axis = 4
 
         self.gather_sems = []
         self.reduce_scatter_sems = []
