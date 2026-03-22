@@ -622,36 +622,56 @@ def convert_decoder_layer_weights(
         hidden = int(hparams.hidden_size)
         experts_variant = f"ep{num_devices}_e{num_experts}_v1"
 
-        w1_list: list[torch.Tensor] = []
-        w3_list: list[torch.Tensor] = []
-        w2_list: list[torch.Tensor] = []
-        for expert_id in range(num_experts):
-            w1 = _dequant_weight(state, f"model.layers.{layer_idx}.mlp.experts.{expert_id}.gate_proj.weight")
-            w3 = _dequant_weight(state, f"model.layers.{layer_idx}.mlp.experts.{expert_id}.up_proj.weight")
-            w2 = _dequant_weight(state, f"model.layers.{layer_idx}.mlp.experts.{expert_id}.down_proj.weight")
-            if tuple(w1.shape) != (moe_intermediate, hidden):
-                raise ValueError(
-                    f"Unexpected gate_proj shape for layer{layer_idx} expert{expert_id}: {tuple(w1.shape)}, "
-                    f"expected ({moe_intermediate}, {hidden})"
-                )
-            if tuple(w3.shape) != (moe_intermediate, hidden):
-                raise ValueError(
-                    f"Unexpected up_proj shape for layer{layer_idx} expert{expert_id}: {tuple(w3.shape)}, "
-                    f"expected ({moe_intermediate}, {hidden})"
-                )
-            if tuple(w2.shape) != (hidden, moe_intermediate):
-                raise ValueError(
-                    f"Unexpected down_proj shape for layer{layer_idx} expert{expert_id}: {tuple(w2.shape)}, "
-                    f"expected ({hidden}, {moe_intermediate})"
-                )
-            # Transpose to TT convention: [in, out]
-            w1_list.append(w1.transpose(-2, -1).contiguous())  # [hidden, moe_intermediate]
-            w3_list.append(w3.transpose(-2, -1).contiguous())  # [hidden, moe_intermediate]
-            w2_list.append(w2.transpose(-2, -1).contiguous())  # [moe_intermediate, hidden]
+        # Fast path: skip loading 480 expert FP8 tensors from safetensors when cache is warm.
+        # On warm cache, ttnn.as_tensor() loads from .tensorbin files directly, making the
+        # CPU-side FP8→BF16 dequant + transpose + stack completely redundant.
+        # This saves ~4-6s per layer × 89 MoE layers = ~6-9 minutes on warm cache.
+        _expert_cache_hit = False
+        if cache_dir is not None:
+            # Check if w1_experts cache file exists as proxy for all 3
+            _w1_cache = c("w1_experts", experts_variant)
+            if _w1_cache is not None:
+                _w1_path = str(_w1_cache) + f"_dtype_{experts_dtype.name}_layout_TILE.tensorbin"
+                _expert_cache_hit = os.path.isfile(_w1_path)
+            if _expert_cache_hit:
+                logger.info("  [L{}] Expert weight cache HIT — skipping {} expert loads", layer_idx, num_experts * 3)
 
-        w1_stacked = torch.stack(w1_list, dim=0)  # [96, hidden, moe_intermediate]
-        w3_stacked = torch.stack(w3_list, dim=0)  # [96, hidden, moe_intermediate]
-        w2_stacked = torch.stack(w2_list, dim=0)  # [96, moe_intermediate, hidden]
+        if _expert_cache_hit:
+            # Dummy tensors — ttnn.as_tensor will ignore these and load from cache
+            w1_stacked = torch.zeros(num_experts, hidden, moe_intermediate, dtype=torch.bfloat16)
+            w3_stacked = torch.zeros(num_experts, hidden, moe_intermediate, dtype=torch.bfloat16)
+            w2_stacked = torch.zeros(num_experts, moe_intermediate, hidden, dtype=torch.bfloat16)
+        else:
+            w1_list: list[torch.Tensor] = []
+            w3_list: list[torch.Tensor] = []
+            w2_list: list[torch.Tensor] = []
+            for expert_id in range(num_experts):
+                w1 = _dequant_weight(state, f"model.layers.{layer_idx}.mlp.experts.{expert_id}.gate_proj.weight")
+                w3 = _dequant_weight(state, f"model.layers.{layer_idx}.mlp.experts.{expert_id}.up_proj.weight")
+                w2 = _dequant_weight(state, f"model.layers.{layer_idx}.mlp.experts.{expert_id}.down_proj.weight")
+                if tuple(w1.shape) != (moe_intermediate, hidden):
+                    raise ValueError(
+                        f"Unexpected gate_proj shape for layer{layer_idx} expert{expert_id}: {tuple(w1.shape)}, "
+                        f"expected ({moe_intermediate}, {hidden})"
+                    )
+                if tuple(w3.shape) != (moe_intermediate, hidden):
+                    raise ValueError(
+                        f"Unexpected up_proj shape for layer{layer_idx} expert{expert_id}: {tuple(w3.shape)}, "
+                        f"expected ({moe_intermediate}, {hidden})"
+                    )
+                if tuple(w2.shape) != (hidden, moe_intermediate):
+                    raise ValueError(
+                        f"Unexpected down_proj shape for layer{layer_idx} expert{expert_id}: {tuple(w2.shape)}, "
+                        f"expected ({hidden}, {moe_intermediate})"
+                    )
+                # Transpose to TT convention: [in, out]
+                w1_list.append(w1.transpose(-2, -1).contiguous())  # [hidden, moe_intermediate]
+                w3_list.append(w3.transpose(-2, -1).contiguous())  # [hidden, moe_intermediate]
+                w2_list.append(w2.transpose(-2, -1).contiguous())  # [moe_intermediate, hidden]
+
+            w1_stacked = torch.stack(w1_list, dim=0)  # [num_experts, hidden, moe_intermediate]
+            w3_stacked = torch.stack(w3_list, dim=0)  # [num_experts, hidden, moe_intermediate]
+            w2_stacked = torch.stack(w2_list, dim=0)  # [num_experts, moe_intermediate, hidden]
 
         import time as _time
         _msync("after expert stacking")
