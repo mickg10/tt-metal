@@ -576,10 +576,22 @@ class Glm4MoeTT:
             return torch.zeros((0, 1, int(self.hparams.vocab_size)), dtype=torch.float32)
 
         if enable_trace and self._decode_traces_stale:
-            # Phase 1: Traces are stale from prefill. Run eager decode for
-            # the first N tokens to return results immediately, then lazily
-            # release and recapture traces in the background.
-            if self._post_prefill_eager_remaining > 0:
+            # Phase 1b: Traces survive prefill — just clear stale flag and replay.
+            # Safe because: trace buffers allocated top-down, prefill temps bottom-up
+            # (can't overlap); persistent inputs updated by _decode_trace replay path;
+            # KV cache accessed by page_table pointer (never moves).
+            # Must reset device semaphores since prefill CCL ops left them dirty.
+            _skip_recapture = os.environ.get("GLM4_MOE_SKIP_TRACE_RECAPTURE", "1") == "1"
+            if _skip_recapture:
+                logger.info("Phase 1b: traces survived prefill — reusing (no recapture)")
+                if self.tt_ccl is not None:
+                    self.tt_ccl.reset_global_semaphores()
+                    self.tt_ccl.reset_sem_counters()
+                self._decode_traces_stale = False
+                self._post_prefill_eager_remaining = 0
+                # Fall through to normal _decode_trace replay path.
+            elif self._post_prefill_eager_remaining > 0:
+                # Fallback: eager decode path (Phase 1a, gated by env var).
                 self._post_prefill_eager_remaining -= 1
                 logger.info("Post-prefill eager decode (remaining={})", self._post_prefill_eager_remaining)
                 return self._decode_eager(
