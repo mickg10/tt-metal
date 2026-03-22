@@ -224,21 +224,50 @@ class Glm4MoeForCausalLM(nn.Module):
     # -------------------------------------------------------------------
 
     def warmup_model_prefill(self, *, kv_cache, enable_trace, sampling_params=None, **kwargs):
-        """vLLM TT backend warmup hook."""
+        """vLLM TT backend warmup hook.
+
+        Run actual prefill at common seq_len buckets to pre-compile all prefill
+        programs (embedding, decoder layers, RoPE slicing, RMSNorm, lm_head).
+        Without this, the first real prefill request pays ~10-20s of program
+        compilation on top of the trace release/recapture overhead.
+        """
         self._ensure_tt_runner()
 
         num_blocks = int(self._kv_cache_shape[0]) if self._kv_cache_shape else 1
         page_table = torch.zeros((1, max(1, num_blocks)), dtype=torch.int32)
         page_table[0, 0] = 0
 
-        _ = self.decode_forward(
-            tokens=torch.zeros((1, 1), dtype=torch.int32),
-            page_table=page_table,
-            kv_cache=kv_cache,
-            start_pos=torch.zeros((1,), dtype=torch.int32),
-            enable_trace=False,
-            read_from_device=True,
-        )
+        # Prefill warmup at common sequence-length buckets.
+        # The prefill path pads to multiples of 128, so we pick representative
+        # lengths that cover the program configs users will hit.
+        warmup_lens_str = os.environ.get("GLM4_MOE_PREFILL_WARMUP_LENS", "128,256").strip()
+        warmup_lens = [int(x) for x in warmup_lens_str.split(",") if x.strip()]
+        # Cap at max_seq_len
+        warmup_lens = [min(sl, self.max_seq_len) for sl in warmup_lens if sl > 0]
+        # Deduplicate while preserving order
+        seen = set()
+        unique_lens = []
+        for sl in warmup_lens:
+            if sl not in seen:
+                seen.add(sl)
+                unique_lens.append(sl)
+        warmup_lens = unique_lens
+
+        logger.info("warmup_model_prefill: warming up prefill programs at seq_lens={}", warmup_lens)
+
+        for seq_len in warmup_lens:
+            logger.info("warmup_model_prefill: prefill warmup seq_len={}", seq_len)
+            dummy_tokens = torch.zeros((1, seq_len), dtype=torch.int32)
+            try:
+                _ = self.prefill_forward(
+                    tokens=dummy_tokens,
+                    prompt_lens=[seq_len],
+                    page_table=page_table,
+                    kv_cache=kv_cache,
+                )
+            except Exception as e:
+                logger.warning("warmup_model_prefill: prefill warmup failed at seq_len={}: {}", seq_len, e)
+        logger.info("warmup_model_prefill: prefill warmup complete")
 
     def warmup_model_decode(self, *, kv_cache, enable_trace, max_batch_size, num_blocks, **kwargs):
         """vLLM TT backend decode warmup hook.
