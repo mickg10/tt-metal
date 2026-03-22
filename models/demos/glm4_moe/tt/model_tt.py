@@ -1539,10 +1539,17 @@ class Glm4MoeTT:
         if not self._decode_trace_states:
             return
         self._decode_traces_stale = True
-        eager_count = int(os.environ.get("GLM4_MOE_EAGER_DECODE_COUNT", "1"))
+        eager_count = int(os.environ.get("GLM4_MOE_EAGER_DECODE_COUNT", "2"))
         self._post_prefill_eager_remaining = max(1, eager_count)
-        # Reset CCL semaphore counters — prefill may have advanced them.
+        # Must sync device to drain any in-flight trace replay ops before
+        # resetting semaphores. Without this, prefill CCL ops can collide
+        # with stale device-side semaphore state from the last trace replay.
+        ttnn.synchronize_device(self.device)
+        # Reset both device-side semaphore values AND Python-side counters.
+        # Prefill uses device-side CCL (MoE EP reduce, dense MLP TP reduce),
+        # so device semaphores must be clean before prefill starts.
         if self.tt_ccl is not None:
+            self.tt_ccl.reset_global_semaphores()
             self.tt_ccl.reset_sem_counters()
         logger.info("Decode traces marked stale (eager_remaining={})", self._post_prefill_eager_remaining)
 

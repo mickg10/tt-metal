@@ -883,8 +883,9 @@ class Glm4MoeAttention(LightweightModule):
         _sync("after O projection")
 
         # 10. All-reduce on TP axis (TP reduction for row-parallel O projection)
-        # NOTE: Prefill runs outside trace — do NOT pass ccl to avoid async CCL ops
-        # conflicting with the existing captured trace's semaphore state.
+        # NOTE: Prefill runs outside trace. When stale decode traces exist (Phase 1),
+        # device-side CCL semaphores conflict with trace-owned state → HANG.
+        # Must use host-side reduce for prefill when traces may be stale.
         output = _simple_all_reduce(
             output,
             self.mesh_device,
