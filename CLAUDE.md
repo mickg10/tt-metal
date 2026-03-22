@@ -155,34 +155,30 @@ When starting containers, use `docker compose up -d` (creates fresh) not `docker
 
 ## MANDATORY: Run Validation After ANY Code Change
 
-**After ANY code change, container restart, config change, or model switch, run the validation harness.**
+**After ANY code change, container restart, config change, or model switch, run `run_all.py`.**
 
 ```bash
-# From any machine with access to the vLLM endpoint:
 cd /home/ttuser/src_docker/plan/_testing
 
-# Quick smoke test (infra + basic generation):
-python validate.py 0 1 --url http://localhost:8088/v1 --model /home/mick/models/GLM-4.7-FP8
+# Quick (2 min) — after any change:
+python run_all.py --url http://localhost:8088/v1 --quick
 
-# Full validation (all 6 stages):
-python validate.py all --url http://localhost:8088/v1 --model /home/mick/models/GLM-4.7-FP8
+# Standard (10 min) — after bug fixes:
+python run_all.py --url http://localhost:8088/v1 0 1 2 3
 
-# Agentic code generation (8 algorithm problems):
-python solve.py all --url http://localhost:8088/v1
+# Full (30 min) — after major changes or new model:
+python run_all.py --url http://localhost:8088/v1
 
-# Capture full session traces (for replay/regression):
-python capture_proxy.py --port 9088 --backend http://localhost:8088
-# Then point clients at :9088 — all requests/responses logged to JSONL
+# On remote directly (no SSH tunnel needed):
+scp plan/_testing/run_all.py mick@38.97.6.6:/tmp/
+ssh -p 55212 mick@38.97.6.6 "python3 /tmp/run_all.py --url http://localhost:8088/v1 --quick"
 ```
 
-**Stages**: 0=Infrastructure, 1=Basic Generation, 2=Reasoning, 3=Code Gen, 4=Agentic, 5=Performance
-
-**Results**: Written to `plan/_testing/results/<model>_<timestamp>.jsonl` — review for quality.
+**7 stages**: 0=Infra, 1=Basic Gen, 2=Reasoning, 3=Code Gen (exec+verify), 4=Agentic (solve.py 8 problems), 5=Performance (TTFT/throughput/prefix cache), 6=Trace Replay (garble detection)
 
 **Rules**:
-- Run at least stages 0+1 after every code change (2 min)
-- Run stages 0-3 after fixing any decode/MoE/attention bug (10 min)
-- Run `solve.py all` after any change that could affect longer context or tool use
-- Run stage 5 after any performance optimization
-- Save results JSONL for regression tracking
-- The capture_proxy.py JSONL traces can be replayed for regression testing
+- `--quick` (stages 0-2) after every code change (2 min)
+- Stages 0-3 after fixing any decode/MoE/attention bug (10 min)
+- Full pipeline after major changes, new model, or context length change (30 min)
+- Stage 4 (`solve.py all`) for agentic/tool-use validation
+- All results saved to `plan/_testing/results/*.jsonl` for regression tracking
