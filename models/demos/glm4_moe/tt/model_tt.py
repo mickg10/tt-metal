@@ -315,6 +315,8 @@ class Glm4MoeTT:
     tt_ccl: Any | None
 
     _decode_trace_states: dict[int, _DecodeTraceState] = field(init=False, default_factory=dict)
+    _decode_traces_stale: bool = field(init=False, default=False)
+    _post_prefill_eager_remaining: int = field(init=False, default=0)
 
     @classmethod
     def create(
@@ -572,6 +574,27 @@ class Glm4MoeTT:
         active = int((start_pos >= 0).sum().item())
         if active <= 0:
             return torch.zeros((0, 1, int(self.hparams.vocab_size)), dtype=torch.float32)
+
+        if enable_trace and self._decode_traces_stale:
+            # Phase 1: Traces are stale from prefill. Run eager decode for
+            # the first N tokens to return results immediately, then lazily
+            # release and recapture traces in the background.
+            if self._post_prefill_eager_remaining > 0:
+                self._post_prefill_eager_remaining -= 1
+                logger.info("Post-prefill eager decode (remaining={})", self._post_prefill_eager_remaining)
+                return self._decode_eager(
+                    tokens=tokens[:active].to(torch.int32),
+                    positions=start_pos[:active].to(torch.int32),
+                    page_table=page_table[:active].to(torch.int32),
+                    kv_cache=kv_cache,
+                    sampling_params=sampling_params,
+                )
+            else:
+                # Eager decode quota exhausted — now do the expensive release+recapture.
+                logger.info("Lazy trace release+recapture (stale traces being released)")
+                self._release_all_decode_traces()
+                self._decode_traces_stale = False
+                # Fall through to normal _decode_trace which will capture fresh traces.
 
         if enable_trace:
             return self._decode_trace(
@@ -1505,6 +1528,24 @@ class Glm4MoeTT:
         )
         ttnn.copy_host_to_device_tensor(host_pt, state.page_table_tt)
 
+    def _invalidate_decode_traces(self) -> None:
+        """Mark decode traces as stale without releasing them (fast, non-blocking).
+
+        Called from prefill() instead of _release_all_decode_traces() when
+        GLM4_MOE_PRESERVE_TRACE_AFTER_PREFILL=1. The actual release+recapture
+        is deferred until after the first few eager decode steps, so the first
+        token is returned without the 10-14s trace release/recapture overhead.
+        """
+        if not self._decode_trace_states:
+            return
+        self._decode_traces_stale = True
+        eager_count = int(os.environ.get("GLM4_MOE_EAGER_DECODE_COUNT", "1"))
+        self._post_prefill_eager_remaining = max(1, eager_count)
+        # Reset CCL semaphore counters — prefill may have advanced them.
+        if self.tt_ccl is not None:
+            self.tt_ccl.reset_sem_counters()
+        logger.info("Decode traces marked stale (eager_remaining={})", self._post_prefill_eager_remaining)
+
     def _release_all_decode_traces(self) -> None:
         """Release ALL bucket decode traces and deallocate trace output tensors."""
         if not self._decode_trace_states:
@@ -1528,6 +1569,8 @@ class Glm4MoeTT:
                     except Exception:
                         pass
         self._decode_trace_states.clear()
+        self._decode_traces_stale = False
+        self._post_prefill_eager_remaining = 0
         # Reset CCL semaphore counters — decode trace replay advances counters,
         # and the next prefill's all_reduce needs them starting at 0.
         if self.tt_ccl is not None:
@@ -1573,7 +1616,16 @@ class Glm4MoeTT:
         # Prefill allocates device buffers that can overlap with trace-owned buffers,
         # producing garbled output on subsequent trace replays.
         # With synchronize_device before trace capture (line ~931), re-capture is safe.
-        self._release_all_decode_traces()  # Required: prefill buffers overlap with trace-owned buffers
+        #
+        # Phase 1 optimization: when GLM4_MOE_PRESERVE_TRACE_AFTER_PREFILL=1, skip the
+        # expensive release+synchronize and just mark traces stale. The first decode
+        # after prefill runs eagerly (no trace), then traces are lazily recaptured.
+        # This saves 10-14s on TTFT by eliminating the release/recapture blocking path.
+        _preserve = os.environ.get("GLM4_MOE_PRESERVE_TRACE_AFTER_PREFILL", "1") == "1"
+        if _preserve and self._decode_trace_states:
+            self._invalidate_decode_traces()
+        else:
+            self._release_all_decode_traces()
 
         if tokens.ndim != 2:
             raise ValueError(f"expected tokens [B,S], got {tuple(tokens.shape)}")
@@ -1616,11 +1668,11 @@ class Glm4MoeTT:
             input_padded = torch.zeros((1, padded_new_len), dtype=torch.int32)
             input_padded[0, :num_new_tokens] = new_token_ids
 
-            if num_cached > 0:
-                logger.info(
-                    "prefill user {}: prompt_len={}, num_cached={}, new_tokens={}, padded_new={}",
-                    i, prompt_len, num_cached, num_new_tokens, padded_new_len,
-                )
+            logger.info(
+                "prefill user {}: prompt_len={}, num_cached={}, new_tokens={}, padded_new={}, start_pos_raw={}",
+                i, prompt_len, num_cached, num_new_tokens, padded_new_len,
+                int(start_pos[i].item()) if start_pos is not None else "None",
+            )
 
             # Page table for this request.
             page_row = page_table[i : i + 1, :].to(torch.int32)
