@@ -222,7 +222,7 @@ class Glm4MoeLiteForCausalLM(nn.Module):
         self._kv_cache = kv_cache
         return kv_cache
 
-    def warmup_model_prefill(self, *, kv_cache, enable_trace, sampling_params):
+    def warmup_model_prefill(self, *, kv_cache, enable_trace, sampling_params=None, **kwargs):
         """vLLM TT backend warmup hook.
 
         The TT runner uses this to compile/trace common prefill paths early.
@@ -250,6 +250,28 @@ class Glm4MoeLiteForCausalLM(nn.Module):
             enable_trace=False,
             read_from_device=True,
         )
+
+    def warmup_model_decode(self, *, kv_cache, enable_trace, max_batch_size, num_blocks, **kwargs):
+        """vLLM TT backend decode warmup hook.
+
+        Exercises decode_forward at each batch size to compile/trace decode paths.
+        """
+        self._ensure_tt_runner()
+
+        page_table = torch.zeros((max_batch_size, max(1, num_blocks)), dtype=torch.int32)
+        tokens = torch.zeros((max_batch_size, 1), dtype=torch.int32)
+        start_pos = torch.zeros((max_batch_size,), dtype=torch.int32)
+
+        logger.info(f"Warming up decode for batch_size={max_batch_size}, enable_trace={enable_trace}")
+        _ = self.decode_forward(
+            tokens=tokens,
+            page_table=page_table,
+            kv_cache=kv_cache,
+            start_pos=start_pos,
+            enable_trace=enable_trace,
+            read_from_device=True,
+        )
+        logger.info(f"Decode warmup completed for batch_size={max_batch_size}")
 
     def prefill_forward(self, *args, **kwargs):
         # Required kwargs used by TTModelRunner:
