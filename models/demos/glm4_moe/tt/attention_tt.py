@@ -826,11 +826,15 @@ class Glm4MoeAttention(LightweightModule):
         ttnn.deallocate(q)
 
         if chunk_start_idx is not None:
+            # For chunked/prefix-cached SDPA, use the FULL page table (not chunk_page_table)
+            # because the SDPA op needs to read all K/V entries from position 0 through
+            # position chunk_start_idx + Q_len. chunk_page_table only covers NEW pages
+            # and is used for KV cache filling above.
             attn_output = ttnn.transformer.chunked_scaled_dot_product_attention(
                 input_tensor_q=q_8b,
                 input_tensor_k=keys,
                 input_tensor_v=values,
-                page_table_tensor=fill_page_table,
+                page_table_tensor=page_table,
                 chunk_start_idx=chunk_start_idx,
             )
         else:

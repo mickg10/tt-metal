@@ -38,7 +38,7 @@ class Glm4MoeForCausalLM(nn.Module):
     KV cache: separate K and V, dtype BF8, paged.
     """
 
-    model_capabilities = {"supports_prefix_caching": False}
+    model_capabilities = {"supports_prefix_caching": True}
 
     def __init__(
         self,
@@ -308,10 +308,12 @@ class Glm4MoeForCausalLM(nn.Module):
         if all(int(x) == 0 for x in prompt_lens):
             return torch.zeros((batch, 1, vocab), dtype=torch.float32)
 
+        # Prefix caching: start_pos[i] tells us how many tokens are already
+        # cached in the KV cache for request i. We skip those during prefill.
         if start_pos is not None:
             start_pos_t = torch.as_tensor(start_pos, dtype=torch.int32) if not isinstance(start_pos, torch.Tensor) else start_pos.to(torch.int32)
-            if (start_pos_t != 0).any():
-                raise ValueError(f"Prefix caching not supported; got non-zero start_pos: {start_pos_t.tolist()}")
+        else:
+            start_pos_t = torch.zeros(batch, dtype=torch.int32)
 
         self._ensure_tt_runner()
 
@@ -320,6 +322,7 @@ class Glm4MoeForCausalLM(nn.Module):
             prompt_lens=prompt_lens,
             page_table=page_table,
             kv_cache=kv_cache,
+            start_pos=start_pos_t,
         )
 
     # -------------------------------------------------------------------

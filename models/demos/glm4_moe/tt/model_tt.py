@@ -1546,6 +1546,7 @@ class Glm4MoeTT:
         prompt_lens: list[int],
         page_table: torch.Tensor,
         kv_cache: list,
+        start_pos: torch.Tensor | None = None,
         seq_pad_multiple: int = 128,
     ) -> torch.Tensor:
         """Compute logits for the last prompt token for each request and fill KV caches.
@@ -1553,11 +1554,16 @@ class Glm4MoeTT:
         Processes each request independently (B loop). For long prompts (>16K tokens),
         uses chunked prefill to avoid activation memory OOM.
 
+        Supports prefix caching: when start_pos[i] > 0, the first start_pos[i] tokens
+        are already in the KV cache. We skip embedding/processing those tokens and
+        offset RoPE positions accordingly.
+
         Args:
             tokens: [B, S] int32
             prompt_lens: length B, actual prompt lengths
             page_table: [B, W] int32
             kv_cache: list of [cache_k, cache_v] per layer
+            start_pos: [B] int32, number of cached tokens per request (0 = no caching)
             seq_pad_multiple: pad prompt lengths to this multiple
 
         Returns:
@@ -1586,6 +1592,9 @@ class Glm4MoeTT:
         # Prefill chunk size (16K tokens, matching DSv3 pattern for activation memory).
         PREFILL_CHUNK_SIZE = int(os.environ.get("GLM4_MOE_PREFILL_CHUNK_SIZE", "").strip() or "16384")
 
+        if start_pos is None:
+            start_pos = torch.zeros(int(batch), dtype=torch.int32)
+
         out_logits: list[torch.Tensor] = []
 
         for i in range(int(batch)):
@@ -1594,12 +1603,24 @@ class Glm4MoeTT:
                 out_logits.append(torch.zeros((1, vocab), dtype=torch.float32))
                 continue
 
-            padded_len = ((prompt_len + pad_multiple - 1) // pad_multiple) * pad_multiple
-            padded_len = min(padded_len, int(self.max_seq_len))
+            num_cached = int(start_pos[i].item()) if start_pos is not None else 0
+            num_cached = max(0, min(num_cached, prompt_len - 1))  # Must process at least 1 token
+            num_new_tokens = prompt_len - num_cached
 
-            prompt_ids = tokens[i, :prompt_len].to(torch.int32).cpu()
-            input_padded = torch.zeros((1, padded_len), dtype=torch.int32)
-            input_padded[0, :prompt_len] = prompt_ids
+            # Pad the NEW tokens (not the full prompt) to pad_multiple.
+            padded_new_len = ((num_new_tokens + pad_multiple - 1) // pad_multiple) * pad_multiple
+            padded_new_len = min(padded_new_len, int(self.max_seq_len) - num_cached)
+
+            # Extract only the new (uncached) tokens.
+            new_token_ids = tokens[i, num_cached:prompt_len].to(torch.int32).cpu()
+            input_padded = torch.zeros((1, padded_new_len), dtype=torch.int32)
+            input_padded[0, :num_new_tokens] = new_token_ids
+
+            if num_cached > 0:
+                logger.info(
+                    "prefill user {}: prompt_len={}, num_cached={}, new_tokens={}, padded_new={}",
+                    i, prompt_len, num_cached, num_new_tokens, padded_new_len,
+                )
 
             # Page table for this request.
             page_row = page_table[i : i + 1, :].to(torch.int32)
@@ -1612,22 +1633,17 @@ class Glm4MoeTT:
                 mesh_mapper=ttnn.ReplicateTensorToMesh(self.device) if is_mesh else None,
             )
 
-            # Slice RoPE tables.
+            # RoPE tables: offset by num_cached so positions are correct.
+            # For prefix caching, new tokens start at position num_cached.
+            rope_start = num_cached
+            rope_end = num_cached + padded_new_len
             rope_slices_owned = True
-            if (
-                int(padded_len) == int(self.rope["cos_matrix"].shape[2])
-                and int(rope_dim) == int(self.rope["cos_matrix"].shape[3])
-            ):
-                cos_matrix = self.rope["cos_matrix"]
-                sin_matrix = self.rope["sin_matrix"]
-                rope_slices_owned = False
-            else:
-                cos_matrix = ttnn.slice(
-                    self.rope["cos_matrix"], [0, 0, 0, 0], [1, 1, padded_len, rope_dim]
-                )
-                sin_matrix = ttnn.slice(
-                    self.rope["sin_matrix"], [0, 0, 0, 0], [1, 1, padded_len, rope_dim]
-                )
+            cos_matrix = ttnn.slice(
+                self.rope["cos_matrix"], [0, 0, rope_start, 0], [1, 1, rope_end, rope_dim]
+            )
+            sin_matrix = ttnn.slice(
+                self.rope["sin_matrix"], [0, 0, rope_start, 0], [1, 1, rope_end, rope_dim]
+            )
 
             # DEBUG: sync checkpoints for prefill pipeline
             _dbg = os.environ.get("GLM4_MOE_DEBUG_SYNC", "0") != "0"
@@ -1640,11 +1656,10 @@ class Glm4MoeTT:
 
             _psync("after page_table + rope_slice")
 
-            # Embedding: do host-side lookup to avoid device-side tile conversion hang on TG.
-            # ttnn.embedding with TILE_LAYOUT and ttnn.to_layout both hang on 32-device TG mesh.
-            embed_torch = self.embed_w_cpu[input_padded[0].long()]  # [padded_len, hidden]
+            # Embedding: only embed the NEW tokens (cached tokens already in KV cache).
+            embed_torch = self.embed_w_cpu[input_padded[0].long()]  # [padded_new_len, hidden]
             x = ttnn.from_torch(
-                embed_torch.unsqueeze(0).unsqueeze(0).to(torch.bfloat16),  # [1, 1, padded_len, hidden]
+                embed_torch.unsqueeze(0).unsqueeze(0).to(torch.bfloat16),  # [1, 1, padded_new_len, hidden]
                 device=self.device,
                 dtype=ttnn.bfloat16,
                 layout=ttnn.TILE_LAYOUT,
@@ -1657,13 +1672,36 @@ class Glm4MoeTT:
 
             _psync("before layer loop")
 
+            # Build chunk_page_table for the new tokens' KV cache region.
+            # chunk_start_idx is the absolute position where new tokens start in the KV cache.
+            chunk_start_idx = num_cached if num_cached > 0 else None
+            block_size = kv_cache[0][0].shape[2]  # block_size from KV cache shape
+
+            if chunk_start_idx is not None:
+                # Build chunk page table: pages covering [num_cached, num_cached + padded_new_len)
+                start_block = num_cached // block_size
+                end_block = (num_cached + padded_new_len + block_size - 1) // block_size
+                chunk_page_table_torch = page_row[:, start_block:end_block]
+                chunk_page_table_tt = ttnn.from_torch(
+                    chunk_page_table_torch.to(torch.int32),
+                    device=self.device,
+                    dtype=ttnn.int32,
+                    layout=ttnn.ROW_MAJOR_LAYOUT,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    mesh_mapper=ttnn.ReplicateTensorToMesh(self.device) if is_mesh else None,
+                )
+            else:
+                chunk_page_table_tt = None
+
             # Chunked prefill: process PREFILL_CHUNK_SIZE tokens at a time.
-            if padded_len > PREFILL_CHUNK_SIZE:
+            if padded_new_len > PREFILL_CHUNK_SIZE:
                 x = self._prefill_chunked(
-                    x=x, padded_len=padded_len, prompt_len=prompt_len,
+                    x=x, padded_len=padded_new_len, prompt_len=num_new_tokens,
                     page_table_tt=page_table_tt, kv_cache=kv_cache,
                     rot_mats=rot_mats, user_id=i,
                     chunk_size=PREFILL_CHUNK_SIZE,
+                    chunk_start_idx=chunk_start_idx,
+                    chunk_page_table_tt=chunk_page_table_tt,
                 )
             else:
                 # Single-pass prefill.
@@ -1671,11 +1709,14 @@ class Glm4MoeTT:
                     dl = self.decoder_layers[layer_idx]
                     x_next = dl.forward(
                         x, None, rot_mats, page_table_tt, kv_cache[layer_idx], mode="prefill",
+                        chunk_page_table=chunk_page_table_tt,
+                        chunk_start_idx=chunk_start_idx,
                     )
                     ttnn.deallocate(x, force=False)
                     x = x_next
 
-            x_last = ttnn.slice(x, [0, 0, prompt_len - 1, 0], [1, 1, prompt_len, hidden])
+            # Extract last token logits. num_new_tokens is relative to x (new tokens only).
+            x_last = ttnn.slice(x, [0, 0, num_new_tokens - 1, 0], [1, 1, num_new_tokens, hidden])
             ttnn.deallocate(x, force=False)
 
             x_last = _sharded_rms_norm(x_last, self.final_norm, int(self.hparams.hidden_size))
@@ -1712,6 +1753,8 @@ class Glm4MoeTT:
                 ttnn.deallocate(cos_matrix, force=False)
                 ttnn.deallocate(sin_matrix, force=False)
             ttnn.deallocate(page_table_tt, force=False)
+            if chunk_page_table_tt is not None:
+                ttnn.deallocate(chunk_page_table_tt, force=False)
 
             # Reset CCL semaphore counters after each prefill to keep state consistent.
             if self.tt_ccl is not None:
@@ -1730,14 +1773,20 @@ class Glm4MoeTT:
         rot_mats: tuple,
         user_id: int,
         chunk_size: int,
+        chunk_start_idx: int | None = None,
+        chunk_page_table_tt: ttnn.Tensor | None = None,
     ) -> ttnn.Tensor:
         """Run prefill in chunks for long sequences to avoid activation OOM.
 
         Processes chunk_size tokens at a time through all layers, writing KV cache
         incrementally. Returns the full hidden state [1,1,padded_len,hidden].
+
+        When chunk_start_idx is set (prefix caching), the absolute KV cache position
+        offset is chunk_start_idx + local chunk offset.
         """
         hidden = int(self.hparams.hidden_size)
         num_chunks = (padded_len + chunk_size - 1) // chunk_size
+        base_offset = chunk_start_idx if chunk_start_idx is not None else 0
 
         for layer_idx in range(self.num_layers_to_run):
             dl = self.decoder_layers[layer_idx]
@@ -1746,10 +1795,14 @@ class Glm4MoeTT:
             for chunk_idx in range(num_chunks):
                 start = chunk_idx * chunk_size
                 end = min(start + chunk_size, padded_len)
+                # Absolute position in the full sequence for this chunk
+                abs_chunk_start = base_offset + start if base_offset > 0 else (start if start > 0 else None)
 
                 x_chunk = ttnn.slice(x, [0, 0, start, 0], [1, 1, end, hidden])
                 x_chunk_out = dl.forward(
                     x_chunk, None, rot_mats, page_table_tt, kv_cache[layer_idx], mode="prefill",
+                    chunk_page_table=chunk_page_table_tt,
+                    chunk_start_idx=abs_chunk_start,
                 )
                 x_next_chunks.append(x_chunk_out)
                 ttnn.deallocate(x_chunk, force=False)
