@@ -591,6 +591,10 @@ class Glm4MoeTT:
             _skip_recapture = os.environ.get("GLM4_MOE_SKIP_TRACE_RECAPTURE", "1") == "1"
             if _skip_recapture:
                 logger.info("Phase 1b: traces survived prefill — reusing (no recapture)")
+                # Drain ALL in-flight prefill CCL ops BEFORE resetting semaphores.
+                # Without this sync, a prefill CCL op completing after reset
+                # leaves a dirty semaphore value → trace replay corruption.
+                ttnn.synchronize_device(self.device)
                 if self.tt_ccl is not None:
                     self.tt_ccl.reset_global_semaphores()
                     self.tt_ccl.reset_sem_counters()
