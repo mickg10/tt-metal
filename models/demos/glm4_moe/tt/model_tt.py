@@ -47,6 +47,12 @@ from models.demos.glm4_moe.tt.layer_weights import (
 )
 from models.demos.glm4_moe.tt.ccl import CCL
 from models.demos.glm4_moe.tt.moe_tt import create_moe_runtime, Glm4MoeMoERuntime
+from models.demos.glm4_moe.tt.trace_retainer import (
+    TraceRetainer,
+    set_trace_retainer,
+    clear_trace_retainer,
+    _dealloc,
+)
 from models.demos.glm4_moe.tt.tt_embedding import (
     convert_embedding_weight_to_tt,
     run_tt_embedding,
@@ -722,7 +728,7 @@ class Glm4MoeTT:
                 active_batch=active,
             )
             logger.info("[DBG] _decode_eager: after layer {} x_next.shape={}", layer_idx, list(x_next.shape))
-            ttnn.deallocate(x, force=False)
+            _dealloc(x, force=False)
             x = x_next
             if not hasattr(self, '_decode_layers_logged') or not self._decode_layers_logged:
                 if layer_idx == self.num_layers_to_run - 1:
@@ -757,12 +763,12 @@ class Glm4MoeTT:
         vocab = int(self.hparams.vocab_size)
         result = self._logits_to_host(logits_tt, active, vocab)
 
-        ttnn.deallocate(logits_tt, force=False)
-        ttnn.deallocate(x, force=False)
-        ttnn.deallocate(tt_positions, force=False)
-        ttnn.deallocate(cos_batch, force=False)
-        ttnn.deallocate(sin_batch, force=False)
-        ttnn.deallocate(page_table_tt, force=False)
+        _dealloc(logits_tt, force=False)
+        _dealloc(x, force=False)
+        _dealloc(tt_positions, force=False)
+        _dealloc(cos_batch, force=False)
+        _dealloc(sin_batch, force=False)
+        _dealloc(page_table_tt, force=False)
 
         # Reset CCL semaphore counters after eager decode.
         if self.tt_ccl is not None:
@@ -790,16 +796,16 @@ class Glm4MoeTT:
             max_out = ttnn.max(logits_rm_tight, dim=3, keepdim=True)
             if isinstance(max_out, tuple):
                 local_max_tt, next_ids_tt = max_out
-                ttnn.deallocate(local_max_tt, force=False)
+                _dealloc(local_max_tt, force=False)
             else:
                 next_ids_tt = ttnn.argmax(logits_rm_tight, dim=3, keepdim=False, use_multicore=True)
-            ttnn.deallocate(logits_rm_tight, force=False)
+            _dealloc(logits_rm_tight, force=False)
 
             next_ids_torch = _tt_to_torch_for_vllm_output(tensor=next_ids_tt, device=self.device)
             next_ids_flat = next_ids_torch.reshape(-1).to(dtype=torch.int32).cpu()
-            ttnn.deallocate(logits_rm, force=False)
-            ttnn.deallocate(logits_tt, force=False)
-            ttnn.deallocate(next_ids_tt, force=False)
+            _dealloc(logits_rm, force=False)
+            _dealloc(logits_tt, force=False)
+            _dealloc(next_ids_tt, force=False)
         else:
             # Vocab-sharded: per-device max+argmax, reduce on host.
             logits_rm = ttnn.to_layout(logits_tt, ttnn.ROW_MAJOR_LAYOUT)
@@ -841,16 +847,16 @@ class Glm4MoeTT:
                 next_ids[b] = best_global
             next_ids_flat = next_ids
 
-            ttnn.deallocate(local_max_tt, force=False)
-            ttnn.deallocate(local_argmax_tt, force=False)
-            ttnn.deallocate(logits_rm, force=False)
-            ttnn.deallocate(logits_tt, force=False)
+            _dealloc(local_max_tt, force=False)
+            _dealloc(local_argmax_tt, force=False)
+            _dealloc(logits_rm, force=False)
+            _dealloc(logits_tt, force=False)
 
-        ttnn.deallocate(x, force=False)
-        ttnn.deallocate(tt_positions, force=False)
-        ttnn.deallocate(cos_batch, force=False)
-        ttnn.deallocate(sin_batch, force=False)
-        ttnn.deallocate(page_table_tt, force=False)
+        _dealloc(x, force=False)
+        _dealloc(tt_positions, force=False)
+        _dealloc(cos_batch, force=False)
+        _dealloc(sin_batch, force=False)
+        _dealloc(page_table_tt, force=False)
 
         # Reset CCL semaphore counters after eager decode (sampling path).
         if self.tt_ccl is not None:
@@ -912,10 +918,10 @@ class Glm4MoeTT:
                 next_ids[b] = best_global
 
             # Clean up temporaries (NOT logits_tt — trace-owned)
-            ttnn.deallocate(local_max_tt, force=True)
-            ttnn.deallocate(local_argmax_tt, force=True)
-            ttnn.deallocate(logits_rm_view, force=False)
-            ttnn.deallocate(logits_rm, force=True)
+            _dealloc(local_max_tt, force=True)
+            _dealloc(local_argmax_tt, force=True)
+            _dealloc(logits_rm_view, force=False)
+            _dealloc(logits_rm, force=True)
         else:
             # Non-sharded: single argmax
             logits_rm = ttnn.to_layout(logits_tt, ttnn.ROW_MAJOR_LAYOUT)
@@ -930,10 +936,10 @@ class Glm4MoeTT:
             next_ids = _tt_to_torch_for_vllm_output(tensor=next_ids_tt, device=self.device)
             next_ids = next_ids.reshape(-1).to(dtype=torch.int32).cpu()
 
-            ttnn.deallocate(next_ids_tt, force=True)
-            ttnn.deallocate(logits_rm_tight, force=True)
-            ttnn.deallocate(logits_rm_view, force=False)
-            ttnn.deallocate(logits_rm, force=True)
+            _dealloc(next_ids_tt, force=True)
+            _dealloc(logits_rm_tight, force=True)
+            _dealloc(logits_rm_view, force=False)
+            _dealloc(logits_rm, force=True)
 
         return next_ids
 
@@ -1322,7 +1328,7 @@ class Glm4MoeTT:
                                 active_batch=active)
             # Match trace capture exactly: skip deallocation of embed_tt!
             if layer_idx > 0:
-                ttnn.deallocate(x, force=False)
+                _dealloc(x, force=False)
             x = x_next
             if layer_idx < 5 or layer_idx % 10 == 0 or layer_idx == self.num_layers_to_run - 1:
                 logger.info("  [COMPILE] Layer {}/{} ({:.1f}s)", layer_idx + 1, self.num_layers_to_run, time.time() - _t_layer)
@@ -1361,8 +1367,8 @@ class Glm4MoeTT:
             else:
                 top1_values_tt = max_out
                 top1_indices_tt = ttnn.argmax(logits_rm_tight, dim=3, keepdim=False, use_multicore=True)
-            ttnn.deallocate(logits_rm_tight, force=False)
-            ttnn.deallocate(logits_rm, force=False)
+            _dealloc(logits_rm_tight, force=False)
+            _dealloc(logits_rm, force=False)
 
         # Synchronize device to drain all async ops from compile-forward
         # before starting trace capture.
@@ -1372,8 +1378,8 @@ class Glm4MoeTT:
         logger.info("  [COMPILE] synchronize_device done ({:.1f}s)", time.time() - _t_sync)
 
         # Explicitly free compile-forward outputs.
-        ttnn.deallocate(x, force=True)
-        ttnn.deallocate(logits_tt, force=True)
+        _dealloc(x, force=True)
+        _dealloc(logits_tt, force=True)
         x = logits_tt = top1_values_tt = top1_indices_tt = None
         ttnn.synchronize_device(self.device)
 
@@ -1395,8 +1401,10 @@ class Glm4MoeTT:
         # Retain inter-layer hidden state tensors during trace capture to prevent
         # DRAM address reuse after capture. Without this, freed intermediate
         # addresses get reused by prefill, and trace replay corrupts them.
-        # Only retain the layer-to-layer x tensors (~5-6MB total), NOT intra-layer
-        # intermediates (which would OOM across 92 layers).
+        # NOTE: We only retain the layer-to-layer x tensors (~91 refs), NOT all
+        # intra-layer intermediates — retaining everything OOMs during capture.
+        # The _dealloc() calls pass through to ttnn.deallocate during capture
+        # (no active retainer), keeping DRAM pressure manageable.
         _trace_retained = []
 
         trace_id = ttnn.begin_trace_capture(self.device, cq_id=0)
@@ -1414,7 +1422,7 @@ class Glm4MoeTT:
             # Retain x instead of deallocating — keeps its DRAM address occupied
             # so the allocator cannot reuse it for prefill buffers.
             if layer_idx > 0:
-                _trace_retained.append(x)  # Retain instead of deallocate
+                _trace_retained.append(x)
             x = x_next
             if layer_idx < 3 or layer_idx % 20 == 0 or layer_idx == self.num_layers_to_run - 1:
                 logger.info("  [TRACE_CAPTURE] Layer {}/{} ({:.1f}s)", layer_idx + 1, self.num_layers_to_run, time.time() - _t_layer)
@@ -1435,8 +1443,8 @@ class Glm4MoeTT:
             else:
                 top1_values_tt = max_out
                 top1_indices_tt = ttnn.argmax(logits_rm_tight, dim=3, keepdim=False, use_multicore=True)
-            ttnn.deallocate(logits_rm_tight, force=False)
-            ttnn.deallocate(logits_rm, force=False)
+            _dealloc(logits_rm_tight, force=False)
+            _dealloc(logits_rm, force=False)
 
         ttnn.end_trace_capture(self.device, trace_id, cq_id=0)
         logger.info("Decode trace captured for batch={}, retained {} intermediates", active, len(_trace_retained))
@@ -1593,13 +1601,13 @@ class Glm4MoeTT:
             ):
                 if t is not None:
                     try:
-                        ttnn.deallocate(t, force=True)
+                        _dealloc(t, force=True)
                     except Exception:
                         pass
             # Free retained trace intermediates (dealloc was suppressed during capture)
             for t in state.retained_intermediates:
                 try:
-                    ttnn.deallocate(t, force=True)
+                    _dealloc(t, force=True)
                 except Exception:
                     pass
             state.retained_intermediates.clear()
@@ -1799,12 +1807,12 @@ class Glm4MoeTT:
                         chunk_page_table=chunk_page_table_tt,
                         chunk_start_idx=chunk_start_idx,
                     )
-                    ttnn.deallocate(x, force=False)
+                    _dealloc(x, force=False)
                     x = x_next
 
             # Extract last token logits. num_new_tokens is relative to x (new tokens only).
             x_last = ttnn.slice(x, [0, 0, num_new_tokens - 1, 0], [1, 1, num_new_tokens, hidden])
-            ttnn.deallocate(x, force=False)
+            _dealloc(x, force=False)
 
             x_last = _sharded_rms_norm(x_last, self.final_norm, int(self.hparams.hidden_size))
             logits_tt = ttnn.linear(x_last, self.lm_head_w)
@@ -1834,14 +1842,14 @@ class Glm4MoeTT:
             logits_i = logits_flat.to(dtype=torch.float32).cpu()
             out_logits.append(logits_i)
 
-            ttnn.deallocate(logits_tt, force=False)
-            ttnn.deallocate(x_last, force=False)
+            _dealloc(logits_tt, force=False)
+            _dealloc(x_last, force=False)
             if rope_slices_owned:
-                ttnn.deallocate(cos_matrix, force=False)
-                ttnn.deallocate(sin_matrix, force=False)
-            ttnn.deallocate(page_table_tt, force=False)
+                _dealloc(cos_matrix, force=False)
+                _dealloc(sin_matrix, force=False)
+            _dealloc(page_table_tt, force=False)
             if chunk_page_table_tt is not None:
-                ttnn.deallocate(chunk_page_table_tt, force=False)
+                _dealloc(chunk_page_table_tt, force=False)
 
             # Reset CCL semaphore counters after each prefill to keep state consistent.
             if self.tt_ccl is not None:
@@ -1960,14 +1968,14 @@ class Glm4MoeTT:
                     chunk_start_idx=ci["chunk_start_idx"],
                 )
                 x_next_chunks.append(x_chunk_out)
-                ttnn.deallocate(x_chunk, force=False)
+                _dealloc(x_chunk, force=False)
 
-            ttnn.deallocate(x, force=False)
+            _dealloc(x, force=False)
             if len(x_next_chunks) == 1:
                 x = x_next_chunks[0]
             else:
                 x = ttnn.concat(x_next_chunks, dim=2, memory_config=ttnn.DRAM_MEMORY_CONFIG)
                 for chunk_t in x_next_chunks:
-                    ttnn.deallocate(chunk_t, force=False)
+                    _dealloc(chunk_t, force=False)
 
         return x

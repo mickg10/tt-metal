@@ -22,6 +22,7 @@ from models.common.lightweightmodule import LightweightModule
 from models.common.rmsnorm import RMSNorm
 
 from models.demos.glm4_moe.tt.config import Glm4MoeHParams
+from models.demos.glm4_moe.tt.trace_retainer import _dealloc
 from models.demos.glm4_moe.tt.layer_weights import DecoderLayerTTWeights
 
 
@@ -61,7 +62,7 @@ def _simple_all_reduce_host(tensor, mesh_device, cluster_axis, memory_config=Non
     else:
         raise ValueError(f"cluster_axis must be 0 or 1, got {cluster_axis}")
 
-    ttnn.deallocate(tensor, force=False)
+    _dealloc(tensor, force=False)
     result = ttnn.from_torch(
         host_sum,
         device=mesh_device,
@@ -110,7 +111,7 @@ def _simple_all_reduce(tensor, mesh_device, cluster_axis, memory_config=None, cc
             memory_config=mc,
             topology=ttnn.Topology.Ring,
         )
-        ttnn.deallocate(tensor, force=False)
+        _dealloc(tensor, force=False)
 
     elif impl == "native_auto":
         # On-device all_reduce with auto topology (let system choose).
@@ -119,7 +120,7 @@ def _simple_all_reduce(tensor, mesh_device, cluster_axis, memory_config=None, cc
             cluster_axis=cluster_axis,
             memory_config=mc,
         )
-        ttnn.deallocate(tensor, force=False)
+        _dealloc(tensor, force=False)
 
     elif impl == "full_ar":
         # Single all_reduce across ALL devices (no cluster_axis).
@@ -128,7 +129,7 @@ def _simple_all_reduce(tensor, mesh_device, cluster_axis, memory_config=None, cc
             tensor,
             memory_config=mc,
         )
-        ttnn.deallocate(tensor, force=False)
+        _dealloc(tensor, force=False)
 
     elif impl == "rs_ag":
         # 2-step: reduce_scatter then all_gather along same axis.
@@ -139,14 +140,14 @@ def _simple_all_reduce(tensor, mesh_device, cluster_axis, memory_config=None, cc
             cluster_axis=cluster_axis,
             memory_config=mc,
         )
-        ttnn.deallocate(tensor, force=False)
+        _dealloc(tensor, force=False)
         result = ttnn.all_gather(
             scattered,
             dim=3,
             cluster_axis=cluster_axis,
             memory_config=mc,
         )
-        ttnn.deallocate(scattered, force=False)
+        _dealloc(scattered, force=False)
 
     elif impl == "rs_ag_async":
         # Async 2-step with CCL semaphore management (trace-compatible).
@@ -154,9 +155,9 @@ def _simple_all_reduce(tensor, mesh_device, cluster_axis, memory_config=None, cc
         if ccl is None:
             # Fallback to sync rs_ag if CCL not initialized.
             scattered = ttnn.reduce_scatter(tensor, dim=3, cluster_axis=cluster_axis, memory_config=mc)
-            ttnn.deallocate(tensor, force=False)
+            _dealloc(tensor, force=False)
             result = ttnn.all_gather(scattered, dim=3, cluster_axis=cluster_axis, memory_config=mc)
-            ttnn.deallocate(scattered, force=False)
+            _dealloc(scattered, force=False)
         else:
             rs_params = ccl.get_ccl_params_for_reduce_scatter(axis=cluster_axis)
             scattered = ttnn.experimental.reduce_scatter_minimal_async(
@@ -167,7 +168,7 @@ def _simple_all_reduce(tensor, mesh_device, cluster_axis, memory_config=None, cc
                 topology=ttnn.Topology.Linear,
                 **rs_params,
             )
-            ttnn.deallocate(tensor, force=False)
+            _dealloc(tensor, force=False)
 
             ag_params = ccl.get_ccl_params_for_all_gather(axis=cluster_axis)
             result = ttnn.experimental.all_gather_async(
@@ -178,7 +179,7 @@ def _simple_all_reduce(tensor, mesh_device, cluster_axis, memory_config=None, cc
                 topology=ttnn.Topology.Linear,
                 **ag_params,
             )
-            ttnn.deallocate(scattered, force=False)
+            _dealloc(scattered, force=False)
 
     else:
         # Default: host-side fallback (proven correct)
@@ -447,13 +448,13 @@ class Glm4MoeAttention(LightweightModule):
             ttnn.multiply(x_rot, cos),
             ttnn.multiply(rotated, sin),
         )
-        ttnn.deallocate(rotated)
+        _dealloc(rotated)
 
         # Concat back: [rotary_dim | pass_dim] = full head_dim
         x = ttnn.concat([x_rot, x_pass], dim=-1, memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
-        ttnn.deallocate(x_rot)
-        ttnn.deallocate(x_pass)
+        _dealloc(x_rot)
+        _dealloc(x_pass)
         return x
 
     def _apply_partial_rope_prefill(self, x, cos, sin, trans_mat):
@@ -486,12 +487,12 @@ class Glm4MoeAttention(LightweightModule):
             ttnn.multiply(x_rot, cos_sl),
             ttnn.multiply(rotated, sin_sl),
         )
-        ttnn.deallocate(rotated)
+        _dealloc(rotated)
 
         x = ttnn.concat([x_rot, x_pass], dim=-1, memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
-        ttnn.deallocate(x_rot)
-        ttnn.deallocate(x_pass)
+        _dealloc(x_rot)
+        _dealloc(x_pass)
         return x
 
     def forward_decode(
@@ -530,7 +531,7 @@ class Glm4MoeAttention(LightweightModule):
         # Add QKV bias
         xqkv = xqkv + self.wqkv_bias
 
-        ttnn.deallocate(x)
+        _dealloc(x)
 
         # Column-parallel QKV: each device has its own output slice, no all-reduce needed.
         xqkv = ttnn.to_memory_config(xqkv, ttnn.DRAM_MEMORY_CONFIG)
@@ -583,7 +584,7 @@ class Glm4MoeAttention(LightweightModule):
             memory_config=ttnn.L1_HEIGHT_SHARDED_MEMORY_CONFIG,
         )
 
-        ttnn.deallocate(xqkv)
+        _dealloc(xqkv)
 
         # 4. QK Norm (RMSNorm per head, dim=128)
         # RMSNorm requires interleaved input (HEIGHT_SHARDED not supported by layernorm op)
@@ -614,8 +615,8 @@ class Glm4MoeAttention(LightweightModule):
             values, v, update_idxs_tensor=current_pos, page_table=page_table
         )
 
-        ttnn.deallocate(k)
-        ttnn.deallocate(v)
+        _dealloc(k)
+        _dealloc(v)
 
         # 7. SDPA (paged)
         attn_output = ttnn.transformer.paged_scaled_dot_product_attention_decode(
@@ -630,7 +631,7 @@ class Glm4MoeAttention(LightweightModule):
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
 
-        ttnn.deallocate(q)
+        _dealloc(q)
 
         # 8. Concat heads (requires HEIGHT_SHARDED input)
         attn_output = ttnn.interleaved_to_sharded(attn_output, _shard_cfgs["q"])
@@ -678,7 +679,7 @@ class Glm4MoeAttention(LightweightModule):
             dtype=ttnn.bfloat16,
             compute_kernel_config=self.compute_kernel_config,
         )
-        ttnn.deallocate(attn_output)
+        _dealloc(attn_output)
 
         # 11. All-reduce on TP axis (TP reduction for row-parallel O projection)
         dense_out = _simple_all_reduce(
@@ -753,7 +754,7 @@ class Glm4MoeAttention(LightweightModule):
         if seq_len > self.MAX_QKV_MM_SEQ_LEN:
             xqkv = ttnn.reshape(xqkv, [1, 1, seq_len, -1])
 
-        ttnn.deallocate(x)
+        _dealloc(x)
 
         # 3. Split into Q, K, V heads (prefill)
         q, k, v = ttnn.experimental.nlp_create_qkv_heads(
@@ -765,7 +766,7 @@ class Glm4MoeAttention(LightweightModule):
         )
         # q: [1, 12, seq_len, 128], k: [1, 1, seq_len, 128], v: [1, 1, seq_len, 128]
 
-        ttnn.deallocate(xqkv)
+        _dealloc(xqkv)
         _sync("after split heads")
 
         # 4. QK Norm
@@ -784,9 +785,9 @@ class Glm4MoeAttention(LightweightModule):
         values = kv_cache[1]
 
         k_8b = ttnn.typecast(k, dtype=keys.dtype)
-        ttnn.deallocate(k)
+        _dealloc(k)
         v_8b = ttnn.typecast(v, dtype=values.dtype)
-        ttnn.deallocate(v)
+        _dealloc(v)
 
         # For TG with multi-user batch split across DP groups, select the correct
         # TP group's tensors for KV cache fill. But for single-user prefill (the common
@@ -823,7 +824,7 @@ class Glm4MoeAttention(LightweightModule):
 
         # 7. SDPA — match Q dtype to KV cache dtype (avoid BF8 precision loss for BF16 KV)
         q_8b = ttnn.typecast(q, dtype=keys.dtype)
-        ttnn.deallocate(q)
+        _dealloc(q)
 
         if chunk_start_idx is not None:
             # For chunked/prefix-cached SDPA, use the FULL page table (not chunk_page_table)
@@ -846,9 +847,9 @@ class Glm4MoeAttention(LightweightModule):
                 scale=self.scale,
             )
 
-        ttnn.deallocate(q_8b)
-        ttnn.deallocate(k_8b)
-        ttnn.deallocate(v_8b)
+        _dealloc(q_8b)
+        _dealloc(k_8b)
+        _dealloc(v_8b)
 
         _sync("after SDPA")
 
@@ -878,7 +879,7 @@ class Glm4MoeAttention(LightweightModule):
 
         if seq_len > _oproj_thresh:
             output = ttnn.reshape(output, [1, 1, seq_len, -1])
-        ttnn.deallocate(attn_output)
+        _dealloc(attn_output)
 
         _sync("after O projection")
 

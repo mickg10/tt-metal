@@ -21,6 +21,7 @@ from loguru import logger
 import ttnn
 
 from models.demos.glm4_moe.tt.config import Glm4MoeHParams
+from models.demos.glm4_moe.tt.trace_retainer import _dealloc
 from models.demos.glm4_moe.tt.layer_weights import DecoderLayerTTWeights
 from models.demos.glm4_moe.tt.moe_tt import (
     Glm4MoeMoERuntime,
@@ -111,7 +112,7 @@ def _sharded_rms_norm(x: ttnn.Tensor, norm_module: Any, hidden_size: int, num_co
         program_config=program_config,
         compute_kernel_config=norm_module.compute_kernel_config_hifi2,
     )
-    ttnn.deallocate(x_sharded, force=False)
+    _dealloc(x_sharded, force=False)
 
     # Convert back to interleaved DRAM
     result = ttnn.to_memory_config(result, ttnn.DRAM_MEMORY_CONFIG)
@@ -270,7 +271,7 @@ class Glm4MoeDecoderLayer:
         if attn_shape[-2] != x_shape[-2] and x_shape[-2] > 1:
             attn_out = ttnn.reshape(attn_out, x_shape, attn_shape)
         x = ttnn.add(x, attn_out, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        ttnn.deallocate(attn_out, force=False)
+        _dealloc(attn_out, force=False)
 
         # ---- Pre-MLP norm (sharded to avoid L1 overflow with hidden=5120) ----
         residual = x
@@ -283,7 +284,7 @@ class Glm4MoeDecoderLayer:
                 h, w.w_mlp_gate, w.w_mlp_up, w.w_mlp_down,
                 compute_kernel_config=mlp_compute_kernel_config,
             )
-            ttnn.deallocate(h, force=False)
+            _dealloc(h, force=False)
             # TP reduce for dense MLP (host-side — ttnn.all_reduce broken on TG 2D mesh).
             if tp_enabled:
                 mlp_out = _simple_all_reduce(
@@ -316,8 +317,8 @@ class Glm4MoeDecoderLayer:
         logger.info("[DBG] DL{} residual add: residual.shape={}, mlp_out.shape={}",
                     self.layer_idx, list(residual.shape), list(mlp_out.shape))
         x = ttnn.add(residual, mlp_out, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        ttnn.deallocate(mlp_out, force=False)
-        ttnn.deallocate(residual, force=False)
+        _dealloc(mlp_out, force=False)
+        _dealloc(residual, force=False)
         logger.info("[DBG] DL{} _forward_decode exit: x.shape={}", self.layer_idx, list(x.shape))
         return x
 
@@ -380,7 +381,7 @@ class Glm4MoeDecoderLayer:
 
         # ---- Residual ----
         x = ttnn.add(x, attn_out, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        ttnn.deallocate(attn_out, force=False)
+        _dealloc(attn_out, force=False)
 
         _dlsync("after attention + residual")
 
@@ -401,7 +402,7 @@ class Glm4MoeDecoderLayer:
                 h, w.w_mlp_gate, w.w_mlp_up, w.w_mlp_down,
                 compute_kernel_config=mlp_compute_kernel_config,
             )
-            ttnn.deallocate(h, force=False)
+            _dealloc(h, force=False)
             if tp_enabled:
                 mlp_out = _simple_all_reduce(
                     mlp_out, device, cluster_axis=tp_axis,
@@ -418,8 +419,8 @@ class Glm4MoeDecoderLayer:
 
         # ---- Residual (prefill path) ----
         x = ttnn.add(residual, mlp_out, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        ttnn.deallocate(mlp_out, force=False)
-        ttnn.deallocate(residual, force=False)
+        _dealloc(mlp_out, force=False)
+        _dealloc(residual, force=False)
         return x
 
     # -----------------------------------------------------------------------
@@ -446,10 +447,10 @@ class Glm4MoeDecoderLayer:
         gate = ttnn.linear(x, w_gate, **kwargs)
         up = ttnn.linear(x, w_up, **kwargs)
         x_ff = ttnn.mul(gate, up, input_tensor_a_activations=[ttnn.UnaryOpType.SILU])
-        ttnn.deallocate(gate, force=False)
-        ttnn.deallocate(up, force=False)
+        _dealloc(gate, force=False)
+        _dealloc(up, force=False)
         out = ttnn.linear(x_ff, w_down, **kwargs)
-        ttnn.deallocate(x_ff, force=False)
+        _dealloc(x_ff, force=False)
         return out
 
     # -----------------------------------------------------------------------
@@ -535,8 +536,8 @@ class Glm4MoeDecoderLayer:
 
             combined = ttnn.add(shared_out_partial, routed_out_partial,
                                 memory_config=moe_decode_mc)
-            ttnn.deallocate(shared_out_partial, force=False)
-            ttnn.deallocate(routed_out_partial, force=False)
+            _dealloc(shared_out_partial, force=False)
+            _dealloc(routed_out_partial, force=False)
 
             # EP reduce: 2-step device all_reduce or host-side fallback
             # WARNING: Fused device-side 2-step reduce is INCORRECT because shared
@@ -568,7 +569,7 @@ class Glm4MoeDecoderLayer:
                 host_sum = ttnn.to_torch(dev_tensors[0].cpu())
                 for i in range(1, len(dev_tensors)):
                     host_sum = host_sum + ttnn.to_torch(dev_tensors[i].cpu())
-                ttnn.deallocate(combined, force=False)
+                _dealloc(combined, force=False)
                 mlp_out = ttnn.from_torch(
                     host_sum,
                     device=device,
@@ -630,8 +631,8 @@ class Glm4MoeDecoderLayer:
                         )
             mlp_out = ttnn.add(shared_out_partial, routed_out_partial,
                                memory_config=moe_decode_mc)
-            ttnn.deallocate(shared_out_partial, force=False)
-            ttnn.deallocate(routed_out_partial, force=False)
+            _dealloc(shared_out_partial, force=False)
+            _dealloc(routed_out_partial, force=False)
 
         # Slice back to real token count if padded.
         if pad_tokens:
