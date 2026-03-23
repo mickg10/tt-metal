@@ -1768,11 +1768,11 @@ class Glm4MoeTT:
             if padded_new_len > PREFILL_CHUNK_SIZE:
                 x = self._prefill_chunked(
                     x=x, padded_len=padded_new_len, prompt_len=num_new_tokens,
-                    page_table_tt=page_table_tt, kv_cache=kv_cache,
+                    page_table_tt=page_table_tt, page_row=page_row,
+                    kv_cache=kv_cache,
                     rot_mats=rot_mats, user_id=i,
                     chunk_size=PREFILL_CHUNK_SIZE,
                     chunk_start_idx=chunk_start_idx,
-                    chunk_page_table_tt=chunk_page_table_tt,
                 )
             else:
                 # Single-pass prefill.
@@ -1840,17 +1840,20 @@ class Glm4MoeTT:
         padded_len: int,
         prompt_len: int,
         page_table_tt: ttnn.Tensor,
+        page_row: torch.Tensor,
         kv_cache: list,
         rot_mats: tuple,
         user_id: int,
         chunk_size: int,
         chunk_start_idx: int | None = None,
-        chunk_page_table_tt: ttnn.Tensor | None = None,
     ) -> ttnn.Tensor:
         """Run prefill in chunks for long sequences to avoid activation OOM.
 
         Processes chunk_size tokens at a time through all layers, writing KV cache
         incrementally. Returns the full hidden state [1,1,padded_len,hidden].
+
+        Pre-computes per-chunk RoPE slices, KV-fill page tables, and growing SDPA
+        page tables once before the layer loop (same for every layer).
 
         When chunk_start_idx is set (prefix caching), the absolute KV cache position
         offset is chunk_start_idx + local chunk offset.
@@ -1859,21 +1862,86 @@ class Glm4MoeTT:
         num_chunks = (padded_len + chunk_size - 1) // chunk_size
         base_offset = chunk_start_idx if chunk_start_idx is not None else 0
 
+        # Pre-compute per-chunk RoPE slices, page tables, and chunk_start_idx.
+        # These are the same for every layer, so compute once outside the layer loop.
+        rope_dim = rot_mats[0].shape[-1]
+        is_mesh = _is_mesh_device(self.device)
+
+        # Determine block_size from KV cache shape: kv_cache[0] = [keys, values],
+        # keys.shape[2] = block_size (number of positions per page/block).
+        block_size = kv_cache[0][0].shape[2]
+
+        chunk_infos = []
+        for chunk_idx in range(num_chunks):
+            start = chunk_idx * chunk_size
+            end = min(start + chunk_size, padded_len)
+
+            # Per-chunk RoPE: slice cos/sin for correct positions within the
+            # new-token range. rot_mats are already offset by num_cached in prefill().
+            cos_chunk = ttnn.slice(rot_mats[0], [0, 0, start, 0], [1, 1, end, rope_dim])
+            sin_chunk = ttnn.slice(rot_mats[1], [0, 0, start, 0], [1, 1, end, rope_dim])
+            chunk_rot_mats = (cos_chunk, sin_chunk, rot_mats[2])
+
+            # Per-chunk fill page table: the fill kernel maps input tile 0 -> page_table[0],
+            # so for chunk N starting at absolute position base_offset+start, we need
+            # page_table entries starting at (base_offset+start) // block_size.
+            abs_start = base_offset + start
+            abs_end = base_offset + end
+            start_page = abs_start // block_size
+            chunk_len = end - start
+            num_chunk_pages = chunk_len // block_size
+            chunk_page_row = page_row[:, start_page : start_page + num_chunk_pages].to(torch.int32)
+            chunk_page_table_tt = ttnn.from_torch(
+                chunk_page_row,
+                device=self.device,
+                dtype=ttnn.int32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(self.device) if is_mesh else None,
+            )
+
+            # Growing SDPA page table: SDPA needs to read all KV from position 0
+            # through abs_end-1, so pass pages covering [0, abs_end).
+            end_page = abs_end // block_size
+            sdpa_page_row = page_row[:, :end_page].to(torch.int32)
+            sdpa_page_table_tt = ttnn.from_torch(
+                sdpa_page_row,
+                device=self.device,
+                dtype=ttnn.int32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(self.device) if is_mesh else None,
+            )
+
+            # Absolute chunk start for SDPA chunked attention
+            abs_chunk_start = abs_start if abs_start > 0 else None
+
+            chunk_infos.append({
+                "start": start,
+                "end": end,
+                "rot_mats": chunk_rot_mats,
+                "chunk_page_table": chunk_page_table_tt,
+                "sdpa_page_table": sdpa_page_table_tt,
+                "chunk_start_idx": abs_chunk_start,
+            })
+
         for layer_idx in range(self.num_layers_to_run):
             dl = self.decoder_layers[layer_idx]
             x_next_chunks = []
 
             for chunk_idx in range(num_chunks):
-                start = chunk_idx * chunk_size
-                end = min(start + chunk_size, padded_len)
-                # Absolute position in the full sequence for this chunk
-                abs_chunk_start = base_offset + start if base_offset > 0 else (start if start > 0 else None)
+                ci = chunk_infos[chunk_idx]
+                start = ci["start"]
+                end = ci["end"]
 
                 x_chunk = ttnn.slice(x, [0, 0, start, 0], [1, 1, end, hidden])
+
+                # Pass chunk-specific RoPE, page tables, and start index
                 x_chunk_out = dl.forward(
-                    x_chunk, None, rot_mats, page_table_tt, kv_cache[layer_idx], mode="prefill",
-                    chunk_page_table=chunk_page_table_tt,
-                    chunk_start_idx=abs_chunk_start,
+                    x_chunk, None, ci["rot_mats"],
+                    ci["sdpa_page_table"], kv_cache[layer_idx], mode="prefill",
+                    chunk_page_table=ci["chunk_page_table"],
+                    chunk_start_idx=ci["chunk_start_idx"],
                 )
                 x_next_chunks.append(x_chunk_out)
                 ttnn.deallocate(x_chunk, force=False)

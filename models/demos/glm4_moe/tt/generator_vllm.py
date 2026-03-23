@@ -315,6 +315,11 @@ class Glm4MoeForCausalLM(nn.Module):
         else:
             start_pos_t = torch.zeros(batch, dtype=torch.int32)
 
+        logger.info(
+            "prefill_forward: batch={}, prompt_lens={}, start_pos_raw={}, start_pos_t={}, tokens.shape={}",
+            batch, prompt_lens, start_pos, start_pos_t.tolist(), tuple(tokens.shape),
+        )
+
         self._ensure_tt_runner()
 
         return self._tt_runner.prefill(
