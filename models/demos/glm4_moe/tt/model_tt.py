@@ -277,6 +277,7 @@ class _DecodeTraceState:
     top1_values_tt: ttnn.Tensor | None = None
     top1_indices_tt: ttnn.Tensor | None = None
     embed_tt: ttnn.Tensor | None = None
+    retained_intermediates: list = field(default_factory=list)  # Trace address guard
 
 
 # ---------------------------------------------------------------------------
@@ -1391,6 +1392,13 @@ class Glm4MoeTT:
         logger.info("Capturing decode trace for batch={}", active)
         if self.tt_ccl is not None:
             self.tt_ccl.reset_sem_counters()
+        # Retain inter-layer hidden state tensors during trace capture to prevent
+        # DRAM address reuse after capture. Without this, freed intermediate
+        # addresses get reused by prefill, and trace replay corrupts them.
+        # Only retain the layer-to-layer x tensors (~5-6MB total), NOT intra-layer
+        # intermediates (which would OOM across 92 layers).
+        _trace_retained = []
+
         trace_id = ttnn.begin_trace_capture(self.device, cq_id=0)
         logger.info("[DBG] _capture_decode_trace: begin_trace_capture returned trace_id={}", trace_id)
 
@@ -1403,10 +1411,10 @@ class Glm4MoeTT:
             dl = self.decoder_layers[layer_idx]
             x_next = dl.forward(x, tt_positions, rot_mats, page_table_tt, kv_cache[layer_idx], mode="decode",
                                 active_batch=active)
-            # Skip deallocate on first iteration: x IS embed_tt which must survive
-            # for copy_host_to_device_tensor during trace replay.
+            # Retain x instead of deallocating — keeps its DRAM address occupied
+            # so the allocator cannot reuse it for prefill buffers.
             if layer_idx > 0:
-                ttnn.deallocate(x, force=False)
+                _trace_retained.append(x)  # Retain instead of deallocate
             x = x_next
             if layer_idx < 3 or layer_idx % 20 == 0 or layer_idx == self.num_layers_to_run - 1:
                 logger.info("  [TRACE_CAPTURE] Layer {}/{} ({:.1f}s)", layer_idx + 1, self.num_layers_to_run, time.time() - _t_layer)
@@ -1431,7 +1439,7 @@ class Glm4MoeTT:
             ttnn.deallocate(logits_rm, force=False)
 
         ttnn.end_trace_capture(self.device, trace_id, cq_id=0)
-        logger.info("Decode trace captured for batch={}", active)
+        logger.info("Decode trace captured for batch={}, retained {} intermediates", active, len(_trace_retained))
 
         # TG mesh: logits_tt for host-side sampling; non-TG: use on-device sampling results
         use_logits_output = _is_mesh_device(self.device)
@@ -1449,6 +1457,7 @@ class Glm4MoeTT:
             top1_values_tt=top1_values_tt if not use_logits_output else None,
             top1_indices_tt=top1_indices_tt if not use_logits_output else None,
             embed_tt=embed_tt,
+            retained_intermediates=_trace_retained,
         )
 
     def _update_trace_inputs(
@@ -1580,13 +1589,20 @@ class Glm4MoeTT:
             for t in (
                 state.logits_tt, state.top1_values_tt, state.top1_indices_tt,
                 state.tokens_tt, state.positions_tt, state.cos_batch_tt,
-                state.sin_batch_tt, state.trans_matrix_tt, state.page_table_tt
+                state.sin_batch_tt, state.trans_matrix_tt, state.page_table_tt,
             ):
                 if t is not None:
                     try:
                         ttnn.deallocate(t, force=True)
                     except Exception:
                         pass
+            # Free retained trace intermediates (dealloc was suppressed during capture)
+            for t in state.retained_intermediates:
+                try:
+                    ttnn.deallocate(t, force=True)
+                except Exception:
+                    pass
+            state.retained_intermediates.clear()
         self._decode_trace_states.clear()
         self._decode_traces_stale = False
         self._post_prefill_eager_remaining = 0
