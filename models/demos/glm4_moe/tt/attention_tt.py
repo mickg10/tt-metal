@@ -31,6 +31,7 @@ import logging
 
 _REDUCE_IMPL = os.environ.get("GLM4_MOE_REDUCE_IMPL", "host").strip().lower()
 _REDUCE_IMPL_AXIS1 = os.environ.get("GLM4_MOE_REDUCE_IMPL_AXIS1", "").strip().lower()
+_PREFILL_REDUCE_IMPL = os.environ.get("GLM4_MOE_PREFILL_REDUCE_IMPL", "rs_ag").strip().lower()
 _REDUCE_LOG_ONCE = set()
 
 logger = logging.getLogger(__name__)
@@ -884,14 +885,14 @@ class Glm4MoeAttention(LightweightModule):
         _sync("after O projection")
 
         # 10. All-reduce on TP axis (TP reduction for row-parallel O projection)
-        # NOTE: Prefill runs outside trace. When stale decode traces exist (Phase 1),
-        # device-side CCL semaphores conflict with trace-owned state → HANG.
-        # Must use host-side reduce for prefill when traces may be stale.
+        # Prefill uses sync rs_ag (no semaphores) — safe with stale decode traces.
+        # Controlled by GLM4_MOE_PREFILL_REDUCE_IMPL (default: rs_ag).
         output = _simple_all_reduce(
             output,
             self.mesh_device,
             cluster_axis=self.tp_axis,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            impl=_PREFILL_REDUCE_IMPL,
         )
 
         return output

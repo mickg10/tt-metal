@@ -33,7 +33,7 @@ from models.demos.glm4_moe.tt.moe_tt import (
     _moe_sparse_tokens_multiple,
     _parse_math_fidelity,
 )
-from models.demos.glm4_moe.tt.attention_tt import Glm4MoeAttention, _simple_all_reduce, _simple_all_reduce_host
+from models.demos.glm4_moe.tt.attention_tt import Glm4MoeAttention, _simple_all_reduce, _simple_all_reduce_host, _PREFILL_REDUCE_IMPL
 
 
 # ---------------------------------------------------------------------------
@@ -407,7 +407,7 @@ class Glm4MoeDecoderLayer:
                 mlp_out = _simple_all_reduce(
                     mlp_out, device, cluster_axis=tp_axis,
                     memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                    ccl=self.tt_ccl,
+                    impl=_PREFILL_REDUCE_IMPL,
                 )
         else:
             mlp_out = self._moe_forward(
@@ -553,31 +553,29 @@ class Glm4MoeDecoderLayer:
                 mlp_out = _simple_all_reduce(
                     combined, device, cluster_axis=tp_ax,
                     memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                    ccl=self.tt_ccl,
+                    impl=_PREFILL_REDUCE_IMPL,
                 )
                 mesh_shape2 = _get_mesh_shape(device)
                 if mesh_shape2[dp_ax] > 1:
                     mlp_out = _simple_all_reduce(
                         mlp_out, device, cluster_axis=dp_ax,
                         memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                        ccl=self.tt_ccl,
+                        impl=_PREFILL_REDUCE_IMPL,
                     )
             else:
-                # Host-side 32-way sum fallback
-                _orig_dtype = combined.dtype
-                dev_tensors = ttnn.get_device_tensors(combined)
-                host_sum = ttnn.to_torch(dev_tensors[0].cpu())
-                for i in range(1, len(dev_tensors)):
-                    host_sum = host_sum + ttnn.to_torch(dev_tensors[i].cpu())
-                _dealloc(combined, force=False)
-                mlp_out = ttnn.from_torch(
-                    host_sum,
-                    device=device,
-                    dtype=_orig_dtype,
-                    layout=ttnn.TILE_LAYOUT,
+                # Fused EP reduce: 2-step device all_reduce (TP then DP)
+                mlp_out = _simple_all_reduce(
+                    combined, device, cluster_axis=tp_ax,
                     memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                    mesh_mapper=ttnn.ReplicateTensorToMesh(device),
+                    impl=_PREFILL_REDUCE_IMPL,
                 )
+                mesh_shape2b = _get_mesh_shape(device)
+                if mesh_shape2b[dp_ax] > 1:
+                    mlp_out = _simple_all_reduce(
+                        mlp_out, device, cluster_axis=dp_ax,
+                        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                        impl=_PREFILL_REDUCE_IMPL,
+                    )
         else:
             # Fallback: separate reduces (original behavior)
             from models.demos.glm4_moe.tt.layer_weights import _tp_axis_and_size
@@ -590,45 +588,32 @@ class Glm4MoeDecoderLayer:
                 shared_out_partial = _simple_all_reduce(
                     shared_out_partial, device, cluster_axis=tp_axis,
                     memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                    ccl=self.tt_ccl,
+                    impl=_PREFILL_REDUCE_IMPL,
                 )
             # EP reduce for routed experts: need BOTH TP-axis and DP-axis all_reduce.
             # After reduce_scatter(axis=dp_ax, dim=3) + sparse matmul, each device holds
             # a PARTIAL sum. The sparse path does NOT replicate across TP columns (unlike
             # the fused path), so we need TP-axis reduce to sum partials across TP devices,
             # then DP-axis reduce to reconstruct from the reduce_scatter.
-            _ep_reduce_device2 = _env_bool("GLM4_MOE_EP_REDUCE_DEVICE", default=False)
             if device.__class__.__name__ == "MeshDevice":
                 mesh_shape3 = _get_mesh_shape(device)
-                logger.info("[DBG] DL{} EP reduce (separate routed): ep_reduce_device={}, tp_ax={}, dp_ax={}, tp_size={}, dp_size={}",
-                            self.layer_idx, _ep_reduce_device2, tp_ax, dp_ax,
+                logger.info("[DBG] DL{} EP reduce (separate routed): impl={}, tp_ax={}, dp_ax={}, tp_size={}, dp_size={}",
+                            self.layer_idx, _PREFILL_REDUCE_IMPL, tp_ax, dp_ax,
                             mesh_shape3[tp_ax], mesh_shape3[dp_ax])
                 # TP-axis reduce first (sum partials across TP columns)
                 if tp_enabled and tp_axis is not None and mesh_shape3[tp_ax] > 1:
-                    if _ep_reduce_device2:
-                        routed_out_partial = _simple_all_reduce(
-                            routed_out_partial, device, cluster_axis=tp_ax,
-                            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                            ccl=self.tt_ccl,
-                        )
-                    else:
-                        routed_out_partial = _simple_all_reduce_host(
-                            routed_out_partial, device, cluster_axis=tp_ax,
-                            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                        )
+                    routed_out_partial = _simple_all_reduce(
+                        routed_out_partial, device, cluster_axis=tp_ax,
+                        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                        impl=_PREFILL_REDUCE_IMPL,
+                    )
                 # DP-axis reduce (reconstruct from reduce_scatter)
                 if mesh_shape3[dp_ax] > 1:
-                    if _ep_reduce_device2:
-                        routed_out_partial = _simple_all_reduce(
-                            routed_out_partial, device, cluster_axis=dp_ax,
-                            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                            ccl=self.tt_ccl,
-                        )
-                    else:
-                        routed_out_partial = _simple_all_reduce_host(
-                            routed_out_partial, device, cluster_axis=dp_ax,
-                            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                        )
+                    routed_out_partial = _simple_all_reduce(
+                        routed_out_partial, device, cluster_axis=dp_ax,
+                        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                        impl=_PREFILL_REDUCE_IMPL,
+                    )
             mlp_out = ttnn.add(shared_out_partial, routed_out_partial,
                                memory_config=moe_decode_mc)
             _dealloc(shared_out_partial, force=False)

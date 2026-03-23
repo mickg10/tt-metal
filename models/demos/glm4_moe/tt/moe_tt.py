@@ -573,20 +573,20 @@ def moe_sparse_experts_forward_tt(
             _dealloc(routed_out, force=False)
             routed_out = result
         elif ep_reduce == "2step":
-            from models.demos.glm4_moe.tt.attention_tt import _simple_all_reduce
+            from models.demos.glm4_moe.tt.attention_tt import _simple_all_reduce, _PREFILL_REDUCE_IMPL
             from models.demos.glm4_moe.tt.layer_weights import _tp_axis_and_size
             _tp_ax, _ = _tp_axis_and_size(device)
             _dp_ax = 1 - (_tp_ax if _tp_ax is not None else 0)
-            routed_out = _simple_all_reduce(routed_out, device, cluster_axis=_tp_ax, memory_config=memory_config)
-            routed_out = _simple_all_reduce(routed_out, device, cluster_axis=_dp_ax, memory_config=memory_config)
+            routed_out = _simple_all_reduce(routed_out, device, cluster_axis=_tp_ax, memory_config=memory_config, impl=_PREFILL_REDUCE_IMPL)
+            routed_out = _simple_all_reduce(routed_out, device, cluster_axis=_dp_ax, memory_config=memory_config, impl=_PREFILL_REDUCE_IMPL)
         else:
             # host fallback
-            from models.demos.glm4_moe.tt.attention_tt import _simple_all_reduce_host
+            from models.demos.glm4_moe.tt.attention_tt import _simple_all_reduce, _PREFILL_REDUCE_IMPL
             from models.demos.glm4_moe.tt.layer_weights import _tp_axis_and_size
             _tp_ax2, _ = _tp_axis_and_size(device)
             _dp_ax2 = 1 - (_tp_ax2 if _tp_ax2 is not None else 0)
-            routed_out = _simple_all_reduce_host(routed_out, device, cluster_axis=_tp_ax2, memory_config=memory_config)
-            routed_out = _simple_all_reduce_host(routed_out, device, cluster_axis=_dp_ax2, memory_config=memory_config)
+            routed_out = _simple_all_reduce(routed_out, device, cluster_axis=_tp_ax2, memory_config=memory_config, impl=_PREFILL_REDUCE_IMPL)
+            routed_out = _simple_all_reduce(routed_out, device, cluster_axis=_dp_ax2, memory_config=memory_config, impl=_PREFILL_REDUCE_IMPL)
 
     # Slice back to unpadded token count.
     unpadded = int(input_shape[0]) * int(input_shape[2])
