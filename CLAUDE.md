@@ -131,6 +131,33 @@ Every session MUST create a team (e.g., `glm-bh-4`) with:
 
 Delegate ALL implementation to the implementer. Read `plan/glm47_flash/_global/team-structure.md` for full rules.
 
+## BANNED: BF4 Weight Dtype on BH Galaxy for GLM-4.7
+
+**NEVER use `GLM4_MOE_EXPERTS_TT_DTYPE=bf4` on BH Galaxy.** BF4 is lossy and produces
+garbled output. This was tested and banned on GLM-4.7-Flash, and the ban extends to
+GLM-4.7-Full on BH Galaxy. Use bf8 minimum for all weight dtypes.
+
+## BANNED: BF16 KV Cache on BH Galaxy
+
+**Do NOT switch `GLM4_MOE_KV_CACHE_TT_DTYPE` to bf16.** BF16 KV cache doubles DRAM usage
+per KV entry. Keep bf8 — it works and saves DRAM.
+
+## BANNED: Guard Buffer / Dummy Tensor Approach for Trace Protection
+
+**NEVER use guard buffers, dummy tensors, or phantom Python allocations to "protect" trace
+intermediate DRAM addresses.** This approach is fundamentally broken:
+
+- The DRAM free-list uses first-fit allocation. A guard buffer lands at the WRONG address
+  if it doesn't exactly match the freed hole size (~5-6 MB).
+- 32 MB and 320 MB guard buffers were both tested — BOTH failed identically at 4K+ tokens.
+- Guard buffers are fragile, size-dependent, and give false confidence.
+
+**The correct fix is C++ Record+Re-reserve in the tt-metal allocator** (or fixing the CCL
+semaphore race). See `plan/glm47_flash/blackhole_galaxy/record-re-reserve-design.md`.
+
+Follow the C++ Work Policy in `plan/CLAUDE.md`: write test FIRST, run in Docker, fix code,
+verify on both N150 and TG mesh.
+
 ## MANDATORY: Container restart=no
 
 **NEVER use `restart: always` or `restart: unless-stopped` in docker compose.**
