@@ -656,10 +656,19 @@ class Glm4MoeAttention(LightweightModule):
 
             # Gather across DP groups (cluster_axis=1) on batch dim
             dp_axis = 1 - self.tp_axis
-            attn_output = _simple_all_gather(
-                attn_output, self.mesh_device, cluster_axis=dp_axis, dim=2,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            )
+            if self.tt_ccl is not None:
+                dp_ag_params = self.tt_ccl.get_ccl_params_for_all_gather(axis=dp_axis)
+                attn_output = ttnn.experimental.all_gather_async(
+                    attn_output, dim=2, cluster_axis=dp_axis,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    topology=ttnn.Topology.Linear,
+                    **dp_ag_params,
+                )
+            else:
+                attn_output = _simple_all_gather(
+                    attn_output, self.mesh_device, cluster_axis=dp_axis, dim=2,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                )
 
             attn_output = ttnn.to_memory_config(attn_output, ttnn.L1_MEMORY_CONFIG)
             attn_output = ttnn.matmul(

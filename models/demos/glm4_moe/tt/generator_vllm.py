@@ -277,7 +277,7 @@ class Glm4MoeForCausalLM(nn.Module):
         """
         self._ensure_tt_runner()
 
-        warmup_batch = 1  # batch>1 may crash; use 1 for diagnostic
+        warmup_batch = max_batch_size  # Full batch warmup for bs=32 support
         page_table = torch.zeros((warmup_batch, max(1, num_blocks)), dtype=torch.int32)
         page_table[:, 0] = 0
 
