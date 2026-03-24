@@ -66,6 +66,10 @@ struct MeshTraceBuffer {
     // MeshDevice
     std::shared_ptr<MeshBuffer> mesh_buffer = nullptr;
 
+    // DRAM addresses reserved to prevent trace intermediate address reuse.
+    // These are freed when the trace is released.
+    std::vector<DeviceAddr> phantom_reservations;
+
     ~MeshTraceBuffer();
 };
 

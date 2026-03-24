@@ -385,6 +385,27 @@ DeviceAddr AllocatorImpl::get_dram_deletion_high_water_mark() const {
     return dram_manager_->get_deletion_high_water_mark();
 }
 
+void AllocatorImpl::begin_dram_freed_address_tracking() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    dram_manager_->begin_freed_address_tracking();
+}
+
+std::vector<std::pair<DeviceAddr, DeviceAddr>> AllocatorImpl::end_dram_freed_address_tracking() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return dram_manager_->end_freed_address_tracking();
+}
+
+std::vector<DeviceAddr> AllocatorImpl::reserve_dram_freed_addresses(
+    const std::vector<std::pair<DeviceAddr, DeviceAddr>>& address_size_pairs) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return dram_manager_->reserve_freed_addresses(address_size_pairs);
+}
+
+void AllocatorImpl::release_dram_reserved_addresses(const std::vector<DeviceAddr>& addresses) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    dram_manager_->release_reserved_addresses(addresses);
+}
+
 void AllocatorImpl::clear() {
     std::lock_guard<std::mutex> lock(mutex_);
     dram_manager_->clear();

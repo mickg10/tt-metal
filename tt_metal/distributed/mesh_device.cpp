@@ -1172,6 +1172,13 @@ SystemMemoryManager& MeshDeviceImpl::sysmem_manager() {
 }
 
 void MeshDeviceImpl::release_mesh_trace(const MeshTraceId& trace_id) {
+    // Release phantom reservations before releasing the trace
+    auto trace_buffer = sub_device_manager_tracker_->get_active_sub_device_manager()->get_trace(trace_id);
+    if (trace_buffer && !trace_buffer->phantom_reservations.empty()) {
+        this->allocator_impl()->release_dram_reserved_addresses(trace_buffer->phantom_reservations);
+        trace_buffer->phantom_reservations.clear();
+    }
+
     TracyTTMetalReleaseMeshTrace(this->get_device_ids(), *trace_id);
 
     validate_sub_device_manager_tracker();
@@ -1207,6 +1214,7 @@ void MeshDeviceImpl::begin_mesh_trace(uint8_t cq_id, const MeshTraceId& trace_id
     auto trace_region_size = this->allocator_impl()->get_config().trace_region_size;
     if (trace_region_size == 0) {
         this->allocator_impl()->begin_dram_high_water_mark_tracking();
+        this->allocator_impl()->begin_dram_freed_address_tracking();
     }
 
     // Create an empty trace buffer here. This will get initialized in end_trace
@@ -1242,14 +1250,27 @@ void MeshDeviceImpl::end_mesh_trace(uint8_t cq_id, const MeshTraceId& trace_id) 
     auto trace_region_size = this->allocator_impl()->get_config().trace_region_size;
     DeviceAddr dram_allocation_high_water_mark = 0;
     DeviceAddr dram_deletion_high_water_mark = 0;
+    // Collect freed addresses before ending tracking
+    std::vector<std::pair<DeviceAddr, DeviceAddr>> freed_addrs;
     if (trace_region_size == 0) {
         this->allocator_impl()->end_dram_high_water_mark_tracking();
         dram_allocation_high_water_mark = this->allocator_impl()->get_dram_allocation_high_water_mark();
         dram_deletion_high_water_mark = this->allocator_impl()->get_dram_deletion_high_water_mark();
+
+        // End tracking — defer reservation until after trace buffer allocation
+        freed_addrs = this->allocator_impl()->end_dram_freed_address_tracking();
     }
 
     MeshTrace::populate_mesh_buffer(
         *(mesh_command_queues_[cq_id]), trace_buffer, dram_allocation_high_water_mark, dram_deletion_high_water_mark);
+
+    // Re-reserve DRAM addresses freed during trace capture AFTER trace buffer is allocated.
+    // This prevents prefill from allocating into trace intermediate DRAM ranges.
+    if (!freed_addrs.empty()) {
+        auto reserved = this->allocator_impl()->reserve_dram_freed_addresses(freed_addrs);
+        trace_buffer->phantom_reservations = std::move(reserved);
+    }
+
     this->mark_allocations_unsafe();
 }
 

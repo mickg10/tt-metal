@@ -1470,6 +1470,7 @@ class Glm4MoeTT:
             top1_indices_tt=top1_indices_tt if not use_logits_output else None,
             embed_tt=embed_tt,
             retained_intermediates=_trace_retained,
+
         )
 
     def _update_trace_inputs(
@@ -1918,6 +1919,10 @@ class Glm4MoeTT:
             start_page = abs_start // block_size
             chunk_len = end - start
             num_chunk_pages = chunk_len // block_size
+            # Clip to actually allocated pages: vLLM allocates ceil(prompt_len/block_size)
+            # pages but padded_len can exceed prompt_len, referencing unallocated pages.
+            max_valid_pages = (base_offset + prompt_len + block_size - 1) // block_size
+            num_chunk_pages = min(num_chunk_pages, max_valid_pages - start_page)
             chunk_page_row = page_row[:, start_page : start_page + num_chunk_pages].to(torch.int32)
             chunk_page_table_tt = ttnn.from_torch(
                 chunk_page_row,
@@ -1930,6 +1935,10 @@ class Glm4MoeTT:
 
             # Growing SDPA page table: SDPA needs to read all KV from position 0
             # through abs_end-1, so pass pages covering [0, abs_end).
+            # NOTE: Do NOT clip to max_valid_pages here — the SDPA op requires
+            # K_len >= Q_len + chunk_start_idx, which equals abs_end (the padded end).
+            # Pages beyond prompt_len may reference unallocated blocks (index 0 or stale),
+            # but the causal mask prevents them from affecting actual token positions.
             end_page = abs_end // block_size
             sdpa_page_row = page_row[:, :end_page].to(torch.int32)
             sdpa_page_table_tt = ttnn.from_torch(

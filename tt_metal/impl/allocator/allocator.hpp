@@ -82,6 +82,13 @@ public:
     DeviceAddr get_dram_allocation_high_water_mark() const;
     DeviceAddr get_dram_deletion_high_water_mark() const;
 
+    // Freed address tracking during trace capture — prevents DRAM address reuse
+    void begin_dram_freed_address_tracking();
+    std::vector<std::pair<DeviceAddr, DeviceAddr>> end_dram_freed_address_tracking();
+    std::vector<DeviceAddr> reserve_dram_freed_addresses(
+        const std::vector<std::pair<DeviceAddr, DeviceAddr>>& address_size_pairs);
+    void release_dram_reserved_addresses(const std::vector<DeviceAddr>& addresses);
+
     // what does clear even mean on an allocator???
     void clear();
 

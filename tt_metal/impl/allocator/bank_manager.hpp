@@ -136,6 +136,13 @@ public:
     DeviceAddr get_allocation_high_water_mark() const;
     DeviceAddr get_deletion_high_water_mark() const;
 
+    // Freed address tracking during trace capture — prevents DRAM address reuse
+    void begin_freed_address_tracking();
+    std::vector<std::pair<DeviceAddr, DeviceAddr>> end_freed_address_tracking();
+    std::vector<DeviceAddr> reserve_freed_addresses(
+        const std::vector<std::pair<DeviceAddr, DeviceAddr>>& address_size_pairs);
+    void release_reserved_addresses(const std::vector<DeviceAddr>& addresses);
+
     // AllocatorState Methods
     // Extracts the state of the given allocator.
     AllocatorState::BufferTypeState extract_state(
@@ -183,6 +190,10 @@ private:
     bool tracking_high_water_mark_ = false;
     DeviceAddr allocation_high_water_mark_ = 0;
     DeviceAddr deletion_high_water_mark_ = 0;
+
+    // Record addresses freed during trace capture for re-reservation
+    bool tracking_freed_addresses_ = false;
+    std::unordered_map<DeviceAddr, DeviceAddr> freed_during_trace_;  // {address, size}
 
     /*********************************
      * Allocator-independent methods *

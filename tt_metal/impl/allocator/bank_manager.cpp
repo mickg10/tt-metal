@@ -533,6 +533,15 @@ void BankManager::deallocate_buffer(DeviceAddr address, BankManager::AllocatorDe
         }
     }
 
+    // Record freed address during trace capture for re-reservation after capture ends.
+    // Must be done BEFORE deallocate() since get_allocation_size needs the block alive.
+    if (tracking_freed_addresses_) {
+        auto size_opt = alloc->get_allocation_size(address);
+        if (size_opt.has_value()) {
+            freed_during_trace_.try_emplace(address, size_opt.value());
+        }
+    }
+
     alloc->deallocate(address);
     allocated_buffers_[allocator_id.get()].erase(address);
     // Deallocation in this allocator invalidates caches in allocators that depend on this allocator
@@ -766,6 +775,54 @@ bool BankManager::can_apply_state(const AllocatorState::BufferTypeState& state) 
            num_banks() == state.num_banks &&                                 //
            bank_size() == state.bank_size &&                                 //
            alignment_bytes_ == state.alignment_bytes;
+}
+
+// ---------------------------------------------------------------------------
+// Freed address tracking — prevents DRAM address reuse after trace capture
+// ---------------------------------------------------------------------------
+
+void BankManager::begin_freed_address_tracking() {
+    tracking_freed_addresses_ = true;
+    freed_during_trace_.clear();
+}
+
+std::vector<std::pair<DeviceAddr, DeviceAddr>> BankManager::end_freed_address_tracking() {
+    tracking_freed_addresses_ = false;
+    std::vector<std::pair<DeviceAddr, DeviceAddr>> result;
+    result.reserve(freed_during_trace_.size());
+    for (const auto& [addr, size] : freed_during_trace_) {
+        result.emplace_back(addr, size);
+    }
+    freed_during_trace_.clear();
+    return result;
+}
+
+std::vector<DeviceAddr> BankManager::reserve_freed_addresses(
+    const std::vector<std::pair<DeviceAddr, DeviceAddr>>& address_size_pairs) {
+    std::vector<DeviceAddr> reserved;
+    auto* alloc = this->get_allocator_from_id(AllocatorDependencies::AllocatorID{0});
+    TT_FATAL(alloc, "Allocator not initialized!");
+
+    for (const auto& [addr, size] : address_size_pairs) {
+        // allocate_at_address returns nullopt if the address is already allocated
+        // or not within a free block. Safe to skip — the address was already reused.
+        auto result = alloc->allocate_at_address(addr, size);
+        if (result.has_value()) {
+            allocated_buffers_[0].insert(result.value());
+            reserved.push_back(result.value());
+        }
+    }
+    return reserved;
+}
+
+void BankManager::release_reserved_addresses(const std::vector<DeviceAddr>& addresses) {
+    auto* alloc = this->get_allocator_from_id(AllocatorDependencies::AllocatorID{0});
+    TT_FATAL(alloc, "Allocator not initialized!");
+
+    for (DeviceAddr addr : addresses) {
+        alloc->deallocate(addr);
+        allocated_buffers_[0].erase(addr);
+    }
 }
 
 }  // namespace tt::tt_metal
