@@ -365,7 +365,10 @@ class Glm4MoeTT:
 
         hparams = _load_hparams_from_snapshot(snapshot_dir) if hparams is None else hparams
 
-        state = load_glm_lazy_state_dict(snapshot_dir, num_layers=int(hparams.num_hidden_layers))
+        # Include MTP layer (layer 92) in state dict when MTP is enabled
+        _mtp_flag = os.environ.get("GLM4_MOE_MTP", "").strip() == "1"
+        _num_layers_for_state = int(hparams.num_hidden_layers) + (1 if _mtp_flag else 0)
+        state = load_glm_lazy_state_dict(snapshot_dir, num_layers=_num_layers_for_state)
 
         # Embedding.
         embed_w_cpu = _dequant_weight(state, "model.embed_tokens.weight").clone().to(torch.bfloat16)
