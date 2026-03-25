@@ -283,6 +283,7 @@ class _DecodeTraceState:
     top1_values_tt: ttnn.Tensor | None = None
     top1_indices_tt: ttnn.Tensor | None = None
     embed_tt: ttnn.Tensor | None = None
+    tokens_tt: ttnn.Tensor | None = None  # Device token IDs for in-trace embedding
     retained_intermediates: list = field(default_factory=list)  # Trace address guard
 
     # MTP trace state (for traced combined decode+MTP)
@@ -372,9 +373,22 @@ class Glm4MoeTT:
 
         # Embedding.
         embed_w_cpu = _dequant_weight(state, "model.embed_tokens.weight").clone().to(torch.bfloat16)
-        # Skip device embedding — TG mesh uses host-side lookup (embed_w_cpu).
-        # Saves ~1.49 GB DRAM per device.
-        embed_w = None
+        # Device embedding enables in-trace ttnn.embedding (4-byte token IDs vs 40KB embeddings per H2D).
+        # Cost: ~371 MB DRAM per device (37888 vocab × 5120 hidden × 2 bytes BF16, replicated).
+        # This eliminates the biggest source of host overhead (92ms → ~30ms per token).
+        _device_embed = os.environ.get("GLM4_MOE_DEVICE_EMBED", "1").strip() == "1"
+        if _device_embed and _is_mesh_device(device):
+            logger.info("Loading embedding to device (~371 MB/device)")
+            embed_w = ttnn.from_torch(
+                embed_w_cpu.unsqueeze(0).unsqueeze(0),  # [1, 1, vocab, hidden]
+                device=device,
+                dtype=ttnn.bfloat16,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(device),
+            )
+        else:
+            embed_w = None
 
         # RoPE for partial rotary (rope_dim = head_dim * partial_rotary_factor = 64).
         rope_dim = int(hparams.head_dim * hparams.partial_rotary_factor)
@@ -1410,15 +1424,31 @@ class Glm4MoeTT:
 
         # Pre-allocate embedding tensor BEFORE compile warm-up!
         # This ensures the memory allocator state exactly matches during trace capture.
-        embed_torch = self.embed_w_cpu[tokens[:, 0].long()]  # [B, hidden]
-        embed_tt = ttnn.from_torch(
-            embed_torch.unsqueeze(0).unsqueeze(0).to(torch.bfloat16),  # [1, 1, B, hidden]
-            device=self.device,
-            dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ttnn.ReplicateTensorToMesh(self.device) if is_mesh else None,
-        )
+        if self.embed_w is not None:
+            # Device embedding: allocate persistent token ID buffer.
+            # In-trace: ttnn.embedding(tokens_tt, embed_w) runs on device.
+            # On replay: only 4 bytes/user H2D instead of 40KB/user.
+            tokens_device = ttnn.from_torch(
+                tokens[:, 0].contiguous().to(torch.int32),
+                device=self.device,
+                dtype=ttnn.uint32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(self.device) if is_mesh else None,
+            )
+            embed_tt = ttnn.embedding(tokens_device, self.embed_w, layout=ttnn.TILE_LAYOUT)
+            embed_tt = ttnn.reshape(embed_tt, [1, 1, active, -1])
+        else:
+            tokens_device = None
+            embed_torch = self.embed_w_cpu[tokens[:, 0].long()]  # [B, hidden]
+            embed_tt = ttnn.from_torch(
+                embed_torch.unsqueeze(0).unsqueeze(0).to(torch.bfloat16),  # [1, 1, B, hidden]
+                device=self.device,
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(self.device) if is_mesh else None,
+            )
 
         rot_mats = (cos_batch, sin_batch, self.rope["trans_matrix"])
         logger.info("[DBG] _capture_decode_trace: persistent inputs created (embed_tt.shape={}, page_table_tt.shape={}, positions_tt.shape={})",
