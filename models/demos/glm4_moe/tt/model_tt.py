@@ -1611,6 +1611,122 @@ class Glm4MoeTT:
         ttnn.synchronize_device(self.device)
 
     # -------------------------------------------------------------------
+    # MTP (Multi-Token Prediction)
+    # -------------------------------------------------------------------
+
+    def _mtp_forward_eager(
+        self,
+        *,
+        main_token_ids: torch.Tensor,     # [B] int32 — main model's predicted token IDs
+        hidden_state: ttnn.Tensor,         # [1,1,B,hidden] TILE on device — pre-final_norm hidden
+        mtp_positions: torch.Tensor,       # [B] int32 (= main start_pos + 1)
+        page_table: torch.Tensor,          # [B,W] int32
+        kv_cache: list,                    # full list including kv_cache[mtp_layer_idx]
+    ) -> torch.Tensor:
+        """Run MTP layer eagerly. Returns draft_token_ids [B] int32 on CPU."""
+        if not self.mtp_enabled:
+            return None
+        batch = int(main_token_ids.shape[0])
+        if batch > self.mtp_max_batch:
+            return None
+        hidden = int(self.hparams.hidden_size)  # 5120
+        is_mesh = _is_mesh_device(self.device)
+        mtp_layer_idx = int(self.hparams.num_hidden_layers)  # 92
+
+        # 1. Embed main model's predicted tokens (HOST-SIDE)
+        embed_torch = self.embed_w_cpu[main_token_ids.long()]  # [batch, hidden]
+        hidden_batch = int(hidden_state.shape[-2])
+        if batch < hidden_batch:
+            pad = torch.zeros(hidden_batch - batch, hidden, dtype=embed_torch.dtype)
+            embed_torch = torch.cat([embed_torch, pad], dim=0)
+        x_embed = ttnn.from_torch(
+            embed_torch.unsqueeze(0).unsqueeze(0).to(torch.bfloat16),
+            device=self.device,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.device) if is_mesh else None,
+        )
+
+        # 2. enorm(embedded), hnorm(hidden_state)
+        enorm_out = _sharded_rms_norm(x_embed, self.mtp_enorm, hidden)
+        _dealloc(x_embed, force=False)
+        hnorm_out = _sharded_rms_norm(hidden_state, self.mtp_hnorm, hidden)
+
+        # 3. Split-matmul projection (avoids ttnn.concat which fails on TG mesh)
+        proj_e = ttnn.linear(enorm_out, self.mtp_eh_proj_e_w)
+        _dealloc(enorm_out, force=False)
+        proj_h = ttnn.linear(hnorm_out, self.mtp_eh_proj_h_w)
+        _dealloc(hnorm_out, force=False)
+        proj = ttnn.add(proj_e, proj_h)
+        _dealloc(proj_e, force=False)
+        _dealloc(proj_h, force=False)
+
+        # 4. Prepare RoPE for MTP positions (= main_position + 1)
+        # BH uses dynamic dp_axis based on mesh topology
+        from models.demos.glm4_moe.tt.layer_weights import _tp_axis_and_size
+        tp_ax, _ = _tp_axis_and_size(self.device)
+        dp_ax = 1 - tp_ax
+        dp_shard_axis = None
+        dp_batch_mapper = ttnn.ReplicateTensorToMesh(self.device) if is_mesh else None
+        if is_mesh:
+            mesh_shape = list(self.device.shape)
+            dp_size = mesh_shape[dp_ax]
+            if batch > 1 and batch % dp_size == 0:
+                dp_shard_axis = dp_ax
+                dp_batch_mapper = ttnn.ShardTensor2dMesh(
+                    self.device, dims=(None if dp_ax == 1 else 0, 0 if dp_ax == 1 else None),
+                    mesh_shape=mesh_shape,
+                )
+
+        mtp_pos_clamped = mtp_positions[:batch].to(torch.int32).clamp(
+            min=0, max=max(0, int(self.max_seq_len) - 1)
+        )
+        # BH returns 3 values (no sin_neg)
+        tt_positions, cos_batch, sin_batch = _prepare_decode_rope_and_positions_tt(
+            device=self.device, rope=self.rope, positions=mtp_pos_clamped,
+            dp_shard_axis=dp_shard_axis,
+        )
+
+        # Page table for MTP
+        pt = page_table[:batch].to(torch.int32).contiguous()
+        page_table_tt = ttnn.from_torch(
+            pt, device=self.device, dtype=ttnn.int32,
+            layout=ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=dp_batch_mapper,
+        )
+
+        rot_mats = (cos_batch, sin_batch, self.rope["trans_matrix"])
+
+        # 5. Run MTP decoder layer
+        x = self.mtp_decoder_layer.forward(
+            proj, tt_positions, rot_mats, page_table_tt,
+            kv_cache[mtp_layer_idx],
+            mode="decode",
+            active_batch=batch,
+        )
+        _dealloc(proj, force=False)
+
+        # 6. shared_head: norm + LM head
+        x = _sharded_rms_norm(x, self.mtp_shared_head_norm, hidden)
+        logits_tt = ttnn.linear(x, self.mtp_shared_head_w)
+        _dealloc(x, force=False)
+
+        # 7. Host-side argmax
+        draft_token_ids = self._host_argmax_from_trace_logits(
+            logits_tt, hidden_batch, int(self.hparams.vocab_size)
+        )
+
+        # Cleanup
+        _dealloc(logits_tt, force=False)
+        _dealloc(tt_positions, force=False)
+        _dealloc(cos_batch, force=False)
+        _dealloc(sin_batch, force=False)
+        _dealloc(page_table_tt, force=False)
+
+        return draft_token_ids[:batch]
+
+    # -------------------------------------------------------------------
     # Prefill
     # -------------------------------------------------------------------
 
