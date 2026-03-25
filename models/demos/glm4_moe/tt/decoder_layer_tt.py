@@ -22,6 +22,10 @@ import ttnn
 
 from models.demos.glm4_moe.tt.config import Glm4MoeHParams
 from models.demos.glm4_moe.tt.trace_retainer import _dealloc
+
+# Gate hot-path debug logging — 1012 log calls per token when enabled (92 layers × 11 logs).
+# Set GLM4_MOE_DEBUG_DECODE=1 to enable.
+_DBG_DECODE = os.environ.get("GLM4_MOE_DEBUG_DECODE", "0") != "0"
 from models.demos.glm4_moe.tt.layer_weights import DecoderLayerTTWeights
 from models.demos.glm4_moe.tt.moe_tt import (
     Glm4MoeMoERuntime,
@@ -230,8 +234,9 @@ class Glm4MoeDecoderLayer:
         w = self.layer_weights
         device = self.device
         hparams = self.hparams
-        logger.info("[DBG] DL{} _forward_decode entry: x.shape={}, active_batch={}",
-                    self.layer_idx, list(x.shape), active_batch)
+        if _DBG_DECODE:
+            logger.info("[DBG] DL{} _forward_decode entry: x.shape={}, active_batch={}",
+            self.layer_idx, list(x.shape), active_batch)
 
         tp_axis = _tp_cluster_axis(device)
         tp_enabled = tp_axis is not None
@@ -254,12 +259,14 @@ class Glm4MoeDecoderLayer:
         h = _sharded_rms_norm(x, w.input_layernorm, hparams.hidden_size)
 
         # ---- GQA Attention ----
-        logger.info("[DBG] DL{} before attention: h.shape={}", self.layer_idx, list(h.shape))
+        if _DBG_DECODE:
+            logger.info("[DBG] DL{} before attention: h.shape={}", self.layer_idx, list(h.shape))
         attn_out = self.attention.forward(
             h, current_pos, rot_mats, mode="decode", page_table=page_table, kv_cache=kv_cache,
             active_batch=active_batch,
         )
-        logger.info("[DBG] DL{} after attention: attn_out.shape={}", self.layer_idx, list(attn_out.shape))
+        if _DBG_DECODE:
+            logger.info("[DBG] DL{} after attention: attn_out.shape={}", self.layer_idx, list(attn_out.shape))
 
         # ---- Attention residual ----
         # TILE_LAYOUT pads batch to 32, so attn_out may be [1,1,32,H] while x is [1,1,B,H].
@@ -278,7 +285,8 @@ class Glm4MoeDecoderLayer:
         h = _sharded_rms_norm(x, w.post_attention_layernorm, hparams.hidden_size)
 
         # ---- MLP ----
-        logger.info("[DBG] DL{} before MLP: h.shape={}, is_dense={}", self.layer_idx, list(h.shape), self.is_dense_layer)
+        if _DBG_DECODE:
+            logger.info("[DBG] DL{} before MLP: h.shape={}, is_dense={}", self.layer_idx, list(h.shape), self.is_dense_layer)
         if self.is_dense_layer:
             mlp_out = self._dense_mlp_forward(
                 h, w.w_mlp_gate, w.w_mlp_up, w.w_mlp_down,
@@ -297,7 +305,8 @@ class Glm4MoeDecoderLayer:
                 h, compute_kernel_config=mlp_compute_kernel_config,
                 tp_axis=tp_axis, tp_enabled=tp_enabled,
             )
-        logger.info("[DBG] DL{} after MLP: mlp_out.shape={}", self.layer_idx, list(mlp_out.shape))
+        if _DBG_DECODE:
+            logger.info("[DBG] DL{} after MLP: mlp_out.shape={}", self.layer_idx, list(mlp_out.shape))
 
         # ---- Residual ----
         res_shape = [int(d) for d in residual.shape]
@@ -314,12 +323,14 @@ class Glm4MoeDecoderLayer:
             else:
                 mlp_out = ttnn.slice(mlp_out, [0] * len(res_shape), res_shape)
 
-        logger.info("[DBG] DL{} residual add: residual.shape={}, mlp_out.shape={}",
-                    self.layer_idx, list(residual.shape), list(mlp_out.shape))
+        if _DBG_DECODE:
+            logger.info("[DBG] DL{} residual add: residual.shape={}, mlp_out.shape={}",
+            self.layer_idx, list(residual.shape), list(mlp_out.shape))
         x = ttnn.add(residual, mlp_out, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         _dealloc(mlp_out, force=False)
         _dealloc(residual, force=False)
-        logger.info("[DBG] DL{} _forward_decode exit: x.shape={}", self.layer_idx, list(x.shape))
+        if _DBG_DECODE:
+            logger.info("[DBG] DL{} _forward_decode exit: x.shape={}", self.layer_idx, list(x.shape))
         return x
 
     def _forward_prefill(
@@ -520,9 +531,10 @@ class Glm4MoeDecoderLayer:
 
         # ---- Fused reduce: scale shared by 1/DP, combine, single reduce ----
         fuse_reduce = _env_bool("GLM4_MOE_FUSE_SHARED_EP_REDUCE", default=True)
-        logger.info("[DBG] DL{} _moe_forward: shared_out.shape={}, routed_out.shape={}, fuse_reduce={}, tp_enabled={}, tp_axis={}",
-                    self.layer_idx,
-                    list(shared_out_partial.shape), list(routed_out_partial.shape),
+        if _DBG_DECODE:
+            logger.info("[DBG] DL{} _moe_forward: shared_out.shape={}, routed_out.shape={}, fuse_reduce={}, tp_enabled={}, tp_axis={}",
+            self.layer_idx,
+            list(shared_out_partial.shape), list(routed_out_partial.shape),
                     fuse_reduce, tp_enabled, tp_axis)
         if fuse_reduce and tp_enabled and tp_axis is not None:
             mesh_shape = _get_mesh_shape(device)
@@ -544,7 +556,8 @@ class Glm4MoeDecoderLayer:
             # needs TP reduce but routed does NOT. Use FUSE_SHARED_EP_REDUCE=0 with
             # EP_REDUCE_DEVICE=1. The host-side 32-way sum (below) IS correct for fused.
             _ep_reduce_device = _env_bool("GLM4_MOE_EP_REDUCE_DEVICE", default=False)
-            logger.info("[DBG] DL{} EP reduce (fused): ep_reduce_device={}, tp_ax={}, dp_ax={}, combined.shape={}",
+            if _DBG_DECODE:
+                logger.info("[DBG] DL{} EP reduce (fused): ep_reduce_device={}, tp_ax={}, dp_ax={}, combined.shape={}",
                         self.layer_idx, _ep_reduce_device, tp_ax, dp_ax, list(combined.shape))
             if _ep_reduce_device:
                 # 2-step device-side: TP axis then DP axis
@@ -581,7 +594,8 @@ class Glm4MoeDecoderLayer:
             from models.demos.glm4_moe.tt.layer_weights import _tp_axis_and_size
             tp_ax, _ = _tp_axis_and_size(device)
             dp_ax = 1 - tp_ax
-            logger.info("[DBG] DL{} EP reduce (separate): tp_ax={}, dp_ax={}, shared.shape={}, routed.shape={}",
+            if _DBG_DECODE:
+                logger.info("[DBG] DL{} EP reduce (separate): tp_ax={}, dp_ax={}, shared.shape={}, routed.shape={}",
                         self.layer_idx, tp_ax, dp_ax,
                         list(shared_out_partial.shape), list(routed_out_partial.shape))
             if tp_enabled and tp_axis is not None:
@@ -597,7 +611,8 @@ class Glm4MoeDecoderLayer:
             # then DP-axis reduce to reconstruct from the reduce_scatter.
             if device.__class__.__name__ == "MeshDevice":
                 mesh_shape3 = _get_mesh_shape(device)
-                logger.info("[DBG] DL{} EP reduce (separate routed): impl={}, tp_ax={}, dp_ax={}, tp_size={}, dp_size={}",
+                if _DBG_DECODE:
+                    logger.info("[DBG] DL{} EP reduce (separate routed): impl={}, tp_ax={}, dp_ax={}, tp_size={}, dp_size={}",
                             self.layer_idx, _PREFILL_REDUCE_IMPL, tp_ax, dp_ax,
                             mesh_shape3[tp_ax], mesh_shape3[dp_ax])
                 # TP-axis reduce first (sum partials across TP columns)

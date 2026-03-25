@@ -1042,13 +1042,16 @@ class Glm4MoeTT:
         """
         active = int(tokens.shape[0])
         page_table_w = int(page_table.shape[1])
-        logger.info("[DBG] _decode_trace entry: active={}, page_table_w={}", active, page_table_w)
+        _dbg = os.environ.get("GLM4_MOE_DEBUG_DECODE", "0") != "0"
+        if _dbg:
+            logger.info("[DBG] _decode_trace entry: active={}, page_table_w={}", active, page_table_w)
         # Bucket batch size to avoid capturing separate traces for every unique size.
         # With decode_trace_batch_buckets=[32], only one trace is captured.
         _DECODE_BUCKETS = [1, 4, 8, 16, 32]
         _buckets = getattr(self, "tt_config", {}).get("decode_trace_batch_buckets", _DECODE_BUCKETS)
         bucket = next((b for b in _buckets if b >= active), active)
-        logger.info("[DBG] _decode_trace: bucket={}", bucket)
+        if _dbg:
+            logger.info("[DBG] _decode_trace: bucket={}", bucket)
 
         # Pad inputs to bucket size if needed.
         if active < bucket:
@@ -1062,7 +1065,8 @@ class Glm4MoeTT:
         # E5: track capture vs replay calls for debugging
         _debug_trace_verify = int(os.environ.get("GLM4_MOE_DEBUG_TRACE_VERIFY", "") or "0")
         _is_capture = state is None or state.trace_id is None
-        logger.info("[DBG] _decode_trace: is_capture={}, bucket={}", _is_capture, bucket)
+        if _dbg:
+            logger.info("[DBG] _decode_trace: is_capture={}, bucket={}", _is_capture, bucket)
 
         if _is_capture:
             # Capture a new trace for this batch bucket.
@@ -1092,12 +1096,14 @@ class Glm4MoeTT:
                 raise
         else:
             # Update persistent inputs and replay.
-            logger.info("[DBG] _decode_trace: REPLAY path, updating trace inputs for bucket={}", bucket)
+            if _dbg:
+                logger.info("[DBG] _decode_trace: REPLAY path, updating trace inputs for bucket={}", bucket)
             self._update_trace_inputs(state, tokens, positions, page_table)
             if self.tt_ccl is not None:
                 self.tt_ccl.reset_sem_counters()
             ttnn.synchronize_device(self.device)
-            logger.info("[DBG] _decode_trace: REPLAY sync done, executing trace")
+            if _dbg:
+                logger.info("[DBG] _decode_trace: REPLAY sync done, executing trace")
 
             # DEBUG: trace quality investigation experiments (E0/E1/E3)
             if _debug_trace_verify >= 1:
