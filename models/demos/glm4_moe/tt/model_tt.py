@@ -541,6 +541,84 @@ class Glm4MoeTT:
             ttnn.synchronize_device(device)
             print("  [DEBUG MODEL] synchronize after layers OK", flush=True, file=sys.stderr)
 
+        # ---- MTP Layer (optional, for GLM-4.7 Full with num_nextn_predict_layers=1) ----
+        _mtp_enabled = os.environ.get("GLM4_MOE_MTP", "").strip() == "1"
+        _mtp_max_batch = int(os.environ.get("GLM4_MOE_MTP_MAX_BATCH", "16") or "16")
+        _mtp_enorm = None
+        _mtp_hnorm = None
+        _mtp_eh_proj_e_w = None
+        _mtp_eh_proj_h_w = None
+        _mtp_shared_head_norm = None
+        _mtp_shared_head_w = None
+        _mtp_decoder_layer = None
+
+        if _mtp_enabled:
+            mtp_layer_idx = int(hparams.num_hidden_layers)  # 92
+            logger.info("MTP enabled: loading layer {} weights (mtp_max_batch={})", mtp_layer_idx, _mtp_max_batch)
+            _hidden = int(hparams.hidden_size)
+
+            # enorm + hnorm: RMSNorm(hidden_size)
+            _mtp_enorm = RMSNorm(
+                device=device, dim=_hidden, eps=float(hparams.rms_norm_eps),
+                state_dict=state, state_dict_prefix=f"model.layers.{mtp_layer_idx}.",
+                weight_key="enorm", weight_cache_path=cache_dir / "mtp",
+                weight_dtype=ttnn.bfloat16, is_distributed=False,
+            )
+            _mtp_hnorm = RMSNorm(
+                device=device, dim=_hidden, eps=float(hparams.rms_norm_eps),
+                state_dict=state, state_dict_prefix=f"model.layers.{mtp_layer_idx}.",
+                weight_key="hnorm", weight_cache_path=cache_dir / "mtp",
+                weight_dtype=ttnn.bfloat16, is_distributed=False,
+            )
+
+            # eh_proj: Linear(2*hidden -> hidden). Split into two halves.
+            eh_key = f"model.layers.{mtp_layer_idx}.eh_proj.weight"
+            eh_full = state[eh_key]
+            if hasattr(eh_full, 'item') or not isinstance(eh_full, torch.Tensor):
+                eh_full = torch.tensor(eh_full) if not isinstance(eh_full, torch.Tensor) else eh_full
+            # HF layout: [hidden, 2*hidden] out_dim × in_dim
+            eh_e = eh_full[:, :_hidden].contiguous()  # embed half
+            eh_h = eh_full[:, _hidden:].contiguous()   # hidden half
+            mapper = ttnn.ReplicateTensorToMesh(device) if _is_mesh_device(device) else None
+            _mtp_eh_proj_e_w = ttnn.from_torch(
+                eh_e.to(torch.bfloat16), device=device, dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=mapper,
+            )
+            _mtp_eh_proj_h_w = ttnn.from_torch(
+                eh_h.to(torch.bfloat16), device=device, dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=mapper,
+            )
+
+            # shared_head norm + LM head (same vocab sharding as main lm_head)
+            _mtp_shared_head_norm = RMSNorm(
+                device=device, dim=_hidden, eps=float(hparams.rms_norm_eps),
+                state_dict=state, state_dict_prefix=f"model.layers.{mtp_layer_idx}.shared_head.",
+                weight_key="norm", weight_cache_path=cache_dir / "mtp",
+                weight_dtype=ttnn.bfloat16, is_distributed=False,
+            )
+            sh_key = f"model.layers.{mtp_layer_idx}.shared_head.head.weight"
+            sh_w = state[sh_key].to(torch.bfloat16)
+            # Same TP sharding as main lm_head
+            _mtp_shared_head_w = ttnn.from_torch(
+                sh_w, device=device, dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=mapper,
+            )
+
+            # Full decoder layer for MTP (layer 92)
+            from models.demos.glm4_moe.tt.layer_weights import convert_decoder_layer_weights
+            mtp_lw = convert_decoder_layer_weights(
+                state_dict=state, layer_idx=mtp_layer_idx, device=device,
+                hparams=hparams, cache_dir=cache_dir / "mtp",
+            )
+            _mtp_decoder_layer = Glm4MoeDecoderLayer(
+                device=device, hparams=hparams, layer_weights=mtp_lw,
+                layer_idx=mtp_layer_idx, moe_runtime=moe_runtime, tt_ccl=tt_ccl,
+            )
+            logger.info("MTP layer {} loaded", mtp_layer_idx)
+
         return cls(
             device=device,
             snapshot_dir=snapshot_dir,
@@ -564,6 +642,15 @@ class Glm4MoeTT:
             moe_runtime=moe_runtime,
             configuration=configuration,
             tt_ccl=tt_ccl,
+            mtp_enabled=_mtp_enabled,
+            mtp_enorm=_mtp_enorm,
+            mtp_hnorm=_mtp_hnorm,
+            mtp_eh_proj_e_w=_mtp_eh_proj_e_w,
+            mtp_eh_proj_h_w=_mtp_eh_proj_h_w,
+            mtp_shared_head_norm=_mtp_shared_head_norm,
+            mtp_shared_head_w=_mtp_shared_head_w,
+            mtp_decoder_layer=_mtp_decoder_layer,
+            mtp_max_batch=_mtp_max_batch,
         )
 
     # -------------------------------------------------------------------
@@ -746,12 +833,12 @@ class Glm4MoeTT:
                 if diff_01 > 0.5:
                     print(f"  [DBG L{layer_idx}] WARNING: TP devices diverged! All-reduce may be broken.", flush=True, file=_dbg_sys.stderr)
 
+        # Save pre-norm hidden for MTP (before final_norm destroys it)
+        mtp_hidden = x if self.mtp_enabled else None
+
         # Final norm + LM head (sharded norm to avoid L1 overflow with hidden=5120).
-        logger.info("[DBG] _decode_eager: before final_norm x.shape={}", list(x.shape))
         x = _sharded_rms_norm(x, self.final_norm, int(self.hparams.hidden_size))
-        logger.info("[DBG] _decode_eager: after final_norm, before lm_head x.shape={}", list(x.shape))
         logits_tt = ttnn.linear(x, self.lm_head_w)  # [1, 1, B, vocab]
-        logger.info("[DBG] _decode_eager: after lm_head logits_tt.shape={}", list(logits_tt.shape))
 
         if sampling_params is not None:
             return self._sample_greedy(logits_tt, active, x, tt_positions, cos_batch, sin_batch, page_table_tt)
@@ -759,6 +846,24 @@ class Glm4MoeTT:
         # Return full logits on host.
         vocab = int(self.hparams.vocab_size)
         result = self._logits_to_host(logits_tt, active, vocab)
+
+        # MTP: run speculative decode after main decode
+        if self.mtp_enabled and mtp_hidden is not None:
+            try:
+                # Get main output token IDs for MTP embedding (argmax of logits)
+                main_ids = result.reshape(active, -1).argmax(dim=-1).to(torch.int32)
+                # MTP positions = main positions + 1
+                mtp_positions = positions[:active] + 1
+                self._last_draft_token_ids = self._mtp_forward_eager(
+                    main_token_ids=main_ids,
+                    hidden_state=mtp_hidden,
+                    mtp_positions=mtp_positions,
+                    page_table=page_table[:active],
+                    kv_cache=kv_cache,
+                )
+            except Exception as e:
+                logger.warning("MTP forward failed (non-fatal): {}", e)
+                self._last_draft_token_ids = None
 
         _dealloc(logits_tt, force=False)
         _dealloc(x, force=False)
