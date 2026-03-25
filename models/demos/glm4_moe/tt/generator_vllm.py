@@ -68,6 +68,7 @@ class Glm4MoeForCausalLM(nn.Module):
         self._kv_cache: Optional[list] = None
         self._kv_cache_shape: Optional[tuple] = None
         self._tt_runner: Optional[Glm4MoeTT] = None
+        self._last_draft_token_ids: Optional[torch.Tensor] = None
 
     @classmethod
     def initialize_vllm_model(
@@ -209,6 +210,22 @@ class Glm4MoeForCausalLM(nn.Module):
                 cache_file_name=None,
             )
             kv_cache.append([tt_k, tt_v])
+
+        # MTP: allocate extra KV cache layer for MTP decoder (layer 92)
+        if os.environ.get("GLM4_MOE_MTP", "").strip() == "1":
+            logger.info("Allocating MTP KV cache layer (layer {})", num_layers_to_alloc)
+            tt_k = ttnn.as_tensor(
+                cache_k, device=self.mesh_device, mesh_mapper=mesh_mapper,
+                layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                dtype=tt_dtype, cache_file_name=None,
+            )
+            tt_v = ttnn.as_tensor(
+                cache_v, device=self.mesh_device, mesh_mapper=mesh_mapper,
+                layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                dtype=tt_dtype, cache_file_name=None,
+            )
+            kv_cache.append([tt_k, tt_v])
+            logger.info("MTP KV cache allocated (total {} layers)", len(kv_cache))
 
         self._kv_cache = kv_cache
         return kv_cache
@@ -358,6 +375,9 @@ class Glm4MoeForCausalLM(nn.Module):
             sampling_params=sampling_params,
             enable_trace=enable_trace,
         )
+
+        # Harvest MTP draft tokens (if available)
+        self._last_draft_token_ids = getattr(self._tt_runner, '_last_draft_token_ids', None)
 
         if read_from_device:
             tt_host = self.read_decode_output(tt_out, async_read=False)
