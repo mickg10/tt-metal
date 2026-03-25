@@ -187,6 +187,8 @@ class Glm4MoeDecoderLayer:
         active_batch: int | None = None,
         chunk_page_table: ttnn.Tensor | None = None,
         chunk_start_idx: int | None = None,
+        user_id: int = 0,
+        batch_size: int = 1,
     ) -> ttnn.Tensor:
         """Forward pass for one decoder layer.
 
@@ -219,6 +221,7 @@ class Glm4MoeDecoderLayer:
             return self._forward_prefill(
                 x, current_pos, rot_mats, page_table, kv_cache,
                 chunk_page_table=chunk_page_table, chunk_start_idx=chunk_start_idx,
+                user_id=user_id, batch_size=batch_size,
             )
 
     def _forward_decode(
@@ -342,8 +345,10 @@ class Glm4MoeDecoderLayer:
         kv_cache: list[ttnn.Tensor],
         chunk_page_table: ttnn.Tensor | None = None,
         chunk_start_idx: int | None = None,
+        user_id: int = 0,
+        batch_size: int = 1,
     ) -> ttnn.Tensor:
-        """Prefill forward: batch=1, seq_len in dim=2."""
+        """Prefill forward: batch=1 (or batched with user_id/batch_size)."""
         w = self.layer_weights
         device = self.device
         hparams = self.hparams
@@ -388,6 +393,7 @@ class Glm4MoeDecoderLayer:
         attn_out = self.attention.forward(
             h, current_pos, rot_mats, mode="prefill", page_table=page_table, kv_cache=kv_cache,
             chunk_page_table=chunk_page_table, chunk_start_idx=chunk_start_idx,
+            user_id=user_id,
         )
 
         # ---- Residual ----
