@@ -722,22 +722,25 @@ class Glm4MoeAttention(LightweightModule):
         chunk_page_table=None,
         chunk_start_idx=None,
         kv_cache=None,
+        batch_size: int = 1,
     ) -> ttnn.Tensor:
         """Prefill forward: process entire prompt sequence.
 
         Args:
-            x: [1, 1, seq_len, hidden_size=5120]
-            rot_mats: (cos, sin) rotation matrices for RoPE
-            user_id: batch index for KV cache fill
-            page_table: page table tensor for paged KV cache
+            x: [1, 1, seq_len, hidden] (single user) or [1, 1, U*seq_len, hidden] (batched)
+            rot_mats: (cos, sin) rotation matrices for RoPE (covers seq_len positions)
+            user_id: batch index for KV cache fill (single user) or 0 (batched)
+            page_table: page table [1, W] (single) or [U, W] (batched)
             chunk_page_table: page table for chunked prefill
             chunk_start_idx: starting index for chunked prefill
             kv_cache: [keys, values] external KV cache tensors
+            batch_size: number of users in the batch (1 = legacy single-user path)
 
         Returns:
-            Output tensor [1, 1, seq_len, hidden_size=5120]
+            Output tensor [1, 1, seq_len, hidden] or [1, 1, U*seq_len, hidden]
         """
-        seq_len = x.shape[-2]
+        total_seq = int(x.shape[-2])
+        seq_len = total_seq // batch_size if batch_size > 1 else total_seq
         assert seq_len % 128 == 0 and seq_len > 0, "Seqlen must be divisible by 128"
 
         import os as _os
@@ -785,18 +788,27 @@ class Glm4MoeAttention(LightweightModule):
             transpose_k_heads=False,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
-        # q: [1, 12, seq_len, 128], k: [1, 1, seq_len, 128], v: [1, 1, seq_len, 128]
+        # q: [1, 12, total_seq, 128], k: [1, 1, total_seq, 128], v: [1, 1, total_seq, 128]
 
         _dealloc(xqkv)
+
+        # For batched prefill: reshape from [1, heads, U*T, dim] to [U, heads, T, dim]
+        # so each user gets independent causal SDPA and correct per-user RoPE positions.
+        if batch_size > 1:
+            q = ttnn.reshape(q, [batch_size, self.n_local_heads, seq_len, self.head_dim])
+            k = ttnn.reshape(k, [batch_size, self.n_local_kv_heads, seq_len, self.head_dim])
+            v = ttnn.reshape(v, [batch_size, self.n_local_kv_heads, seq_len, self.head_dim])
+
         _sync("after split heads")
 
-        # 4. QK Norm
+        # 4. QK Norm (element-wise, batch-agnostic)
         q = self.q_norm(q, mode="prefill")
         k = self.k_norm(k, mode="prefill")
 
         _sync("after QK norm")
 
         # 5. Partial RoPE (prefill mode)
+        # cos/sin are [1, 1, seq_len, rope_dim] — broadcast across batch dim U
         q = self._apply_partial_rope_prefill(q, rot_mats[0], rot_mats[1], rot_mats[2])
         k = self._apply_partial_rope_prefill(k, rot_mats[0], rot_mats[1], rot_mats[2])
         _sync("after RoPE")
@@ -833,10 +845,18 @@ class Glm4MoeAttention(LightweightModule):
         if fill_page_table is not None:
             block_size = keys.shape[2]
             page_len = fill_page_table.shape[1] * block_size
-            k_fill_sliced = k_fill[:, :, :page_len, :] if page_len < k_fill.shape[2] else k_fill
-            v_fill_sliced = v_fill[:, :, :page_len, :] if page_len < v_fill.shape[2] else v_fill
-            ttnn.experimental.paged_fill_cache(keys, k_fill_sliced, fill_page_table, batch_idx=user_id)
-            ttnn.experimental.paged_fill_cache(values, v_fill_sliced, fill_page_table, batch_idx=user_id)
+            if batch_size > 1:
+                # Batched: loop per user, slice each user's K/V from the batch
+                for ui in range(batch_size):
+                    k_user = k_fill[ui : ui + 1, :, :page_len, :]
+                    v_user = v_fill[ui : ui + 1, :, :page_len, :]
+                    ttnn.experimental.paged_fill_cache(keys, k_user, fill_page_table, batch_idx=ui)
+                    ttnn.experimental.paged_fill_cache(values, v_user, fill_page_table, batch_idx=ui)
+            else:
+                k_fill_sliced = k_fill[:, :, :page_len, :] if page_len < k_fill.shape[2] else k_fill
+                v_fill_sliced = v_fill[:, :, :page_len, :] if page_len < v_fill.shape[2] else v_fill
+                ttnn.experimental.paged_fill_cache(keys, k_fill_sliced, fill_page_table, batch_idx=user_id)
+                ttnn.experimental.paged_fill_cache(values, v_fill_sliced, fill_page_table, batch_idx=user_id)
         else:
             ttnn.fill_cache(keys, k_fill, user_id % self.batch_size_per_device_group)
             ttnn.fill_cache(values, v_fill, user_id % self.batch_size_per_device_group)
@@ -875,19 +895,29 @@ class Glm4MoeAttention(LightweightModule):
         _sync("after SDPA")
 
         # 8. Reshape and concat heads
-        attn_output = ttnn.reshape(attn_output, [1, self.n_local_heads, -1, self.head_dim])
-        attn_output = ttnn.experimental.nlp_concat_heads(
-            attn_output,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        )
-        # -> [1, 1, seq_len, 1536]
+        if batch_size > 1:
+            # Batched: attn_output is [U, 12, T, 128]. Concat heads per user.
+            attn_output = ttnn.reshape(attn_output, [batch_size, self.n_local_heads, seq_len, self.head_dim])
+            attn_output = ttnn.experimental.nlp_concat_heads(
+                attn_output,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+            # -> [U, 1, T, 1536]. Flatten back to [1, 1, U*T, 1536] for O-proj matmul.
+            attn_output = ttnn.reshape(attn_output, [1, 1, total_seq, -1])
+        else:
+            attn_output = ttnn.reshape(attn_output, [1, self.n_local_heads, -1, self.head_dim])
+            attn_output = ttnn.experimental.nlp_concat_heads(
+                attn_output,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+            # -> [1, 1, seq_len, 1536]
 
         # Reshape for long sequences (must match QKV path threshold)
         _oproj_thresh = self.MAX_QKV_MM_SEQ_LEN
-        if seq_len > _oproj_thresh:
-            if seq_len % _oproj_thresh != 0:
-                raise ValueError(f"O-proj: seq_len {seq_len} must be divisible by {_oproj_thresh}")
-            attn_output = ttnn.reshape(attn_output, [1, seq_len // _oproj_thresh, _oproj_thresh, -1])
+        if total_seq > _oproj_thresh:
+            if total_seq % _oproj_thresh != 0:
+                raise ValueError(f"O-proj: total_seq {total_seq} must be divisible by {_oproj_thresh}")
+            attn_output = ttnn.reshape(attn_output, [1, total_seq // _oproj_thresh, _oproj_thresh, -1])
 
         # 9. Output projection (BF16 output for precision through 92 layers)
         output = ttnn.linear(
@@ -898,8 +928,8 @@ class Glm4MoeAttention(LightweightModule):
             compute_kernel_config=self.compute_kernel_config,
         )
 
-        if seq_len > _oproj_thresh:
-            output = ttnn.reshape(output, [1, 1, seq_len, -1])
+        if total_seq > _oproj_thresh:
+            output = ttnn.reshape(output, [1, 1, total_seq, -1])
         _dealloc(attn_output)
 
         _sync("after O projection")
@@ -929,6 +959,7 @@ class Glm4MoeAttention(LightweightModule):
         chunk_start_idx=None,
         kv_cache=None,
         active_batch: int | None = None,
+        batch_size: int = 1,
     ):
         if mode == "prefill":
             return self.forward_prefill(
@@ -939,6 +970,7 @@ class Glm4MoeAttention(LightweightModule):
                 chunk_page_table=chunk_page_table,
                 chunk_start_idx=chunk_start_idx,
                 kv_cache=kv_cache,
+                batch_size=batch_size,
             )
         else:
             return self.forward_decode(

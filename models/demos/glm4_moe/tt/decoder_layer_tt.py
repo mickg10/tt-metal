@@ -393,7 +393,7 @@ class Glm4MoeDecoderLayer:
         attn_out = self.attention.forward(
             h, current_pos, rot_mats, mode="prefill", page_table=page_table, kv_cache=kv_cache,
             chunk_page_table=chunk_page_table, chunk_start_idx=chunk_start_idx,
-            user_id=user_id,
+            user_id=user_id, batch_size=batch_size,
         )
 
         # ---- Residual ----

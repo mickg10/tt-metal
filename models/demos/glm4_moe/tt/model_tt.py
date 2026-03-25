@@ -1900,7 +1900,14 @@ class Glm4MoeTT:
             mesh_mapper=mapper,
         )
 
-        # 3. RoPE: all users start at position 0 (no prefix cache in this path)
+        # 3. RoPE: cover the full concatenated sequence length.
+        # All users start at position 0. The concatenated tensor has U*padded_len tokens.
+        # RoPE positions repeat for each user: [0..T-1, 0..T-1, ...]. For causal SDPA
+        # with non-paged attention (first pass), this is correct since RoPE is applied
+        # per-token and the causal mask prevents cross-user attention.
+        # For paged attention (chunked prefill), the RoPE is applied to the chunk tokens
+        # which are always within [0..T-1] per user.
+        total_seq = batch * padded_len
         cos_matrix = ttnn.slice(self.rope["cos_matrix"], [0, 0, 0, 0], [1, 1, padded_len, rope_dim])
         sin_matrix = ttnn.slice(self.rope["sin_matrix"], [0, 0, 0, 0], [1, 1, padded_len, rope_dim])
         rot_mats = (cos_matrix, sin_matrix, self.rope["trans_matrix"])
@@ -1924,12 +1931,16 @@ class Glm4MoeTT:
             _dealloc(x, force=False)
             x = x_next
 
-        # 5. Extract last token for each user and compute logits
+        # 5. Extract last token for each user and compute logits.
+        # x is [1, 1, U*padded_len, hidden]. Use actual tensor dims for safe slicing.
+        x_dim2 = int(x.shape[-2])
+        x_dim3 = int(x.shape[-1])
         out_logits = []
         for i in range(batch):
             prompt_len = int(prompt_lens[i])
             offset = i * padded_len + prompt_len - 1
-            x_last = ttnn.slice(x, [0, 0, offset, 0], [1, 1, offset + 1, hidden])
+            assert offset + 1 <= x_dim2, f"Slice offset {offset+1} > tensor dim {x_dim2}"
+            x_last = ttnn.slice(x, [0, 0, offset, 0], [1, 1, offset + 1, x_dim3])
             x_last_normed = _sharded_rms_norm(x_last, self.final_norm, hidden)
             logits_tt = ttnn.linear(x_last_normed, self.lm_head_w)
 
