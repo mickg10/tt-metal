@@ -469,14 +469,15 @@ class Glm4MoeAttention(LightweightModule):
     def _apply_partial_rope_prefill(self, x, cos, sin, trans_mat):
         """Apply partial rotary embedding (prefill mode, NeoX-style).
 
-        x: [1, n_heads, seq_len, head_dim]
-        cos/sin: [1, 1, padded_len, rotary_dim] — sliced to seq_len, broadcasts over n_heads.
+        x: [B, n_heads, seq_len, head_dim] where B=1 (single user) or B=U (batched)
+        cos/sin: [1, 1, padded_len, rotary_dim] — sliced to seq_len, broadcasts over B and n_heads.
         """
-        seq_len = x.shape[2]
-        n_heads = x.shape[1]
+        B = int(x.shape[0])
+        seq_len = int(x.shape[2])
+        n_heads = int(x.shape[1])
 
-        x_rot = ttnn.slice(x, [0, 0, 0, 0], [1, n_heads, seq_len, self.rotary_dim])
-        x_pass = ttnn.slice(x, [0, 0, 0, self.rotary_dim], [1, n_heads, seq_len, self.head_dim])
+        x_rot = ttnn.slice(x, [0, 0, 0, 0], [B, n_heads, seq_len, self.rotary_dim])
+        x_pass = ttnn.slice(x, [0, 0, 0, self.rotary_dim], [B, n_heads, seq_len, self.head_dim])
 
         if x_rot.dtype != ttnn.bfloat16:
             x_rot = ttnn.typecast(x_rot, dtype=ttnn.bfloat16)
@@ -487,8 +488,8 @@ class Glm4MoeAttention(LightweightModule):
 
         # NeoX-style rotate_half: [-x2, x1] where x1 = first half, x2 = second half
         half = self.rotary_dim // 2
-        x1 = ttnn.slice(x_rot, [0, 0, 0, 0], [1, n_heads, seq_len, half])
-        x2 = ttnn.slice(x_rot, [0, 0, 0, half], [1, n_heads, seq_len, self.rotary_dim])
+        x1 = ttnn.slice(x_rot, [0, 0, 0, 0], [B, n_heads, seq_len, half])
+        x2 = ttnn.slice(x_rot, [0, 0, 0, half], [B, n_heads, seq_len, self.rotary_dim])
         rotated = ttnn.concat([ttnn.neg(x2), x1], dim=-1, memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
         # output = x_rot * cos + rotate_half(x_rot) * sin
