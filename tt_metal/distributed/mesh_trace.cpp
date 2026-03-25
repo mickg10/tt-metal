@@ -258,6 +258,18 @@ void MeshTrace::populate_mesh_buffer(
 
 MeshTraceBuffer::~MeshTraceBuffer() {
     if (this->mesh_buffer && this->mesh_buffer->is_allocated() && this->mesh_buffer->device()) {
+        // Release phantom DRAM reservations to prevent memory leak.
+        // These are normally freed by release_mesh_trace(), but if the trace buffer
+        // is destroyed without going through that path, we must clean up here.
+        if (!this->phantom_reservations.empty()) {
+            try {
+                this->mesh_buffer->device()->allocator_impl()->release_dram_reserved_addresses(
+                    this->phantom_reservations);
+            } catch (...) {
+                // Destructor must not throw. Allocator may already be torn down.
+            }
+            this->phantom_reservations.clear();
+        }
         auto current_trace_buffers_size = this->mesh_buffer->device()->get_trace_buffers_size();
         this->mesh_buffer->device()->set_trace_buffers_size(current_trace_buffers_size - this->mesh_buffer->size());
     }

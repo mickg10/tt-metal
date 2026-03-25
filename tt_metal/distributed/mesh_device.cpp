@@ -1172,6 +1172,8 @@ SystemMemoryManager& MeshDeviceImpl::sysmem_manager() {
 }
 
 void MeshDeviceImpl::release_mesh_trace(const MeshTraceId& trace_id) {
+    validate_sub_device_manager_tracker();
+
     // Release phantom reservations before releasing the trace
     auto trace_buffer = sub_device_manager_tracker_->get_active_sub_device_manager()->get_trace(trace_id);
     if (trace_buffer && !trace_buffer->phantom_reservations.empty()) {
@@ -1181,7 +1183,6 @@ void MeshDeviceImpl::release_mesh_trace(const MeshTraceId& trace_id) {
 
     TracyTTMetalReleaseMeshTrace(this->get_device_ids(), *trace_id);
 
-    validate_sub_device_manager_tracker();
     sub_device_manager_tracker_->get_active_sub_device_manager()->release_trace(trace_id);
 
     // Only enable allocations once all captured traces are released

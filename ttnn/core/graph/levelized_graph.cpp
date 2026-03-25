@@ -232,7 +232,7 @@ void LevelizedGraph::populate_edges(const nlohmann::json& trace) {
                     size_t consumer_vertex_id = consumer_id_it->second;
                     // Add edge from tensor to consumer
                     auto& tensor_out_edges = graph[vertex_id].out_edges;
-                    if (std::ranges::find(tensor_out_edges, consumer_vertex_id) == tensor_out_edges.end()) {
+                    if (std::find(tensor_out_edges.begin(), tensor_out_edges.end(), consumer_vertex_id) == tensor_out_edges.end()) {
                         tensor_out_edges.push_back(consumer_vertex_id);
                     }
                 }
@@ -262,7 +262,7 @@ void LevelizedGraph::populate_edges(const nlohmann::json& trace) {
                     // This is a level 1 tensor vertex, create edge from it to this operation
                     size_t tensor_vertex_id = tensor_vertex_it->second;
                     auto& tensor_out_edges = graph[tensor_vertex_id].out_edges;
-                    if (std::ranges::find(tensor_out_edges, vertex_id) == tensor_out_edges.end()) {
+                    if (std::find(tensor_out_edges.begin(), tensor_out_edges.end(), vertex_id) == tensor_out_edges.end()) {
                         tensor_out_edges.push_back(vertex_id);
                     }
                 } else {
@@ -281,7 +281,7 @@ void LevelizedGraph::populate_edges(const nlohmann::json& trace) {
                                 // Avoid self-loops and duplicate edges
                                 auto& producer_connections = graph[producer_vertex_id].out_edges;
                                 if (producer_vertex_id != vertex_id &&
-                                    std::ranges::find(producer_connections, vertex_id) == producer_connections.end()) {
+                                    std::find(producer_connections.begin(), producer_connections.end(), vertex_id) == producer_connections.end()) {
                                     producer_connections.push_back(vertex_id);
                                 }
                             }
@@ -304,7 +304,7 @@ void LevelizedGraph::populate_internals(const nlohmann::json& trace, std::size_t
 
         // Skip tensor nodes - they don't have internals
         if (node[kNodeType] == kNodeTensor) {
-            return;
+            continue;
         }
 
         int function_start_counter = node_counter;
@@ -313,7 +313,7 @@ void LevelizedGraph::populate_internals(const nlohmann::json& trace, std::size_t
         // Find the function_end for this function_start
         auto start_to_end_it = function_start_to_end.find(function_start_counter);
         if (start_to_end_it == function_start_to_end.end()) {
-            return;  // No function_end found, skip
+            continue;  // No function_end found, skip this vertex
         }
         int function_end_counter = start_to_end_it->second;
 
@@ -360,7 +360,7 @@ void LevelizedGraph::populate_output_info() {
             if (!consumer.arguments.empty()) {
                 const std::string& first_arg = consumer.arguments[0];
                 // Check if it's a Tensor argument (starts with "Tensor(")
-                if (first_arg.starts_with("Tensor(")) {
+                if (first_arg.substr(0, 7) == "Tensor(") {
                     // Add to output_info if not already present (avoid duplicates)
                     // Note: this is not scalable, but the only viable solution for now since graph capture does not
                     // store the output info of each vertex.
@@ -385,7 +385,7 @@ void LevelizedGraph::populate_output_shape(const nlohmann::json& trace) {
 
         // Skip tensor nodes - they already have their shape from populate_vertices
         if (node[kNodeType] == kNodeTensor) {
-            return;
+            continue;
         }
 
         int function_start_counter = node_counter;
@@ -393,13 +393,13 @@ void LevelizedGraph::populate_output_shape(const nlohmann::json& trace) {
         // Find the function_end for this function_start
         auto start_to_end_it = function_start_to_end.find(function_start_counter);
         if (start_to_end_it == function_start_to_end.end()) {
-            return;  // No function_end found, skip
+            continue;  // No function_end found, skip this vertex
         }
         int function_end_counter = start_to_end_it->second;
 
         // Get the function_end node from trace
         if (function_end_counter < 0 || static_cast<size_t>(function_end_counter) >= trace.size()) {
-            return;
+            continue;
         }
         const auto& function_end_node = trace[function_end_counter];
 
@@ -448,7 +448,7 @@ void LevelizedGraph::populate_input_connections(const nlohmann::json& trace) {
                 }
             }
             // If no producer, this is an input tensor (no in_edges)
-            return;
+            continue;
         }
 
         // Check if input_tensors field is available, use it to populate in_edges
