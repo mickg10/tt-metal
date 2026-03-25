@@ -285,6 +285,16 @@ class _DecodeTraceState:
     embed_tt: ttnn.Tensor | None = None
     retained_intermediates: list = field(default_factory=list)  # Trace address guard
 
+    # MTP trace state (for traced combined decode+MTP)
+    mtp_hidden_tt: Any = None       # [1,1,B,hidden] clone from main trace
+    mtp_positions_tt: Any = None    # [B] int32
+    mtp_cos_batch_tt: Any = None    # [1,B,1,rope_dim] bf16
+    mtp_sin_batch_tt: Any = None    # [1,B,1,rope_dim] bf16
+    mtp_page_table_tt: Any = None   # [B,W] int32
+    mtp_embed_tt: Any = None        # [1,1,B,hidden]
+    mtp_trace_id: int | None = None
+    mtp_logits_tt: Any = None       # MTP logits
+
 
 # ---------------------------------------------------------------------------
 # Model Runner
@@ -321,9 +331,22 @@ class Glm4MoeTT:
     configuration: dict[str, Any]
     tt_ccl: Any | None
 
+    # MTP (Multi-Token Prediction) — loaded when GLM4_MOE_MTP=1
+    mtp_enabled: bool = False
+    mtp_enorm: Any | None = None
+    mtp_hnorm: Any | None = None
+    mtp_eh_proj_e_w: Any | None = None
+    mtp_eh_proj_h_w: Any | None = None
+    mtp_shared_head_norm: Any | None = None
+    mtp_shared_head_w: Any | None = None
+    mtp_decoder_layer: Any | None = None
+    mtp_max_batch: int = 16
+
     _decode_trace_states: dict[int, _DecodeTraceState] = field(init=False, default_factory=dict)
     _decode_traces_stale: bool = field(init=False, default=False)
     _post_prefill_eager_remaining: int = field(init=False, default=0)
+    _last_draft_token_ids: torch.Tensor | None = field(init=False, default=None)
+    _prev_main_ids: torch.Tensor | None = field(init=False, default=None)
 
     @classmethod
     def create(
