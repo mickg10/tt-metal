@@ -1525,13 +1525,24 @@ class Glm4MoeTT:
 
         # Re-copy persistent inputs before trace capture (like GLM4-Flash)
         # to ensure no inadvertent in-place mutation broke them.
-        host_embed = ttnn.from_torch(
-            embed_torch.unsqueeze(0).unsqueeze(0).to(torch.bfloat16),
-            dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT,
-            mesh_mapper=mapper,
-        )
-        ttnn.copy_host_to_device_tensor(host_embed, embed_tt)
+        if self.embed_w is not None and tokens_device is not None:
+            # Device embed: re-copy token IDs
+            host_tokens = ttnn.from_torch(
+                tokens[:, 0].contiguous().to(torch.int32),
+                dtype=ttnn.uint32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                mesh_mapper=mapper,
+            )
+            ttnn.copy_host_to_device_tensor(host_tokens, tokens_device)
+        else:
+            embed_torch = self.embed_w_cpu[tokens[:, 0].long()]
+            host_embed = ttnn.from_torch(
+                embed_torch.unsqueeze(0).unsqueeze(0).to(torch.bfloat16),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                mesh_mapper=mapper,
+            )
+            ttnn.copy_host_to_device_tensor(host_embed, embed_tt)
 
         # Now capture trace.
         logger.info("[DBG] _capture_decode_trace: compile warmup done, starting trace capture for batch={}", active)
@@ -1550,9 +1561,15 @@ class Glm4MoeTT:
         trace_id = ttnn.begin_trace_capture(self.device, cq_id=0)
         logger.info("[DBG] _capture_decode_trace: begin_trace_capture returned trace_id={}", trace_id)
 
-        # Trace reads from embed_tt; we must NOT deallocate it after first layer
-        # so it survives for copy_host_to_device_tensor during replay.
-        x = embed_tt
+        # Start trace with embedding lookup.
+        # Device embed: ttnn.embedding runs inside trace (recorded in command buffer).
+        # On replay, updated tokens_device produces new embeddings automatically.
+        # Host embed: trace reads from pre-computed embed_tt (updated by H2D copy before replay).
+        if self.embed_w is not None and tokens_device is not None:
+            x = ttnn.embedding(tokens_device, self.embed_w, layout=ttnn.TILE_LAYOUT)
+            x = ttnn.reshape(x, [1, 1, active, -1])
+        else:
+            x = embed_tt
 
         for layer_idx in range(self.num_layers_to_run):
             _t_layer = time.time()
@@ -1595,7 +1612,7 @@ class Glm4MoeTT:
             trace_id=trace_id,
             batch=active,
             page_table_width=int(page_table.shape[1]),
-            tokens_tt=tokens_tt,
+            tokens_tt=tokens_device if (self.embed_w is not None) else None,
             positions_tt=tt_positions,
             cos_batch_tt=cos_batch,
             sin_batch_tt=sin_batch,
@@ -1645,11 +1662,21 @@ class Glm4MoeTT:
                     self.device, dims=tuple(rope_dims), mesh_shape=mesh_shape,
                 )
 
-        # Update embedding (host lookup + copy to pre-allocated device buffer).
-        embed_torch = self.embed_w_cpu[tokens[:, 0].long()]  # [B, hidden]
-        host_embed = ttnn.from_torch(
-            embed_torch.unsqueeze(0).unsqueeze(0).to(torch.bfloat16),  # [1, 1, B, hidden]
-            dtype=ttnn.bfloat16,
+        # Update embedding input.
+        if self.embed_w is not None and state.tokens_tt is not None:
+            # Device embed: only copy 4-byte token IDs (not 40KB embedding vectors)
+            host_tokens = ttnn.from_torch(
+                tokens[:, 0].contiguous().to(torch.int32),
+                dtype=ttnn.uint32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                mesh_mapper=mapper,
+            )
+            ttnn.copy_host_to_device_tensor(host_tokens, state.tokens_tt)
+        elif state.embed_tt is not None:
+            embed_torch = self.embed_w_cpu[tokens[:, 0].long()]  # [B, hidden]
+            host_embed = ttnn.from_torch(
+                embed_torch.unsqueeze(0).unsqueeze(0).to(torch.bfloat16),  # [1, 1, B, hidden]
+                dtype=ttnn.bfloat16,
             layout=ttnn.TILE_LAYOUT,
             mesh_mapper=mapper,
         )
