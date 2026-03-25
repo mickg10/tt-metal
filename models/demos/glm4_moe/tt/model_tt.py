@@ -582,42 +582,12 @@ class Glm4MoeTT:
         if active <= 0:
             return torch.zeros((0, 1, int(self.hparams.vocab_size)), dtype=torch.float32)
 
+        # Traces are always released before prefill (WH pattern). If _decode_traces_stale
+        # is set, it means prefill ran but release failed — force release now.
         if enable_trace and self._decode_traces_stale:
-            # Phase 1b: Traces survive prefill — just clear stale flag and replay.
-            # Safe because: trace buffers allocated top-down, prefill temps bottom-up
-            # (can't overlap); persistent inputs updated by _decode_trace replay path;
-            # KV cache accessed by page_table pointer (never moves).
-            # Must reset device semaphores since prefill CCL ops left them dirty.
-            _skip_recapture = os.environ.get("GLM4_MOE_SKIP_TRACE_RECAPTURE", "1") == "1"
-            if _skip_recapture:
-                logger.info("Phase 1b: traces survived prefill — reusing (no recapture)")
-                # Drain ALL in-flight prefill CCL ops BEFORE resetting semaphores.
-                # Without this sync, a prefill CCL op completing after reset
-                # leaves a dirty semaphore value → trace replay corruption.
-                ttnn.synchronize_device(self.device)
-                if self.tt_ccl is not None:
-                    self.tt_ccl.reset_global_semaphores()
-                    self.tt_ccl.reset_sem_counters()
-                self._decode_traces_stale = False
-                self._post_prefill_eager_remaining = 0
-                # Fall through to normal _decode_trace replay path.
-            elif self._post_prefill_eager_remaining > 0:
-                # Fallback: eager decode path (Phase 1a, gated by env var).
-                self._post_prefill_eager_remaining -= 1
-                logger.info("Post-prefill eager decode (remaining={})", self._post_prefill_eager_remaining)
-                return self._decode_eager(
-                    tokens=tokens[:active].to(torch.int32),
-                    positions=start_pos[:active].to(torch.int32),
-                    page_table=page_table[:active].to(torch.int32),
-                    kv_cache=kv_cache,
-                    sampling_params=sampling_params,
-                )
-            else:
-                # Eager decode quota exhausted — now do the expensive release+recapture.
-                logger.info("Lazy trace release+recapture (stale traces being released)")
-                self._release_all_decode_traces()
-                self._decode_traces_stale = False
-                # Fall through to normal _decode_trace which will capture fresh traces.
+            logger.info("Stale traces detected — releasing before decode")
+            self._release_all_decode_traces()
+            self._decode_traces_stale = False
 
         if enable_trace:
             return self._decode_trace(
@@ -1563,29 +1533,15 @@ class Glm4MoeTT:
         ttnn.copy_host_to_device_tensor(host_pt, state.page_table_tt)
 
     def _invalidate_decode_traces(self) -> None:
-        """Mark decode traces as stale without releasing them (fast, non-blocking).
+        """Mark decode traces as stale (legacy path, kept for PRESERVE_TRACE=1 compat).
 
-        Called from prefill() instead of _release_all_decode_traces() when
-        GLM4_MOE_PRESERVE_TRACE_AFTER_PREFILL=1. The actual release+recapture
-        is deferred until after the first few eager decode steps, so the first
-        token is returned without the 10-14s trace release/recapture overhead.
+        With PRESERVE_TRACE=0 (recommended), prefill() calls _release_all_decode_traces()
+        directly and this method is never reached.
         """
         if not self._decode_trace_states:
             return
         self._decode_traces_stale = True
-        eager_count = int(os.environ.get("GLM4_MOE_EAGER_DECODE_COUNT", "2"))
-        self._post_prefill_eager_remaining = max(1, eager_count)
-        # Must sync device to drain any in-flight trace replay ops before
-        # resetting semaphores. Without this, prefill CCL ops can collide
-        # with stale device-side semaphore state from the last trace replay.
-        ttnn.synchronize_device(self.device)
-        # Reset both device-side semaphore values AND Python-side counters.
-        # Prefill uses device-side CCL (MoE EP reduce, dense MLP TP reduce),
-        # so device semaphores must be clean before prefill starts.
-        if self.tt_ccl is not None:
-            self.tt_ccl.reset_global_semaphores()
-            self.tt_ccl.reset_sem_counters()
-        logger.info("Decode traces marked stale (eager_remaining={})", self._post_prefill_eager_remaining)
+        logger.info("Decode traces marked stale")
 
     def _release_all_decode_traces(self) -> None:
         """Release ALL bucket decode traces and deallocate trace output tensors."""
