@@ -1662,7 +1662,8 @@ class Glm4MoeTT:
         # Batched prefill: process multiple users in one forward pass.
         # Gated behind env var — falls back to sequential if disabled or mixed lengths.
         _batched_prefill = os.environ.get("GLM4_MOE_BATCHED_PREFILL", "0").strip() == "1"
-        if _batched_prefill and int(batch) > 1:
+        _max_batch_prefill = int(os.environ.get("GLM4_MOE_MAX_BATCHED_PREFILL", "16"))
+        if _batched_prefill and 1 < int(batch) <= _max_batch_prefill:
             # Check if all users have same padded length (required for Phase 1)
             _all_cached = [max(0, min(int(start_pos[i].item()), int(prompt_lens[i]) - 1)) for i in range(int(batch))]
             _all_new = [int(prompt_lens[i]) - _all_cached[i] for i in range(int(batch))]
