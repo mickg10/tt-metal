@@ -847,10 +847,13 @@ class Glm4MoeAttention(LightweightModule):
             block_size = keys.shape[2]
             page_len = fill_page_table.shape[1] * block_size
             if batch_size > 1:
-                # Batched: loop per user, slice each user's K/V from the batch
+                # Batched: loop per user, slice each user's K/V from the batch.
+                # Cap at seq_len (per-user) since k_fill is [U, heads, seq_len, dim],
+                # not [U, heads, page_len, dim].
+                fill_len = min(page_len, seq_len)
                 for ui in range(batch_size):
-                    k_user = k_fill[ui : ui + 1, :, :page_len, :]
-                    v_user = v_fill[ui : ui + 1, :, :page_len, :]
+                    k_user = k_fill[ui : ui + 1, :, :fill_len, :]
+                    v_user = v_fill[ui : ui + 1, :, :fill_len, :]
                     ttnn.experimental.paged_fill_cache(keys, k_user, fill_page_table, batch_idx=ui)
                     ttnn.experimental.paged_fill_cache(values, v_user, fill_page_table, batch_idx=ui)
             else:
