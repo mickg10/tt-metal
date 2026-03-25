@@ -617,7 +617,7 @@ class Glm4MoeTT:
             )
             _mtp_decoder_layer = Glm4MoeDecoderLayer(
                 mesh_device=device, hparams=hparams, layer_weights=mtp_lw,
-                moe_runtime=moe_runtime, tt_ccl=tt_ccl,
+                configuration=configuration, moe_runtime=moe_runtime, tt_ccl=tt_ccl,
             )
             logger.info("MTP layer {} loaded", mtp_layer_idx)
 
