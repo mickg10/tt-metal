@@ -1659,6 +1659,26 @@ class Glm4MoeTT:
 
         out_logits: list[torch.Tensor] = []
 
+        # Batched prefill: process multiple users in one forward pass.
+        # Gated behind env var — falls back to sequential if disabled or mixed lengths.
+        _batched_prefill = os.environ.get("GLM4_MOE_BATCHED_PREFILL", "0").strip() == "1"
+        if _batched_prefill and int(batch) > 1:
+            # Check if all users have same padded length (required for Phase 1)
+            _all_cached = [max(0, min(int(start_pos[i].item()), int(prompt_lens[i]) - 1)) for i in range(int(batch))]
+            _all_new = [int(prompt_lens[i]) - _all_cached[i] for i in range(int(batch))]
+            _all_padded = [((n + pad_multiple - 1) // pad_multiple) * pad_multiple for n in _all_new]
+            _unique_padded = set(_all_padded)
+            if len(_unique_padded) == 1 and all(c == 0 for c in _all_cached):
+                # All same length, no prefix caching — use batched path
+                return self._prefill_batched(
+                    tokens=tokens, prompt_lens=prompt_lens, page_table=page_table,
+                    kv_cache=kv_cache, start_pos=start_pos, padded_len=_all_padded[0],
+                    hidden=hidden, vocab=vocab, rope_dim=rope_dim,
+                    PREFILL_CHUNK_SIZE=PREFILL_CHUNK_SIZE,
+                )
+            else:
+                logger.info("Batched prefill: mixed lengths or prefix cache, falling back to sequential")
+
         for i in range(int(batch)):
             prompt_len = int(prompt_lens[i])
             if prompt_len <= 0:
@@ -1822,6 +1842,132 @@ class Glm4MoeTT:
             if self.tt_ccl is not None:
                 self.tt_ccl.reset_sem_counters()
 
+        return torch.stack(out_logits, dim=0)  # [B, 1, vocab]
+
+    def _prefill_batched(
+        self,
+        *,
+        tokens: torch.Tensor,
+        prompt_lens: list[int],
+        page_table: torch.Tensor,
+        kv_cache: list,
+        start_pos: torch.Tensor,
+        padded_len: int,
+        hidden: int,
+        vocab: int,
+        rope_dim: int,
+        PREFILL_CHUNK_SIZE: int,
+    ) -> torch.Tensor:
+        """Process multiple users' prefill in one batched forward pass.
+
+        All matmuls and MoE ops are token-wise — concatenating U users' T-length
+        embeddings into [1, 1, U*T, hidden] just creates a larger matmul.
+        Only attention needs user-awareness (per-user KV cache fill + causal mask).
+
+        Requires: all users have same padded_len and start_pos=0 (no prefix cache).
+        """
+        batch = int(tokens.shape[0])
+        is_mesh = _is_mesh_device(self.device)
+        mapper = ttnn.ReplicateTensorToMesh(self.device) if is_mesh else None
+
+        logger.info("Batched prefill: {} users × {} tokens = {} total", batch, padded_len, batch * padded_len)
+
+        # 1. Concatenate embeddings for all users: [U*padded_len, hidden]
+        embed_parts = []
+        for i in range(batch):
+            prompt_len = int(prompt_lens[i])
+            tok_ids = tokens[i, :prompt_len].to(torch.int32).cpu()
+            padded = torch.zeros(padded_len, dtype=torch.int32)
+            padded[:prompt_len] = tok_ids
+            embed_parts.append(self.embed_w_cpu[padded.long()])
+        embed_cat = torch.cat(embed_parts, dim=0)  # [U*padded_len, hidden]
+        x = ttnn.from_torch(
+            embed_cat.unsqueeze(0).unsqueeze(0).to(torch.bfloat16),  # [1, 1, U*T, hidden]
+            device=self.device,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=mapper,
+        )
+
+        # 2. Page table for all users: [U, W]
+        page_table_tt = ttnn.from_torch(
+            page_table[:batch].to(torch.int32),
+            device=self.device,
+            dtype=ttnn.int32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=mapper,
+        )
+
+        # 3. RoPE: all users start at position 0 (no prefix cache in this path)
+        cos_matrix = ttnn.slice(self.rope["cos_matrix"], [0, 0, 0, 0], [1, 1, padded_len, rope_dim])
+        sin_matrix = ttnn.slice(self.rope["sin_matrix"], [0, 0, 0, 0], [1, 1, padded_len, rope_dim])
+        rot_mats = (cos_matrix, sin_matrix, self.rope["trans_matrix"])
+
+        # 4. Forward through all layers
+        # For Phase 1: process as flat [1,1,U*T,hidden]. Attention handles per-user
+        # KV fill via user_id parameter. SDPA sees the full concatenated sequence
+        # with causal masking (cross-user attention is masked by causal constraint
+        # since user i's tokens come before user i+1's in the concatenated sequence).
+        #
+        # NOTE: This is correct ONLY when all users have the same padded_len and
+        # start from position 0, because the causal mask naturally separates users
+        # (user 0 tokens [0..T-1] can't attend to user 1 tokens [T..2T-1] since
+        # the latter have higher positions in the causal ordering).
+        for layer_idx in range(self.num_layers_to_run):
+            dl = self.decoder_layers[layer_idx]
+            x_next = dl.forward(
+                x, None, rot_mats, page_table_tt, kv_cache[layer_idx], mode="prefill",
+                user_id=0, batch_size=batch,
+            )
+            _dealloc(x, force=False)
+            x = x_next
+
+        # 5. Extract last token for each user and compute logits
+        out_logits = []
+        for i in range(batch):
+            prompt_len = int(prompt_lens[i])
+            offset = i * padded_len + prompt_len - 1
+            x_last = ttnn.slice(x, [0, 0, offset, 0], [1, 1, offset + 1, hidden])
+            x_last_normed = _sharded_rms_norm(x_last, self.final_norm, hidden)
+            logits_tt = ttnn.linear(x_last_normed, self.lm_head_w)
+
+            # Assemble vocab-sharded logits on host
+            if self.lm_head_sharded_vocab and _is_mesh_device(self.device):
+                shards = ttnn.get_device_tensors(logits_tt)
+                tp_size = self.lm_head_tp_size
+                num_shards = len(shards)
+                if num_shards == tp_size:
+                    tp_shards = list(shards)
+                elif num_shards > tp_size:
+                    tp_axis = self.lm_head_tp_axis if self.lm_head_tp_axis is not None else 0
+                    mesh_cols = int(self.device.shape[1])
+                    dp_stride = mesh_cols if tp_axis == 0 else 1
+                    tp_shards = [shards[j * dp_stride] for j in range(tp_size)]
+                else:
+                    tp_shards = list(shards)
+                logits_shards = [ttnn.to_torch(t.cpu())[..., :int(t.shape[-1])] for t in tp_shards]
+                logits_torch = torch.cat(logits_shards, dim=-1)[..., :vocab]
+                logits_flat = logits_torch.reshape(-1, vocab)
+            else:
+                logits_torch = _tt_to_torch_for_vllm_output(tensor=logits_tt, device=self.device)
+                logits_flat = logits_torch[..., :vocab].reshape(-1, vocab)
+
+            out_logits.append(logits_flat.to(dtype=torch.float32).cpu())
+            _dealloc(logits_tt, force=False)
+            _dealloc(x_last, force=False)
+            _dealloc(x_last_normed, force=False)
+
+        _dealloc(x, force=False)
+        _dealloc(cos_matrix, force=False)
+        _dealloc(sin_matrix, force=False)
+        _dealloc(page_table_tt, force=False)
+
+        if self.tt_ccl is not None:
+            self.tt_ccl.reset_sem_counters()
+
+        logger.info("Batched prefill complete: {} users", batch)
         return torch.stack(out_logits, dim=0)  # [B, 1, vocab]
 
     def _prefill_chunked(
