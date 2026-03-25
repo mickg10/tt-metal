@@ -608,9 +608,8 @@ class Glm4MoeTT:
             )
 
             # Full decoder layer for MTP (layer 92)
-            from models.demos.glm4_moe.tt.layer_weights import convert_decoder_layer_weights
             mtp_lw = convert_decoder_layer_weights(
-                state_dict=state, layer_idx=mtp_layer_idx, device=device,
+                device=device, state=state, layer_idx=mtp_layer_idx,
                 hparams=hparams, cache_dir=cache_dir / "mtp",
             )
             _mtp_decoder_layer = Glm4MoeDecoderLayer(
