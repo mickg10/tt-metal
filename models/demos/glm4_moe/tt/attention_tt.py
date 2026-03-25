@@ -775,10 +775,16 @@ class Glm4MoeAttention(LightweightModule):
 
         # Column-parallel QKV: each device has its own output slice, no all-reduce needed.
 
-        if seq_len > self.MAX_QKV_MM_SEQ_LEN:
-            xqkv = ttnn.reshape(xqkv, [1, 1, seq_len, -1])
+        if total_seq > self.MAX_QKV_MM_SEQ_LEN:
+            xqkv = ttnn.reshape(xqkv, [1, 1, total_seq, -1])
 
         _dealloc(x)
+
+        # For batched prefill: reshape to [U, 1, T, qkv_dim] BEFORE head split.
+        # nlp_create_qkv_heads naturally produces [U, heads, T, dim] when input has batch > 1.
+        # This follows the proven Llama batched prefill pattern (tt_transformers/attention.py:961).
+        if batch_size > 1:
+            xqkv = ttnn.reshape(xqkv, [batch_size, 1, seq_len, -1])
 
         # 3. Split into Q, K, V heads (prefill)
         q, k, v = ttnn.experimental.nlp_create_qkv_heads(
@@ -788,16 +794,10 @@ class Glm4MoeAttention(LightweightModule):
             transpose_k_heads=False,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
-        # q: [1, 12, total_seq, 128], k: [1, 1, total_seq, 128], v: [1, 1, total_seq, 128]
+        # Single user: q[1, 12, T, 128], k[1, 1, T, 128], v[1, 1, T, 128]
+        # Batched:     q[U, 12, T, 128], k[U, 1, T, 128], v[U, 1, T, 128]
 
         _dealloc(xqkv)
-
-        # For batched prefill: reshape from [1, heads, U*T, dim] to [U, heads, T, dim]
-        # so each user gets independent causal SDPA and correct per-user RoPE positions.
-        if batch_size > 1:
-            q = ttnn.reshape(q, [batch_size, self.n_local_heads, seq_len, self.head_dim])
-            k = ttnn.reshape(k, [batch_size, self.n_local_kv_heads, seq_len, self.head_dim])
-            v = ttnn.reshape(v, [batch_size, self.n_local_kv_heads, seq_len, self.head_dim])
 
         _sync("after split heads")
 
@@ -895,22 +895,15 @@ class Glm4MoeAttention(LightweightModule):
         _sync("after SDPA")
 
         # 8. Reshape and concat heads
+        attn_output = ttnn.experimental.nlp_concat_heads(
+            attn_output,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        # Single: [1, 1, T, 1536]. Batched: [U, 1, T, 1536]
+
+        # Flatten batch back for O-proj matmul
         if batch_size > 1:
-            # Batched: attn_output is [U, 12, T, 128]. Concat heads per user.
-            attn_output = ttnn.reshape(attn_output, [batch_size, self.n_local_heads, seq_len, self.head_dim])
-            attn_output = ttnn.experimental.nlp_concat_heads(
-                attn_output,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            )
-            # -> [U, 1, T, 1536]. Flatten back to [1, 1, U*T, 1536] for O-proj matmul.
             attn_output = ttnn.reshape(attn_output, [1, 1, total_seq, -1])
-        else:
-            attn_output = ttnn.reshape(attn_output, [1, self.n_local_heads, -1, self.head_dim])
-            attn_output = ttnn.experimental.nlp_concat_heads(
-                attn_output,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            )
-            # -> [1, 1, seq_len, 1536]
 
         # Reshape for long sequences (must match QKV path threshold)
         _oproj_thresh = self.MAX_QKV_MM_SEQ_LEN
