@@ -1650,6 +1650,9 @@ class Glm4MoeTT:
         # MTP: allocate persistent tensors + compile warmup BEFORE trace capture
         mtp_embed_tt = None
         mtp_logits_tt_compile = None
+        mtp_tt_positions = None
+        mtp_cos_batch = None
+        mtp_sin_batch = None
         if self.mtp_enabled and active <= self.mtp_max_batch:
             logger.info("  [MTP COMPILE] Allocating MTP persistent tensors for batch={}", active)
             hidden = int(self.hparams.hidden_size)
@@ -1838,9 +1841,9 @@ class Glm4MoeTT:
             embed_tt=embed_tt,
             retained_intermediates=_trace_retained,
             mtp_hidden_tt=mtp_hidden_tt,
-            mtp_positions_tt=mtp_tt_positions if self.mtp_enabled else None,
-            mtp_cos_batch_tt=mtp_cos_batch if self.mtp_enabled else None,
-            mtp_sin_batch_tt=mtp_sin_batch if self.mtp_enabled else None,
+            mtp_positions_tt=mtp_tt_positions,
+            mtp_cos_batch_tt=mtp_cos_batch,
+            mtp_sin_batch_tt=mtp_sin_batch,
             mtp_embed_tt=mtp_embed_tt,
             mtp_logits_tt=mtp_logits_tt,
         )
