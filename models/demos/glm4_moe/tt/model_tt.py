@@ -593,21 +593,16 @@ class Glm4MoeTT:
             eh_full = state[eh_key]
             if hasattr(eh_full, 'item') or not isinstance(eh_full, torch.Tensor):
                 eh_full = torch.tensor(eh_full) if not isinstance(eh_full, torch.Tensor) else eh_full
-            # HF layout: [out_features=hidden, in_features=2*hidden]
-            # ttnn.linear(x, w) computes x @ w, so w must be [in_features, out_features]
-            eh_full_t = eh_full.t().contiguous()  # [2*hidden, hidden]
-            eh_e = eh_full_t[:_hidden, :].contiguous()  # [hidden, hidden] (embed half)
-            eh_h = eh_full_t[_hidden:, :].contiguous()   # [hidden, hidden] (hidden half)
-            mapper = ttnn.ReplicateTensorToMesh(device) if _is_mesh_device(device) else None
-            _mtp_eh_proj_e_w = ttnn.from_torch(
-                eh_e.to(torch.bfloat16), device=device, dtype=ttnn.bfloat16,
-                layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                mesh_mapper=mapper,
+            # HF layout: [out=hidden, in=2*hidden]. Split in-features, keep HF [out, in] format.
+            eh_e_hf = eh_full[:, :_hidden].contiguous()  # [hidden_out, hidden_in] (embed half)
+            eh_h_hf = eh_full[:, _hidden:].contiguous()   # [hidden_out, hidden_in] (hidden half)
+            # Use _linear_weight_tt which transposes HF [out, in] → TT [1, 1, in, out]
+            from models.demos.glm4_moe.tt.layer_weights import _linear_weight_tt
+            _mtp_eh_proj_e_w = _linear_weight_tt(
+                device=device, torch_weight_out_in=eh_e_hf.to(torch.bfloat16),
             )
-            _mtp_eh_proj_h_w = ttnn.from_torch(
-                eh_h.to(torch.bfloat16), device=device, dtype=ttnn.bfloat16,
-                layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                mesh_mapper=mapper,
+            _mtp_eh_proj_h_w = _linear_weight_tt(
+                device=device, torch_weight_out_in=eh_h_hf.to(torch.bfloat16),
             )
 
             # shared_head norm + LM head (same vocab sharding as main lm_head)
@@ -618,13 +613,11 @@ class Glm4MoeTT:
                 weight_dtype=ttnn.bfloat16, is_distributed=False,
             )
             sh_key = f"model.layers.{mtp_layer_idx}.shared_head.head.weight"
-            sh_w = state[sh_key].to(torch.bfloat16)
-            # HF: [vocab, hidden]. ttnn.linear needs [hidden, vocab] (w transposed).
-            sh_w = sh_w.t().contiguous()
-            _mtp_shared_head_w = ttnn.from_torch(
-                sh_w, device=device, dtype=ttnn.bfloat16,
-                layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                mesh_mapper=mapper,
+            sh_w_hf = state[sh_key].to(torch.bfloat16)  # HF: [vocab, hidden]
+            # Use _linear_weight_tt which transposes HF [out, in] → TT [1, 1, in, out]
+            # Same as main lm_head loading
+            _mtp_shared_head_w = _linear_weight_tt(
+                device=device, torch_weight_out_in=sh_w_hf,
             )
 
             # Full decoder layer for MTP (layer 92)
