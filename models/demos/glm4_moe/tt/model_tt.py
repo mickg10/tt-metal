@@ -1247,6 +1247,9 @@ class Glm4MoeTT:
             _t0 = _time.perf_counter()
 
             self._update_trace_inputs(state, tokens, positions, page_table)
+            # MTP: update MTP inputs with PREVIOUS step's main output
+            if self.mtp_enabled and state.mtp_embed_tt is not None and self._prev_main_ids is not None:
+                self._copy_mtp_trace_inputs(state, self._prev_main_ids, positions)
             _t1 = _time.perf_counter()
 
             if self.tt_ccl is not None:
@@ -1397,6 +1400,16 @@ class Glm4MoeTT:
             else:
                 # Fallback: eager MTP (slower, 52ms overhead)
                 self._run_mtp_after_trace_replay(state, _output, active, tokens, positions, page_table, kv_cache)
+
+        # Save main output token IDs for next step's MTP embed update
+        if self.mtp_enabled and _output is not None:
+            try:
+                if _output.dim() >= 2 and _output.shape[-1] > 1:
+                    self._prev_main_ids = _output.reshape(active, -1).argmax(dim=-1).to(torch.int32)
+                else:
+                    self._prev_main_ids = _output.reshape(-1)[:active].to(torch.int32)
+            except Exception:
+                self._prev_main_ids = None
 
         return _output
 
