@@ -623,11 +623,18 @@ class Glm4MoeTT:
                 mesh_mapper=lm_head_mapper,
             )
 
-            # Full decoder layer for MTP (layer 92)
+            # Full decoder layer for MTP (layer 92).
+            # Use BF16 experts for MTP (not BF8) — FP8→BF8 precision loss destroys
+            # MTP prediction accuracy (0% acceptance with BF8 vs 30%+ with BF16).
+            _orig_dtype = os.environ.get("GLM4_MOE_EXPERTS_TT_DTYPE", "")
+            mtp_expert_dtype = os.environ.get("GLM4_MOE_MTP_EXPERTS_TT_DTYPE", "bf16")
+            os.environ["GLM4_MOE_EXPERTS_TT_DTYPE"] = mtp_expert_dtype
+            logger.info("MTP loading with expert dtype={}", mtp_expert_dtype)
             mtp_lw = convert_decoder_layer_weights(
                 device=device, state=state, layer_idx=mtp_layer_idx,
-                hparams=hparams, cache_dir=cache_dir / "mtp",
+                hparams=hparams, cache_dir=cache_dir / "mtp_bf16",
             )
+            os.environ["GLM4_MOE_EXPERTS_TT_DTYPE"] = _orig_dtype
             _mtp_decoder_layer = Glm4MoeDecoderLayer(
                 mesh_device=device, hparams=hparams, layer_weights=mtp_lw,
                 configuration=configuration, moe_runtime=moe_runtime, tt_ccl=tt_ccl,
