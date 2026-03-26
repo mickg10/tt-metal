@@ -1642,12 +1642,13 @@ class Glm4MoeTT:
             if layer_idx < 3 or layer_idx % 20 == 0 or layer_idx == self.num_layers_to_run - 1:
                 logger.info("  [TRACE_CAPTURE] Layer {}/{} ({:.1f}s)", layer_idx + 1, self.num_layers_to_run, time.time() - _t_layer)
 
-        # MTP: clone hidden state before final_norm for MTP decoder layer input.
-        # The clone runs inside the trace — on replay, it produces a trace-owned
-        # copy of the hidden state at the correct DRAM address.
+        # MTP: copy hidden state before final_norm for MTP decoder layer input.
+        # ttnn.clone() is NOT trace-safe (dispatches outside trace command stream).
+        # Use multiply(x, 1.0) which is a compute kernel that records into the trace.
+        # This is the same pattern used by WH Galaxy (model_tt.py).
         mtp_hidden_tt = None
         if self.mtp_enabled:
-            mtp_hidden_tt = ttnn.clone(x, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            mtp_hidden_tt = ttnn.multiply(x, 1.0, memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
         x = _sharded_rms_norm(x, self.final_norm, int(self.hparams.hidden_size))
         logits_tt = ttnn.linear(x, self.lm_head_w)
