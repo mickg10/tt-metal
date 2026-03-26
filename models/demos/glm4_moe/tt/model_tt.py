@@ -1351,34 +1351,65 @@ class Glm4MoeTT:
 
         # Read outputs.
         _t6 = _time.perf_counter() if '_t0' in dir() else None
+        _output = None
         if sampling_params is not None and state.top1_indices_tt is not None:
-            next_ids_torch = _tt_to_torch_for_vllm_output(
+            _output = _tt_to_torch_for_vllm_output(
                 tensor=state.top1_indices_tt, device=self.device
             ).reshape(-1).to(dtype=torch.int32).cpu()
-            if _t6 is not None and hasattr(self, '_replay_count') and (self._replay_count <= 3 or self._replay_count % 50 == 0):
-                logger.warning("PERF REPLAY #{}: output_read={:.1f}ms", self._replay_count, (_time.perf_counter() - _t6) * 1000)
-            return next_ids_torch
-
-        if state.logits_tt is not None:
+        elif state.logits_tt is not None:
             if sampling_params is not None:
                 if _is_mesh_device(self.device):
-                    # TG mesh: device-side sampling ops hang. Use optimized host transfer.
                     vocab = int(self.hparams.vocab_size)
-                    result = self._host_argmax_from_trace_logits(state.logits_tt, active, vocab)
-                    if _t6 is not None and hasattr(self, '_replay_count') and (self._replay_count <= 3 or self._replay_count % 50 == 0):
-                        logger.warning("PERF REPLAY #{}: output_read={:.1f}ms (host_argmax)", self._replay_count, (_time.perf_counter() - _t6) * 1000)
-                    return result
+                    _output = self._host_argmax_from_trace_logits(state.logits_tt, active, vocab)
                 else:
-                    # Non-TG: device-side sampling works fine outside trace.
-                    return self._sample_from_trace_logits(state.logits_tt, active)
-            # Non-sampling path: still need full logits on host
-            vocab = int(self.hparams.vocab_size)
-            logits_host = self._logits_to_host(state.logits_tt, active, vocab)
-            if _t6 is not None and hasattr(self, '_replay_count') and (self._replay_count <= 3 or self._replay_count % 50 == 0):
-                logger.warning("PERF REPLAY #{}: output_read={:.1f}ms (full_logits)", self._replay_count, (_time.perf_counter() - _t6) * 1000)
-            return logits_host
+                    _output = self._sample_from_trace_logits(state.logits_tt, active)
+            else:
+                vocab = int(self.hparams.vocab_size)
+                _output = self._logits_to_host(state.logits_tt, active, vocab)
 
-        return torch.zeros((active, 1, int(self.hparams.vocab_size)), dtype=torch.float32)
+        if _output is None:
+            _output = torch.zeros((active, 1, int(self.hparams.vocab_size)), dtype=torch.float32)
+
+        if _t6 is not None and hasattr(self, '_replay_count') and (self._replay_count <= 3 or self._replay_count % 50 == 0):
+            logger.warning("PERF REPLAY #{}: output_read={:.1f}ms", self._replay_count, (_time.perf_counter() - _t6) * 1000)
+
+        # MTP: run speculative decode AFTER reading main output
+        if not _is_capture and self.mtp_enabled:
+            self._run_mtp_after_trace_replay(state, _output, active, tokens, positions, page_table, kv_cache)
+
+        return _output
+
+    def _run_mtp_after_trace_replay(self, state, result, active, tokens, positions, page_table, kv_cache):
+        """Run MTP eagerly after trace replay to produce draft tokens."""
+        if not self.mtp_enabled or active > self.mtp_max_batch:
+            return
+        if state.mtp_hidden_tt is None:
+            return  # No hidden state saved (trace captured without MTP)
+        try:
+            # Get main token IDs from result (logits or token IDs)
+            if result.dim() >= 2 and result.shape[-1] > 1:
+                main_ids = result.reshape(active, -1).argmax(dim=-1).to(torch.int32)
+            else:
+                main_ids = result.reshape(-1)[:active].to(torch.int32)
+            mtp_positions = positions[:active] + 1
+            self._last_draft_token_ids = self._mtp_forward_eager(
+                main_token_ids=main_ids,
+                hidden_state=state.mtp_hidden_tt,  # trace-owned clone of pre-norm hidden
+                mtp_positions=mtp_positions,
+                page_table=page_table[:active],
+                kv_cache=kv_cache,
+            )
+            if self._last_draft_token_ids is not None:
+                if not hasattr(self, '_mtp_call_count'):
+                    self._mtp_call_count = 0
+                self._mtp_call_count += 1
+                if self._mtp_call_count <= 3 or self._mtp_call_count % 50 == 0:
+                    logger.warning("MTP #{}: draft_ids={}", self._mtp_call_count,
+                                   self._last_draft_token_ids[:4].tolist())
+        except Exception as e:
+            logger.warning("MTP after trace replay failed (non-fatal): {}", e)
+            import traceback; traceback.print_exc()
+            self._last_draft_token_ids = None
 
     def _capture_decode_trace(
         self,
@@ -1611,6 +1642,13 @@ class Glm4MoeTT:
             if layer_idx < 3 or layer_idx % 20 == 0 or layer_idx == self.num_layers_to_run - 1:
                 logger.info("  [TRACE_CAPTURE] Layer {}/{} ({:.1f}s)", layer_idx + 1, self.num_layers_to_run, time.time() - _t_layer)
 
+        # MTP: clone hidden state before final_norm for MTP decoder layer input.
+        # The clone runs inside the trace — on replay, it produces a trace-owned
+        # copy of the hidden state at the correct DRAM address.
+        mtp_hidden_tt = None
+        if self.mtp_enabled:
+            mtp_hidden_tt = ttnn.clone(x, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+
         x = _sharded_rms_norm(x, self.final_norm, int(self.hparams.hidden_size))
         logits_tt = ttnn.linear(x, self.lm_head_w)
 
@@ -1650,7 +1688,7 @@ class Glm4MoeTT:
             top1_indices_tt=top1_indices_tt if not use_logits_output else None,
             embed_tt=embed_tt,
             retained_intermediates=_trace_retained,
-
+            mtp_hidden_tt=mtp_hidden_tt,
         )
 
     def _update_trace_inputs(
