@@ -1382,6 +1382,61 @@ class Glm4MoeTT:
 
         return _output
 
+    def _mtp_decode_step_tt(
+        self,
+        *,
+        state: _DecodeTraceState,
+        kv_cache: list,
+    ) -> ttnn.Tensor:
+        """MTP decode step using persistent device tensors (TRACE-SAFE).
+
+        All ops are compute kernels that record into the trace command buffer.
+        Returns MTP logits on device [1,1,B,vocab].
+        """
+        batch = int(state.batch)
+        hidden = int(self.hparams.hidden_size)
+        mtp_layer_idx = int(self.hparams.num_hidden_layers)  # 92
+
+        # 1. Embed: use persistent buffer (uploaded by _copy_mtp_trace_inputs)
+        x_embed = state.mtp_embed_tt
+
+        # 2. enorm(embedded), hnorm(hidden_state from main trace)
+        enorm_out = _sharded_rms_norm(x_embed, self.mtp_enorm, hidden)
+        hnorm_out = _sharded_rms_norm(state.mtp_hidden_tt, self.mtp_hnorm, hidden)
+
+        # 3. Split-matmul projection
+        proj_e = ttnn.linear(enorm_out, self.mtp_eh_proj_e_w)
+        _dealloc(enorm_out, force=False)
+        proj_h = ttnn.linear(hnorm_out, self.mtp_eh_proj_h_w)
+        _dealloc(hnorm_out, force=False)
+        proj = ttnn.add(proj_e, proj_h)
+        _dealloc(proj_e, force=False)
+        _dealloc(proj_h, force=False)
+
+        # 4. RoPE from persistent cos/sin (BH 3-tuple, no sin_neg)
+        rot_mats = (
+            state.mtp_cos_batch_tt,
+            state.mtp_sin_batch_tt,
+            self.rope["trans_matrix"],
+        )
+
+        # 5. MTP decoder layer forward
+        x = self.mtp_decoder_layer.forward(
+            proj, state.mtp_positions_tt, rot_mats,
+            state.mtp_page_table_tt if state.mtp_page_table_tt is not None else state.page_table_tt,
+            kv_cache[mtp_layer_idx],
+            mode="decode",
+            active_batch=batch,
+        )
+        _dealloc(proj, force=False)
+
+        # 6. shared_head norm + LM head
+        x = _sharded_rms_norm(x, self.mtp_shared_head_norm, hidden)
+        logits_tt = ttnn.linear(x, self.mtp_shared_head_w)
+        _dealloc(x, force=False)
+
+        return logits_tt
+
     def _run_mtp_after_trace_replay(self, state, result, active, tokens, positions, page_table, kv_cache):
         """Run MTP eagerly after trace replay to produce draft tokens."""
         if not self.mtp_enabled or active > self.mtp_max_batch:
