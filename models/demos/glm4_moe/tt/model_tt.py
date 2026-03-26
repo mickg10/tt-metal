@@ -46,6 +46,7 @@ from models.demos.glm4_moe.tt.layer_weights import (
     convert_decoder_layer_weights,
 )
 from models.demos.glm4_moe.tt.ccl import CCL
+from models.demos.glm4_moe.tt.attention_tt import _simple_all_gather
 from models.demos.glm4_moe.tt.moe_tt import create_moe_runtime, Glm4MoeMoERuntime
 from models.demos.glm4_moe.tt.trace_retainer import (
     TraceRetainer,
@@ -378,14 +379,14 @@ class Glm4MoeTT:
         # This eliminates the biggest source of host overhead (92ms → ~30ms per token).
         _device_embed = os.environ.get("GLM4_MOE_DEVICE_EMBED", "1").strip() == "1"
         if _device_embed and _is_mesh_device(device):
-            logger.info("Loading embedding to device (~371 MB/device)")
-            embed_w = ttnn.from_torch(
-                embed_w_cpu.unsqueeze(0).unsqueeze(0),  # [1, 1, vocab, hidden]
+            logger.info("Loading embedding to device (~371 MB/device) via as_tensor (cached)")
+            # Use ttnn.as_tensor (same as WH) — ttnn.from_torch caused nanobind leaks
+            from models.demos.glm4_moe.tt.tt_embedding import convert_embedding_weight_to_tt
+            embed_w = convert_embedding_weight_to_tt(
                 device=device,
+                embed_weight=embed_w_cpu,
+                cache_file_name=cache_dir / "embed_tokens_w",
                 dtype=ttnn.bfloat16,
-                layout=ttnn.ROW_MAJOR_LAYOUT,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                mesh_mapper=ttnn.ReplicateTensorToMesh(device),
             )
         else:
             embed_w = None
@@ -1250,54 +1251,93 @@ class Glm4MoeTT:
             _t0 = _time.perf_counter()
 
             self._update_trace_inputs(state, tokens, positions, page_table)
-            # MTP: update MTP embed + positions + RoPE with PREVIOUS step's output
-            if self.mtp_enabled and state.mtp_embed_tt is not None and self._prev_main_ids is not None:
+            # MTP: update MTP inputs between trace replays.
+            # With in-trace embed (embed_w loaded): only update positions + RoPE.
+            #   The embedding is computed INSIDE the trace from argmax of main logits.
+            # Without: full embed + positions + RoPE update from previous step's output.
+            if self.mtp_enabled and state.mtp_embed_tt is not None:
                 try:
                     is_mesh = _is_mesh_device(self.device)
                     mapper = ttnn.ReplicateTensorToMesh(self.device) if is_mesh else None
                     batch = int(state.batch)
-                    hidden = int(self.hparams.hidden_size)
 
-                    # 1. Update MTP embedding (host lookup + H2D copy)
-                    embed_torch = self.embed_w_cpu[self._prev_main_ids[:batch].long()]
-                    hidden_batch = int(state.mtp_embed_tt.shape[-2])
-                    if batch < hidden_batch:
-                        pad = torch.zeros(hidden_batch - batch, hidden, dtype=embed_torch.dtype)
-                        embed_torch = torch.cat([embed_torch, pad], dim=0)
-                    host_embed = ttnn.from_torch(
-                        embed_torch.unsqueeze(0).unsqueeze(0).to(torch.bfloat16),
-                        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, mesh_mapper=mapper,
-                    )
-                    ttnn.copy_host_to_device_tensor(host_embed, state.mtp_embed_tt)
-
-                    # 2. Update MTP positions (= main positions + 1)
-                    if state.mtp_positions_tt is not None:
+                    if self.embed_w is not None:
+                        # In-trace embedding mode: only copy positions + RoPE
+                        # (embedding is computed inside trace from argmax -> ttnn.embedding)
                         mtp_pos = (positions[:batch] + 1).clamp(min=0, max=int(self.max_seq_len) - 1)
-                        host_pos = ttnn.from_torch(
-                            mtp_pos.view(-1).contiguous().to(torch.int32),
-                            dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT, mesh_mapper=mapper,
-                        )
-                        ttnn.copy_host_to_device_tensor(host_pos, state.mtp_positions_tt)
 
-                    # 3. Update MTP cos/sin (gather from host RoPE table at MTP positions)
-                    if state.mtp_cos_batch_tt is not None:
-                        mtp_pos_clamped = (positions[:batch] + 1).clamp(min=0, max=int(self.max_seq_len) - 1)
-                        cos_host = self.rope["cos_matrix_host"]  # [1, 1, max_seq, rope_dim]
-                        sin_host = self.rope["sin_matrix_host"]
-                        rope_dim = int(cos_host.shape[3])
-                        cos_gathered = cos_host[0, 0, mtp_pos_clamped.long(), :]  # [B, rope_dim]
-                        sin_gathered = sin_host[0, 0, mtp_pos_clamped.long(), :]
-                        # Reshape to [1, B, 1, rope_dim] to match persistent buffer shape
-                        host_cos = ttnn.from_torch(
-                            cos_gathered.unsqueeze(0).unsqueeze(2).to(torch.bfloat16),
+                        # 1. Update MTP positions
+                        if state.mtp_positions_tt is not None:
+                            host_pos = ttnn.from_torch(
+                                mtp_pos.view(-1).contiguous().to(torch.int32),
+                                dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT, mesh_mapper=mapper,
+                            )
+                            ttnn.copy_host_to_device_tensor(host_pos, state.mtp_positions_tt)
+
+                        # 2. Update MTP cos/sin
+                        if state.mtp_cos_batch_tt is not None:
+                            mtp_pos_clamped = mtp_pos.long().clamp(
+                                min=0, max=int(self.rope["cos_matrix_host"].shape[2]) - 1
+                            )
+                            cos_host = self.rope["cos_matrix_host"]
+                            sin_host = self.rope["sin_matrix_host"]
+                            rope_dim = int(cos_host.shape[3])
+                            cos_gathered = cos_host[0, 0, mtp_pos_clamped, :]
+                            sin_gathered = sin_host[0, 0, mtp_pos_clamped, :]
+                            host_cos = ttnn.from_torch(
+                                cos_gathered.unsqueeze(0).unsqueeze(2).to(torch.bfloat16),
+                                dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, mesh_mapper=mapper,
+                            )
+                            host_sin = ttnn.from_torch(
+                                sin_gathered.unsqueeze(0).unsqueeze(2).to(torch.bfloat16),
+                                dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, mesh_mapper=mapper,
+                            )
+                            ttnn.copy_host_to_device_tensor(host_cos, state.mtp_cos_batch_tt)
+                            ttnn.copy_host_to_device_tensor(host_sin, state.mtp_sin_batch_tt)
+
+                    elif self._prev_main_ids is not None:
+                        # Fallback: full embed + positions + RoPE update
+                        hidden = int(self.hparams.hidden_size)
+
+                        # 1. Update MTP embedding (host lookup + H2D copy)
+                        embed_torch = self.embed_w_cpu[self._prev_main_ids[:batch].long()]
+                        hidden_batch = int(state.mtp_embed_tt.shape[-2])
+                        if batch < hidden_batch:
+                            pad = torch.zeros(hidden_batch - batch, hidden, dtype=embed_torch.dtype)
+                            embed_torch = torch.cat([embed_torch, pad], dim=0)
+                        host_embed = ttnn.from_torch(
+                            embed_torch.unsqueeze(0).unsqueeze(0).to(torch.bfloat16),
                             dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, mesh_mapper=mapper,
                         )
-                        host_sin = ttnn.from_torch(
-                            sin_gathered.unsqueeze(0).unsqueeze(2).to(torch.bfloat16),
-                            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, mesh_mapper=mapper,
-                        )
-                        ttnn.copy_host_to_device_tensor(host_cos, state.mtp_cos_batch_tt)
-                        ttnn.copy_host_to_device_tensor(host_sin, state.mtp_sin_batch_tt)
+                        ttnn.copy_host_to_device_tensor(host_embed, state.mtp_embed_tt)
+
+                        # 2. Update MTP positions (= main positions + 1)
+                        if state.mtp_positions_tt is not None:
+                            mtp_pos = (positions[:batch] + 1).clamp(min=0, max=int(self.max_seq_len) - 1)
+                            host_pos = ttnn.from_torch(
+                                mtp_pos.view(-1).contiguous().to(torch.int32),
+                                dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT, mesh_mapper=mapper,
+                            )
+                            ttnn.copy_host_to_device_tensor(host_pos, state.mtp_positions_tt)
+
+                        # 3. Update MTP cos/sin (gather from host RoPE table at MTP positions)
+                        if state.mtp_cos_batch_tt is not None:
+                            mtp_pos_clamped = (positions[:batch] + 1).clamp(min=0, max=int(self.max_seq_len) - 1)
+                            cos_host = self.rope["cos_matrix_host"]
+                            sin_host = self.rope["sin_matrix_host"]
+                            rope_dim = int(cos_host.shape[3])
+                            cos_gathered = cos_host[0, 0, mtp_pos_clamped.long(), :]
+                            sin_gathered = sin_host[0, 0, mtp_pos_clamped.long(), :]
+                            host_cos = ttnn.from_torch(
+                                cos_gathered.unsqueeze(0).unsqueeze(2).to(torch.bfloat16),
+                                dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, mesh_mapper=mapper,
+                            )
+                            host_sin = ttnn.from_torch(
+                                sin_gathered.unsqueeze(0).unsqueeze(2).to(torch.bfloat16),
+                                dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, mesh_mapper=mapper,
+                            )
+                            ttnn.copy_host_to_device_tensor(host_cos, state.mtp_cos_batch_tt)
+                            ttnn.copy_host_to_device_tensor(host_sin, state.mtp_sin_batch_tt)
                 except Exception as e:
                     logger.warning("MTP input update failed (non-fatal): {}", e)
             _t1 = _time.perf_counter()
@@ -1448,7 +1488,7 @@ class Glm4MoeTT:
         # MTP: run eagerly after trace replay to get correct embed(T_N) for predicting T_{N+1}.
         # Traced MTP uses stale embed(T_{N-1}) → predicts T_N (same as main) → 0% acceptance.
         # Eager MTP uses embed(T_N) → correctly predicts T_{N+1}.
-        _mtp_eager_only = os.environ.get("GLM4_MOE_MTP_EAGER_ONLY", "1").strip() == "1"
+        _mtp_eager_only = os.environ.get("GLM4_MOE_MTP_EAGER_ONLY", "0").strip() == "1"
         if not _is_capture and self.mtp_enabled:
             if state.mtp_logits_tt is not None and not _mtp_eager_only:
                 # Traced MTP: read MTP logits from trace output + host argmax
@@ -1514,18 +1554,24 @@ class Glm4MoeTT:
         *,
         state: _DecodeTraceState,
         kv_cache: list,
+        mtp_current_embed_tt: ttnn.Tensor | None = None,
     ) -> ttnn.Tensor:
         """MTP decode step using persistent device tensors (TRACE-SAFE).
 
-        All ops are compute kernels that record into the trace command buffer.
+        If mtp_current_embed_tt is provided, uses it directly as the token embedding
+        (from in-trace argmax->embedding chain). Otherwise falls back to state.mtp_embed_tt
+        (persistent buffer uploaded between replays).
         Returns MTP logits on device [1,1,B,vocab].
         """
         batch = int(state.batch)
         hidden = int(self.hparams.hidden_size)
         mtp_layer_idx = int(self.hparams.num_hidden_layers)  # 92
 
-        # 1. Embed: use persistent buffer (uploaded by _copy_mtp_trace_inputs)
-        x_embed = state.mtp_embed_tt
+        # 1. Embed: use in-trace embedding if available, else persistent buffer
+        if mtp_current_embed_tt is not None:
+            x_embed = mtp_current_embed_tt  # [1,1,B,hidden] from argmax->embedding inside trace
+        else:
+            x_embed = state.mtp_embed_tt  # [1,1,B,hidden] uploaded by _copy_mtp_trace_inputs
 
         # 2. enorm(embedded), hnorm(hidden_state from main trace)
         enorm_out = _sharded_rms_norm(x_embed, self.mtp_enorm, hidden)
@@ -1762,10 +1808,12 @@ class Glm4MoeTT:
         mtp_tt_positions = None
         mtp_cos_batch = None
         mtp_sin_batch = None
+        mtp_use_intrace_embed = self.mtp_enabled and self.embed_w is not None
         if self.mtp_enabled and active <= self.mtp_max_batch:
             logger.info("  [MTP COMPILE] Allocating MTP persistent tensors for batch={}", active)
             hidden = int(self.hparams.hidden_size)
             # MTP embed buffer: pre-allocated, host copies embedding between replays
+            # (still needed as fallback even with in-trace embed)
             mtp_embed_torch = self.embed_w_cpu[:active]  # dummy [active, hidden]
             mtp_embed_tt = ttnn.from_torch(
                 mtp_embed_torch.unsqueeze(0).unsqueeze(0).to(torch.bfloat16),
@@ -1780,6 +1828,44 @@ class Glm4MoeTT:
             )
             # MTP page table (reuse main page_table_tt)
             mtp_page_table_tt = None  # reuse state.page_table_tt
+
+            # In-trace embedding warmup: all_gather logits -> argmax -> embedding
+            mtp_current_embed_warmup = None
+            if mtp_use_intrace_embed:
+                try:
+                    tp_axis, tp_size = _tp_axis_and_size(self.device)
+                    vocab = int(self.hparams.vocab_size)
+                    _is_mesh = _is_mesh_device(self.device)
+                    if self.lm_head_sharded_vocab and _is_mesh and tp_size > 1:
+                        logits_gathered = _simple_all_gather(
+                            logits_tt, self.device, cluster_axis=tp_axis, dim=3,
+                        )
+                    else:
+                        logits_gathered = logits_tt
+                    logits_rm_mtp = ttnn.to_layout(logits_gathered, ttnn.ROW_MAJOR_LAYOUT)
+                    logits_rm_mtp_view = ttnn.slice(logits_rm_mtp, [0, 0, 0, 0], [1, 1, active, vocab])
+                    mtp_token_ids_tt = ttnn.argmax(logits_rm_mtp_view, dim=3, keepdim=False, use_multicore=True)
+                    _dealloc(logits_rm_mtp, force=False)
+                    if logits_gathered is not logits_tt:
+                        _dealloc(logits_gathered, force=False)
+                    # Reshape argmax output for embedding: [1,1,B,1] -> [B,1]
+                    mtp_token_ids_2d = ttnn.reshape(mtp_token_ids_tt, (active, 1))
+                    mtp_current_embed_warmup = ttnn.embedding(
+                        mtp_token_ids_2d, self.embed_w,
+                        layout=ttnn.TILE_LAYOUT,
+                        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    )
+                    # Reshape to [1,1,B,hidden] for MTP forward
+                    mtp_current_embed_warmup = ttnn.reshape(mtp_current_embed_warmup, (1, 1, active, hidden))
+                    _dealloc(mtp_token_ids_tt, force=False)
+                    _dealloc(mtp_token_ids_2d, force=False)
+                    logger.info("  [MTP COMPILE] In-trace embedding warmup completed for batch={}", active)
+                except Exception as e:
+                    logger.warning("  [MTP COMPILE] In-trace embedding warmup failed, will use fallback: {}", e)
+                    import traceback as _tb
+                    logger.warning("Traceback: {}", _tb.format_exc())
+                    mtp_use_intrace_embed = False
+                    mtp_current_embed_warmup = None
 
             # Create a temporary state for MTP compile warmup
             class _TmpState:
@@ -1796,8 +1882,13 @@ class Glm4MoeTT:
 
             # MTP compile warmup
             logger.info("  [MTP COMPILE] Running MTP compile warmup")
-            mtp_logits_tt_compile = self._mtp_decode_step_tt(state=_tmp, kv_cache=kv_cache)
-            logger.info("  [MTP COMPILE] MTP compile done")
+            mtp_logits_tt_compile = self._mtp_decode_step_tt(
+                state=_tmp, kv_cache=kv_cache,
+                mtp_current_embed_tt=mtp_current_embed_warmup,
+            )
+            logger.info("  [MTP COMPILE] MTP compile done (intrace_embed={})", mtp_use_intrace_embed)
+            if mtp_current_embed_warmup is not None:
+                _dealloc(mtp_current_embed_warmup, force=True)
 
         # Synchronize device to drain all async ops from compile-forward
         # before starting trace capture.
@@ -1896,9 +1987,39 @@ class Glm4MoeTT:
         logits_tt = ttnn.linear(x, self.lm_head_w)
 
         # MTP: run MTP decoder layer INSIDE the trace (after lm_head, before end_trace).
-        # This adds ~3ms to the trace (1 decoder layer) but eliminates 52ms eager overhead.
+        # With in-trace embed: all_gather logits -> argmax -> embedding -> MTP forward.
+        # This uses CURRENT token T_N (from argmax of main logits) instead of stale T_{N-1}.
+        # Without in-trace embed: uses persistent mtp_embed_tt buffer (stale, 0% acceptance).
         mtp_logits_tt = None
         if self.mtp_enabled and mtp_embed_tt is not None and mtp_hidden_tt is not None:
+            mtp_current_embed_trace = None
+            if mtp_use_intrace_embed:
+                # All-gather vocab shards -> full vocab -> argmax -> embedding
+                tp_axis, tp_size = _tp_axis_and_size(self.device)
+                vocab = int(self.hparams.vocab_size)
+                _is_mesh = _is_mesh_device(self.device)
+                if self.lm_head_sharded_vocab and _is_mesh and tp_size > 1:
+                    logits_gathered = _simple_all_gather(
+                        logits_tt, self.device, cluster_axis=tp_axis, dim=3,
+                    )
+                else:
+                    logits_gathered = logits_tt
+                logits_rm_mtp = ttnn.to_layout(logits_gathered, ttnn.ROW_MAJOR_LAYOUT)
+                logits_rm_mtp_view = ttnn.slice(logits_rm_mtp, [0, 0, 0, 0], [1, 1, active, vocab])
+                mtp_token_ids_tt = ttnn.argmax(logits_rm_mtp_view, dim=3, keepdim=False, use_multicore=True)
+                _dealloc(logits_rm_mtp, force=False)
+                if logits_gathered is not logits_tt:
+                    _dealloc(logits_gathered, force=False)
+                # Reshape for embedding: [1,1,B,1] -> [B,1]
+                mtp_token_ids_2d = ttnn.reshape(mtp_token_ids_tt, (active, 1))
+                mtp_current_embed_trace = ttnn.embedding(
+                    mtp_token_ids_2d, self.embed_w,
+                    layout=ttnn.TILE_LAYOUT,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                )
+                mtp_current_embed_trace = ttnn.reshape(mtp_current_embed_trace, (1, 1, active, int(self.hparams.hidden_size)))
+                # Don't deallocate mtp_token_ids -- they're trace intermediates
+
             class _TraceState:
                 pass
             _ts = _TraceState()
@@ -1910,8 +2031,11 @@ class Glm4MoeTT:
             _ts.mtp_sin_batch_tt = mtp_sin_batch
             _ts.mtp_page_table_tt = None  # reuse main page_table_tt
             _ts.page_table_tt = page_table_tt
-            mtp_logits_tt = self._mtp_decode_step_tt(state=_ts, kv_cache=kv_cache)
-            logger.info("  [TRACE_CAPTURE] MTP step captured")
+            mtp_logits_tt = self._mtp_decode_step_tt(
+                state=_ts, kv_cache=kv_cache,
+                mtp_current_embed_tt=mtp_current_embed_trace,
+            )
+            logger.info("  [TRACE_CAPTURE] MTP step captured (intrace_embed={})", mtp_use_intrace_embed)
 
         # On TG mesh, sampling ops (to_layout, slice, max, argmax) inside trace
         # produce wrong results. Do sampling on host instead (read logits from trace output).
