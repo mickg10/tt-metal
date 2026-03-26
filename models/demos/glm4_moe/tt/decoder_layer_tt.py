@@ -306,7 +306,7 @@ class Glm4MoeDecoderLayer:
         else:
             mlp_out = self._moe_forward(
                 h, compute_kernel_config=mlp_compute_kernel_config,
-                tp_axis=tp_axis, tp_enabled=tp_enabled,
+                tp_axis=tp_axis, tp_enabled=tp_enabled, active_batch=active_batch,
             )
         if _DBG_DECODE:
             logger.info("[DBG] DL{} after MLP: mlp_out.shape={}", self.layer_idx, list(mlp_out.shape))
@@ -480,6 +480,7 @@ class Glm4MoeDecoderLayer:
         compute_kernel_config: Any | None = None,
         tp_axis: int | None = None,
         tp_enabled: bool = False,
+        active_batch: int | None = None,
     ) -> ttnn.Tensor:
         """MoE forward: shared expert + routed experts -> sum.
 
@@ -536,7 +537,12 @@ class Glm4MoeDecoderLayer:
         )
 
         # ---- Fused reduce: scale shared by 1/DP, combine, single reduce ----
-        fuse_reduce = _env_bool("GLM4_MOE_FUSE_SHARED_EP_REDUCE", default=True)
+        # Gate on active_batch <= 4: at larger batch sizes, shared/routed output shapes
+        # diverge (sparsity_block_size=32 padding on routed only), causing add() broadcast
+        # failure and subsequent CCL hang. Safe at bs<=4 where both shapes match.
+        _fuse_env = _env_bool("GLM4_MOE_FUSE_SHARED_EP_REDUCE", default=True)
+        _fuse_batch_ok = active_batch is not None and active_batch <= 4
+        fuse_reduce = _fuse_env and _fuse_batch_ok
         if _DBG_DECODE:
             logger.info("[DBG] DL{} _moe_forward: shared_out.shape={}, routed_out.shape={}, fuse_reduce={}, tp_enabled={}, tp_axis={}",
             self.layer_idx,
