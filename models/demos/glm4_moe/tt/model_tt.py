@@ -1240,14 +1240,18 @@ class Glm4MoeTT:
                 raise
         else:
             # Update persistent inputs and replay.
-            if _dbg:
-                logger.info("[DBG] _decode_trace: REPLAY path, updating trace inputs for bucket={}", bucket)
+            import time as _time
+            _t0 = _time.perf_counter()
+
             self._update_trace_inputs(state, tokens, positions, page_table)
+            _t1 = _time.perf_counter()
+
             if self.tt_ccl is not None:
                 self.tt_ccl.reset_sem_counters()
+            _t2 = _time.perf_counter()
+
             ttnn.synchronize_device(self.device)
-            if _dbg:
-                logger.info("[DBG] _decode_trace: REPLAY sync done, executing trace")
+            _t3 = _time.perf_counter()
 
             # DEBUG: trace quality investigation experiments (E0/E1/E3)
             if _debug_trace_verify >= 1:
@@ -1301,8 +1305,23 @@ class Glm4MoeTT:
                 except Exception:
                     pass
 
+            _t4 = _time.perf_counter()
             ttnn.execute_trace(self.device, state.trace_id, cq_id=0, blocking=False)
             ttnn.synchronize_device(self.device)
+            _t5 = _time.perf_counter()
+
+            # Performance instrumentation (log every 50th token to avoid spam)
+            if not hasattr(self, '_replay_count'):
+                self._replay_count = 0
+            self._replay_count += 1
+            if self._replay_count <= 3 or self._replay_count % 50 == 0:
+                logger.warning(
+                    "PERF REPLAY #{}: update_inputs={:.1f}ms sem_reset={:.1f}ms pre_sync={:.1f}ms "
+                    "execute+sync={:.1f}ms TOTAL={:.1f}ms",
+                    self._replay_count,
+                    (_t1 - _t0) * 1000, (_t2 - _t1) * 1000, (_t3 - _t2) * 1000,
+                    (_t5 - _t4) * 1000, (_t5 - _t0) * 1000,
+                )
 
         # E5: Log CAPTURE vs REPLAY and top-1 token for quality tracking
         if _debug_trace_verify >= 5 and state.logits_tt is not None:
@@ -1331,10 +1350,13 @@ class Glm4MoeTT:
                 logger.error("DEBUG E5: failed: {}", e)
 
         # Read outputs.
+        _t6 = _time.perf_counter() if '_t0' in dir() else None
         if sampling_params is not None and state.top1_indices_tt is not None:
             next_ids_torch = _tt_to_torch_for_vllm_output(
                 tensor=state.top1_indices_tt, device=self.device
             ).reshape(-1).to(dtype=torch.int32).cpu()
+            if _t6 is not None and hasattr(self, '_replay_count') and (self._replay_count <= 3 or self._replay_count % 50 == 0):
+                logger.warning("PERF REPLAY #{}: output_read={:.1f}ms", self._replay_count, (_time.perf_counter() - _t6) * 1000)
             return next_ids_torch
 
         if state.logits_tt is not None:
@@ -1342,13 +1364,18 @@ class Glm4MoeTT:
                 if _is_mesh_device(self.device):
                     # TG mesh: device-side sampling ops hang. Use optimized host transfer.
                     vocab = int(self.hparams.vocab_size)
-                    return self._host_argmax_from_trace_logits(state.logits_tt, active, vocab)
+                    result = self._host_argmax_from_trace_logits(state.logits_tt, active, vocab)
+                    if _t6 is not None and hasattr(self, '_replay_count') and (self._replay_count <= 3 or self._replay_count % 50 == 0):
+                        logger.warning("PERF REPLAY #{}: output_read={:.1f}ms (host_argmax)", self._replay_count, (_time.perf_counter() - _t6) * 1000)
+                    return result
                 else:
                     # Non-TG: device-side sampling works fine outside trace.
                     return self._sample_from_trace_logits(state.logits_tt, active)
             # Non-sampling path: still need full logits on host
             vocab = int(self.hparams.vocab_size)
             logits_host = self._logits_to_host(state.logits_tt, active, vocab)
+            if _t6 is not None and hasattr(self, '_replay_count') and (self._replay_count <= 3 or self._replay_count % 50 == 0):
+                logger.warning("PERF REPLAY #{}: output_read={:.1f}ms (full_logits)", self._replay_count, (_time.perf_counter() - _t6) * 1000)
             return logits_host
 
         return torch.zeros((active, 1, int(self.hparams.vocab_size)), dtype=torch.float32)
