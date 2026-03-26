@@ -614,9 +614,13 @@ class Glm4MoeTT:
             sh_key = f"model.layers.{mtp_layer_idx}.shared_head.head.weight"
             sh_w_hf = state[sh_key].to(torch.bfloat16)  # HF: [vocab, hidden]
             # Use _linear_weight_tt which transposes HF [out, in] → TT [1, 1, in, out]
-            # Same as main lm_head loading
+            # MUST use same lm_head_mapper as main lm_head to get vocab-sharded layout.
+            # Without this, the weight is replicated (full vocab on every device) but
+            # _host_argmax_from_trace_logits treats it as sharded, causing wrong argmax
+            # and 0% MTP acceptance.
             _mtp_shared_head_w = _linear_weight_tt(
                 device=device, torch_weight_out_in=sh_w_hf,
+                mesh_mapper=lm_head_mapper,
             )
 
             # Full decoder layer for MTP (layer 92)
