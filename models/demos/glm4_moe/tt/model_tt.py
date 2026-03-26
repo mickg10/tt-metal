@@ -1438,9 +1438,12 @@ class Glm4MoeTT:
         if _t6 is not None and hasattr(self, '_replay_count') and (self._replay_count <= 3 or self._replay_count % 50 == 0):
             logger.warning("PERF REPLAY #{}: output_read={:.1f}ms", self._replay_count, (_time.perf_counter() - _t6) * 1000)
 
-        # MTP: extract draft tokens from trace output (or run eagerly if no traced MTP)
+        # MTP: run eagerly after trace replay to get correct embed(T_N) for predicting T_{N+1}.
+        # Traced MTP uses stale embed(T_{N-1}) → predicts T_N (same as main) → 0% acceptance.
+        # Eager MTP uses embed(T_N) → correctly predicts T_{N+1}.
+        _mtp_eager_only = os.environ.get("GLM4_MOE_MTP_EAGER_ONLY", "1").strip() == "1"
         if not _is_capture and self.mtp_enabled:
-            if state.mtp_logits_tt is not None:
+            if state.mtp_logits_tt is not None and not _mtp_eager_only:
                 # Traced MTP: read MTP logits from trace output + host argmax
                 try:
                     vocab = int(self.hparams.vocab_size)
