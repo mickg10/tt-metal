@@ -1434,9 +1434,19 @@ class Glm4MoeTT:
                     if not hasattr(self, '_mtp_call_count'):
                         self._mtp_call_count = 0
                     self._mtp_call_count += 1
-                    if self._mtp_call_count <= 3 or self._mtp_call_count % 50 == 0:
-                        logger.warning("TRACED MTP #{}: draft_ids={}", self._mtp_call_count,
-                                       self._last_draft_token_ids[:4].tolist())
+                    if self._mtp_call_count <= 10 or self._mtp_call_count % 50 == 0:
+                        # Compare MTP draft vs actual main output for this step
+                        main_ids_now = None
+                        if _output is not None:
+                            if _output.dim() >= 2 and _output.shape[-1] > 1:
+                                main_ids_now = _output.reshape(active, -1).argmax(dim=-1).to(torch.int32)
+                            else:
+                                main_ids_now = _output.reshape(-1)[:active].to(torch.int32)
+                        logger.warning("TRACED MTP #{}: draft={} main_now={} prev_main={}",
+                                       self._mtp_call_count,
+                                       self._last_draft_token_ids[:4].tolist(),
+                                       main_ids_now[:4].tolist() if main_ids_now is not None else None,
+                                       self._prev_main_ids[:4].tolist() if self._prev_main_ids is not None else None)
                 except Exception as e:
                     logger.warning("Traced MTP output read failed: {}", e)
                     self._last_draft_token_ids = None
