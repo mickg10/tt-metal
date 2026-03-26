@@ -1409,9 +1409,7 @@ class Glm4MoeTT:
             if sampling_params is not None:
                 if _is_mesh_device(self.device):
                     vocab = int(self.hparams.vocab_size)
-                    # Read ALL trace batch slots (not just active) for spec decode lane outputs
-                    _read_batch = int(state.logits_tt.shape[-2])  # full trace batch
-                    _output = self._host_argmax_from_trace_logits(state.logits_tt, _read_batch, vocab)
+                    _output = self._host_argmax_from_trace_logits(state.logits_tt, active, vocab)
                 else:
                     _output = self._sample_from_trace_logits(state.logits_tt, active)
             else:
