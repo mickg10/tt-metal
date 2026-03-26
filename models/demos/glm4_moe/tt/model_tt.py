@@ -1419,6 +1419,22 @@ class Glm4MoeTT:
         if _output is None:
             _output = torch.zeros((active, 1, int(self.hparams.vocab_size)), dtype=torch.float32)
 
+        # For spec decode batch expansion: read draft lane outputs too.
+        # Only when MTP + batch expansion is active (active < trace_batch).
+        # We read up to min(active*2, trace_batch) slots to include draft lanes.
+        trace_batch = int(state.batch)
+        _batch_expand = os.environ.get("GLM4_MOE_BATCH_EXPAND", "0").strip() == "1"
+        if (not _is_capture and _batch_expand and self.mtp_enabled
+                and _output is not None and _output.dim() == 1
+                and state.logits_tt is not None and trace_batch > active):
+            try:
+                vocab = int(self.hparams.vocab_size)
+                read_slots = min(active * 2, trace_batch)  # main + 1 draft per user
+                all_ids = self._host_argmax_from_trace_logits(state.logits_tt, read_slots, vocab)
+                _output = all_ids
+            except Exception:
+                pass
+
         if _t6 is not None and hasattr(self, '_replay_count') and (self._replay_count <= 3 or self._replay_count % 50 == 0):
             logger.warning("PERF REPLAY #{}: output_read={:.1f}ms", self._replay_count, (_time.perf_counter() - _t6) * 1000)
 
