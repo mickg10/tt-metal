@@ -1247,24 +1247,56 @@ class Glm4MoeTT:
             _t0 = _time.perf_counter()
 
             self._update_trace_inputs(state, tokens, positions, page_table)
-            # MTP: update MTP embedding with PREVIOUS step's main output token
+            # MTP: update MTP embed + positions + RoPE with PREVIOUS step's output
             if self.mtp_enabled and state.mtp_embed_tt is not None and self._prev_main_ids is not None:
                 try:
                     is_mesh = _is_mesh_device(self.device)
                     mapper = ttnn.ReplicateTensorToMesh(self.device) if is_mesh else None
                     batch = int(state.batch)
+                    hidden = int(self.hparams.hidden_size)
+
+                    # 1. Update MTP embedding (host lookup + H2D copy)
                     embed_torch = self.embed_w_cpu[self._prev_main_ids[:batch].long()]
                     hidden_batch = int(state.mtp_embed_tt.shape[-2])
                     if batch < hidden_batch:
-                        pad = torch.zeros(hidden_batch - batch, int(self.hparams.hidden_size), dtype=embed_torch.dtype)
+                        pad = torch.zeros(hidden_batch - batch, hidden, dtype=embed_torch.dtype)
                         embed_torch = torch.cat([embed_torch, pad], dim=0)
                     host_embed = ttnn.from_torch(
                         embed_torch.unsqueeze(0).unsqueeze(0).to(torch.bfloat16),
                         dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, mesh_mapper=mapper,
                     )
                     ttnn.copy_host_to_device_tensor(host_embed, state.mtp_embed_tt)
+
+                    # 2. Update MTP positions (= main positions + 1)
+                    if state.mtp_positions_tt is not None:
+                        mtp_pos = (positions[:batch] + 1).clamp(min=0, max=int(self.max_seq_len) - 1)
+                        host_pos = ttnn.from_torch(
+                            mtp_pos.view(-1).contiguous().to(torch.int32),
+                            dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT, mesh_mapper=mapper,
+                        )
+                        ttnn.copy_host_to_device_tensor(host_pos, state.mtp_positions_tt)
+
+                    # 3. Update MTP cos/sin (gather from host RoPE table at MTP positions)
+                    if state.mtp_cos_batch_tt is not None:
+                        mtp_pos_clamped = (positions[:batch] + 1).clamp(min=0, max=int(self.max_seq_len) - 1)
+                        cos_host = self.rope["cos_matrix_host"]  # [1, 1, max_seq, rope_dim]
+                        sin_host = self.rope["sin_matrix_host"]
+                        rope_dim = int(cos_host.shape[3])
+                        cos_gathered = cos_host[0, 0, mtp_pos_clamped.long(), :]  # [B, rope_dim]
+                        sin_gathered = sin_host[0, 0, mtp_pos_clamped.long(), :]
+                        # Reshape to [1, B, 1, rope_dim] to match persistent buffer shape
+                        host_cos = ttnn.from_torch(
+                            cos_gathered.unsqueeze(0).unsqueeze(2).to(torch.bfloat16),
+                            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, mesh_mapper=mapper,
+                        )
+                        host_sin = ttnn.from_torch(
+                            sin_gathered.unsqueeze(0).unsqueeze(2).to(torch.bfloat16),
+                            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, mesh_mapper=mapper,
+                        )
+                        ttnn.copy_host_to_device_tensor(host_cos, state.mtp_cos_batch_tt)
+                        ttnn.copy_host_to_device_tensor(host_sin, state.mtp_sin_batch_tt)
                 except Exception as e:
-                    pass  # Non-fatal: MTP will use stale embed (lower acceptance)
+                    logger.warning("MTP input update failed (non-fatal): {}", e)
             _t1 = _time.perf_counter()
 
             if self.tt_ccl is not None:
