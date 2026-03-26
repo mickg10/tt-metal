@@ -430,6 +430,7 @@ class Glm4MoeDecoderLayer:
             mlp_out = self._moe_forward(
                 h, compute_kernel_config=mlp_compute_kernel_config,
                 tp_axis=tp_axis, tp_enabled=tp_enabled,
+                active_batch=1,  # Prefill is always bs=1 per user → enables FUSE at bs≤4
             )
 
         _dlsync("after MLP")
