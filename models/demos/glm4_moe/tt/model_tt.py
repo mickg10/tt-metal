@@ -1247,9 +1247,24 @@ class Glm4MoeTT:
             _t0 = _time.perf_counter()
 
             self._update_trace_inputs(state, tokens, positions, page_table)
-            # MTP: update MTP inputs with PREVIOUS step's main output
+            # MTP: update MTP embedding with PREVIOUS step's main output token
             if self.mtp_enabled and state.mtp_embed_tt is not None and self._prev_main_ids is not None:
-                self._copy_mtp_trace_inputs(state, self._prev_main_ids, positions)
+                try:
+                    is_mesh = _is_mesh_device(self.device)
+                    mapper = ttnn.ReplicateTensorToMesh(self.device) if is_mesh else None
+                    batch = int(state.batch)
+                    embed_torch = self.embed_w_cpu[self._prev_main_ids[:batch].long()]
+                    hidden_batch = int(state.mtp_embed_tt.shape[-2])
+                    if batch < hidden_batch:
+                        pad = torch.zeros(hidden_batch - batch, int(self.hparams.hidden_size), dtype=embed_torch.dtype)
+                        embed_torch = torch.cat([embed_torch, pad], dim=0)
+                    host_embed = ttnn.from_torch(
+                        embed_torch.unsqueeze(0).unsqueeze(0).to(torch.bfloat16),
+                        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, mesh_mapper=mapper,
+                    )
+                    ttnn.copy_host_to_device_tensor(host_embed, state.mtp_embed_tt)
+                except Exception as e:
+                    pass  # Non-fatal: MTP will use stale embed (lower acceptance)
             _t1 = _time.perf_counter()
 
             if self.tt_ccl is not None:
