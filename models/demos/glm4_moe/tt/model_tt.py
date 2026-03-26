@@ -593,9 +593,11 @@ class Glm4MoeTT:
             eh_full = state[eh_key]
             if hasattr(eh_full, 'item') or not isinstance(eh_full, torch.Tensor):
                 eh_full = torch.tensor(eh_full) if not isinstance(eh_full, torch.Tensor) else eh_full
-            # HF layout: [hidden, 2*hidden] out_dim × in_dim
-            eh_e = eh_full[:, :_hidden].contiguous()  # embed half
-            eh_h = eh_full[:, _hidden:].contiguous()   # hidden half
+            # HF layout: [out_features=hidden, in_features=2*hidden]
+            # ttnn.linear(x, w) computes x @ w, so w must be [in_features, out_features]
+            eh_full_t = eh_full.t().contiguous()  # [2*hidden, hidden]
+            eh_e = eh_full_t[:_hidden, :].contiguous()  # [hidden, hidden] (embed half)
+            eh_h = eh_full_t[_hidden:, :].contiguous()   # [hidden, hidden] (hidden half)
             mapper = ttnn.ReplicateTensorToMesh(device) if _is_mesh_device(device) else None
             _mtp_eh_proj_e_w = ttnn.from_torch(
                 eh_e.to(torch.bfloat16), device=device, dtype=ttnn.bfloat16,
@@ -617,7 +619,8 @@ class Glm4MoeTT:
             )
             sh_key = f"model.layers.{mtp_layer_idx}.shared_head.head.weight"
             sh_w = state[sh_key].to(torch.bfloat16)
-            # Same TP sharding as main lm_head
+            # HF: [vocab, hidden]. ttnn.linear needs [hidden, vocab] (w transposed).
+            sh_w = sh_w.t().contiguous()
             _mtp_shared_head_w = ttnn.from_torch(
                 sh_w, device=device, dtype=ttnn.bfloat16,
                 layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
