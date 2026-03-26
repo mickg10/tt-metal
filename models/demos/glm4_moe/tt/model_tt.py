@@ -1607,6 +1607,9 @@ class Glm4MoeTT:
             if layer_idx < 5 or layer_idx % 10 == 0 or layer_idx == self.num_layers_to_run - 1:
                 logger.info("  [COMPILE] Layer {}/{} ({:.1f}s)", layer_idx + 1, self.num_layers_to_run, time.time() - _t_layer)
 
+        # Save pre-norm hidden for MTP compile warmup
+        _compile_hidden = x  # pre-final-norm hidden state
+
         x = _sharded_rms_norm(x, self.final_norm, int(self.hparams.hidden_size))
         logits_tt = ttnn.linear(x, self.lm_head_w)
 
@@ -1672,7 +1675,7 @@ class Glm4MoeTT:
             _tmp = _TmpState()
             _tmp.batch = active
             _tmp.mtp_embed_tt = mtp_embed_tt
-            _tmp.mtp_hidden_tt = mtp_hidden_tt  # from multiply(x, 1.0) above
+            _tmp.mtp_hidden_tt = _compile_hidden  # compile warmup's hidden state (pre-final-norm)
             _tmp.mtp_positions_tt = mtp_tt_positions
             _tmp.mtp_cos_batch_tt = mtp_cos_batch
             _tmp.mtp_sin_batch_tt = mtp_sin_batch
