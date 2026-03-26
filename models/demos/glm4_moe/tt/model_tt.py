@@ -1487,6 +1487,23 @@ class Glm4MoeTT:
                     self._prev_main_ids = _output.reshape(active, -1).argmax(dim=-1).to(torch.int32)
                 else:
                     self._prev_main_ids = _output.reshape(-1)[:active].to(torch.int32)
+                # MTP accuracy check: compare previous draft with current main output
+                prev_draft = getattr(self, '_prev_draft_for_compare', None)
+                if prev_draft is not None and self._prev_main_ids is not None:
+                    if not hasattr(self, '_mtp_match_count'):
+                        self._mtp_match_count = 0
+                        self._mtp_total_count = 0
+                    match = int(prev_draft[0].item()) == int(self._prev_main_ids[0].item())
+                    self._mtp_total_count += 1
+                    if match:
+                        self._mtp_match_count += 1
+                    if self._mtp_total_count <= 10 or self._mtp_total_count % 50 == 0:
+                        rate = self._mtp_match_count / max(1, self._mtp_total_count) * 100
+                        logger.warning("MTP ACCURACY: {}/{} ({:.1f}%) prev_draft={} main_now={}",
+                            self._mtp_match_count, self._mtp_total_count, rate,
+                            prev_draft[:1].tolist(), self._prev_main_ids[:1].tolist())
+                if self._last_draft_token_ids is not None:
+                    self._prev_draft_for_compare = self._last_draft_token_ids.clone() if isinstance(self._last_draft_token_ids, torch.Tensor) else torch.tensor(self._last_draft_token_ids)
             except Exception:
                 self._prev_main_ids = None
 
