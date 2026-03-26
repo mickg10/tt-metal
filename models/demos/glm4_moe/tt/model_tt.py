@@ -596,8 +596,7 @@ class Glm4MoeTT:
             # HF layout: [out=hidden, in=2*hidden]. Split in-features, keep HF [out, in] format.
             eh_e_hf = eh_full[:, :_hidden].contiguous()  # [hidden_out, hidden_in] (embed half)
             eh_h_hf = eh_full[:, _hidden:].contiguous()   # [hidden_out, hidden_in] (hidden half)
-            # Use _linear_weight_tt which transposes HF [out, in] → TT [1, 1, in, out]
-            from models.demos.glm4_moe.tt.layer_weights import _linear_weight_tt
+            # Use _linear_weight_tt (imported at top) — transposes HF [out, in] → TT [1, 1, in, out]
             _mtp_eh_proj_e_w = _linear_weight_tt(
                 device=device, torch_weight_out_in=eh_e_hf.to(torch.bfloat16),
             )
