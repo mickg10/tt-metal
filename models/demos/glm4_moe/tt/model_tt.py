@@ -2312,7 +2312,7 @@ class Glm4MoeTT:
         if _debug_pt_width > 0 and page_table.shape[1] > _debug_pt_width:
             page_table = page_table[:, :_debug_pt_width].contiguous()
 
-        # Update page table (host tensor, then copy).
+        # Update page table (always copy — critical for correctness).
         host_pt = ttnn.from_torch(
             page_table.contiguous().clone(),
             dtype=ttnn.int32,
