@@ -619,6 +619,8 @@ class Glm4MoeAttention(LightweightModule):
         k = ttnn.interleaved_to_sharded(k, _shard_cfgs["k"])
 
         # 6. KV cache update — two-call masked for spec decode (90%+ acceptance)
+        # Note: paged_fused_update_cache requires non-overlapping K/V cores — can't use
+        # because K and V share the same shard grid from QKV split.
         keys = kv_cache[0]
         values = kv_cache[1]
 
