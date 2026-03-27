@@ -619,22 +619,33 @@ class Glm4MoeAttention(LightweightModule):
         k = ttnn.interleaved_to_sharded(k, _shard_cfgs["k"])
 
         # 6. KV cache update
-        # When spec decode is active (positions_main_tt provided), write ONLY
-        # main lanes' KV (draft lanes masked to -1 → skipped). This avoids
-        # the RMW race in trace mode where two batch entries sharing the same
-        # page table corrupt each other's tile writes.
-        # Draft SDPA reads stale/zero KV — acceptable for verification
-        # (missing 1 K/V out of hundreds has negligible softmax impact).
+        # Two-call masked pattern for spec decode: serialize writes to avoid
+        # RMW race when batch entries share same page table.
         keys = kv_cache[0]
         values = kv_cache[1]
-        _pos = positions_main_tt if positions_main_tt is not None else current_pos
 
-        ttnn.experimental.paged_update_cache(
-            keys, k, update_idxs_tensor=_pos, page_table=page_table
-        )
-        ttnn.experimental.paged_update_cache(
-            values, v, update_idxs_tensor=_pos, page_table=page_table
-        )
+        if positions_main_tt is not None and positions_draft_tt is not None:
+            # Call 1: main lanes only (draft positions masked to -1 → skipped)
+            ttnn.experimental.paged_update_cache(
+                keys, k, update_idxs_tensor=positions_main_tt, page_table=page_table
+            )
+            ttnn.experimental.paged_update_cache(
+                values, v, update_idxs_tensor=positions_main_tt, page_table=page_table
+            )
+            # Call 2: draft lanes only (main positions masked to -1 → skipped)
+            ttnn.experimental.paged_update_cache(
+                keys, k, update_idxs_tensor=positions_draft_tt, page_table=page_table
+            )
+            ttnn.experimental.paged_update_cache(
+                values, v, update_idxs_tensor=positions_draft_tt, page_table=page_table
+            )
+        else:
+            ttnn.experimental.paged_update_cache(
+                keys, k, update_idxs_tensor=current_pos, page_table=page_table
+            )
+            ttnn.experimental.paged_update_cache(
+                values, v, update_idxs_tensor=current_pos, page_table=page_table
+            )
 
         _dealloc(k)
         _dealloc(v)

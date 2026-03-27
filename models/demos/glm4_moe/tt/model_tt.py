@@ -1644,9 +1644,32 @@ class Glm4MoeTT:
                 main_ids = result.reshape(-1)[:active].to(torch.int32)
             mtp_positions = positions[:active] + 1
 
+            # Isolate main user's hidden state from the trace batch.
+            # The trace hidden has [1,1,trace_batch,hidden] but MTP needs only [1,1,active,hidden].
+            # D2H the first `active` rows, then H2D as a clean tensor.
+            mtp_hidden = state.mtp_hidden_tt
+            hidden_batch = int(mtp_hidden.shape[-2])
+            if active < hidden_batch:
+                try:
+                    is_mesh = _is_mesh_device(self.device)
+                    if is_mesh:
+                        h_shard = ttnn.get_device_tensors(mtp_hidden)[0]
+                        h_host = ttnn.to_torch(h_shard.cpu()).to(torch.bfloat16)
+                    else:
+                        h_host = ttnn.to_torch(mtp_hidden.cpu()).to(torch.bfloat16)
+                    hidden = int(self.hparams.hidden_size)
+                    h_main = h_host[..., :active, :hidden].contiguous()
+                    mtp_hidden = ttnn.from_torch(
+                        h_main, device=self.device, dtype=ttnn.bfloat16,
+                        layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                        mesh_mapper=ttnn.ReplicateTensorToMesh(self.device) if is_mesh else None,
+                    )
+                except Exception:
+                    pass  # fallback: use full hidden state
+
             self._last_draft_token_ids = self._mtp_forward_eager(
                 main_token_ids=main_ids,
-                hidden_state=state.mtp_hidden_tt,  # full trace batch — _mtp_forward_eager handles padding
+                hidden_state=mtp_hidden,
                 mtp_positions=mtp_positions,
                 page_table=page_table[:active],
                 kv_cache=kv_cache,
