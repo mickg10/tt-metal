@@ -618,8 +618,7 @@ class Glm4MoeAttention(LightweightModule):
         q = ttnn.interleaved_to_sharded(q, _shard_cfgs["q"])
         k = ttnn.interleaved_to_sharded(k, _shard_cfgs["k"])
 
-        # 6. KV cache update — two-call masked pattern for spec decode
-        # share_cache=True can't be used in trace mode (semaphore writes not supported).
+        # 6. KV cache update — two-call masked for spec decode (90%+ acceptance)
         keys = kv_cache[0]
         values = kv_cache[1]
 
