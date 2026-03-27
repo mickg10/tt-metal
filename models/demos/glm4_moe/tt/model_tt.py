@@ -297,6 +297,10 @@ class _DecodeTraceState:
     mtp_trace_id: int | None = None
     mtp_logits_tt: Any = None       # MTP logits
 
+    # Two-call masked paged_update_cache (spec decode with shared page tables)
+    positions_main_tt: Any = None   # [B] int32 — valid for main lanes, -1 for draft
+    positions_draft_tt: Any = None  # [B] int32 — valid for draft lanes, -1 for main
+
 
 # ---------------------------------------------------------------------------
 # Model Runner
@@ -690,6 +694,7 @@ class Glm4MoeTT:
         kv_cache: list,
         sampling_params: Any | None = None,
         enable_trace: bool = False,
+        num_main_lanes: int = 0,
     ) -> Any:
         """Run a single-token decode step through all layers.
 
@@ -729,6 +734,7 @@ class Glm4MoeTT:
                 page_table=page_table[:active].to(torch.int32),
                 kv_cache=kv_cache,
                 sampling_params=sampling_params,
+                num_main_lanes=num_main_lanes,
             )
 
         return self._decode_eager(
@@ -1185,6 +1191,7 @@ class Glm4MoeTT:
         page_table: torch.Tensor,
         kv_cache: list,
         sampling_params: Any | None = None,
+        num_main_lanes: int = 0,
     ) -> Any:
         """Decode using trace capture/replay for performance.
 
@@ -1250,7 +1257,8 @@ class Glm4MoeTT:
             import time as _time
             _t0 = _time.perf_counter()
 
-            self._update_trace_inputs(state, tokens, positions, page_table)
+            self._update_trace_inputs(state, tokens, positions, page_table,
+                                       num_main_lanes=num_main_lanes)
             # MTP: update MTP inputs between trace replays.
             # With in-trace embed (embed_w loaded): only update positions + RoPE.
             #   The embedding is computed INSIDE the trace from argmax of main logits.
@@ -1298,12 +1306,16 @@ class Glm4MoeTT:
                     elif self._prev_main_ids is not None:
                         # Fallback: full embed + positions + RoPE update
                         hidden = int(self.hparams.hidden_size)
+                        hidden_batch = int(state.mtp_embed_tt.shape[-2])
 
                         # 1. Update MTP embedding (host lookup + H2D copy)
-                        embed_torch = self.embed_w_cpu[self._prev_main_ids[:batch].long()]
-                        hidden_batch = int(state.mtp_embed_tt.shape[-2])
-                        if batch < hidden_batch:
-                            pad = torch.zeros(hidden_batch - batch, hidden, dtype=embed_torch.dtype)
+                        # Pad _prev_main_ids to batch size (active users may be < trace batch)
+                        prev_ids = self._prev_main_ids[:batch]
+                        if prev_ids.shape[0] < batch:
+                            prev_ids = torch.cat([prev_ids, torch.zeros(batch - prev_ids.shape[0], dtype=prev_ids.dtype)])
+                        embed_torch = self.embed_w_cpu[prev_ids.long()]
+                        if embed_torch.shape[0] < hidden_batch:
+                            pad = torch.zeros(hidden_batch - embed_torch.shape[0], hidden, dtype=embed_torch.dtype)
                             embed_torch = torch.cat([embed_torch, pad], dim=0)
                         host_embed = ttnn.from_torch(
                             embed_torch.unsqueeze(0).unsqueeze(0).to(torch.bfloat16),
@@ -1313,7 +1325,10 @@ class Glm4MoeTT:
 
                         # 2. Update MTP positions (= main positions + 1)
                         if state.mtp_positions_tt is not None:
-                            mtp_pos = (positions[:batch] + 1).clamp(min=0, max=int(self.max_seq_len) - 1)
+                            pos_padded = positions[:batch]
+                            if pos_padded.shape[0] < batch:
+                                pos_padded = torch.cat([pos_padded, torch.zeros(batch - pos_padded.shape[0], dtype=pos_padded.dtype)])
+                            mtp_pos = (pos_padded + 1).clamp(min=0, max=int(self.max_seq_len) - 1)
                             host_pos = ttnn.from_torch(
                                 mtp_pos.view(-1).contiguous().to(torch.int32),
                                 dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT, mesh_mapper=mapper,
@@ -1322,12 +1337,13 @@ class Glm4MoeTT:
 
                         # 3. Update MTP cos/sin (gather from host RoPE table at MTP positions)
                         if state.mtp_cos_batch_tt is not None:
-                            mtp_pos_clamped = (positions[:batch] + 1).clamp(min=0, max=int(self.max_seq_len) - 1)
+                            mtp_pos_clamped = mtp_pos.long().clamp(
+                                min=0, max=int(self.rope["cos_matrix_host"].shape[2]) - 1
+                            )
                             cos_host = self.rope["cos_matrix_host"]
                             sin_host = self.rope["sin_matrix_host"]
-                            rope_dim = int(cos_host.shape[3])
-                            cos_gathered = cos_host[0, 0, mtp_pos_clamped.long(), :]
-                            sin_gathered = sin_host[0, 0, mtp_pos_clamped.long(), :]
+                            cos_gathered = cos_host[0, 0, mtp_pos_clamped, :]
+                            sin_gathered = sin_host[0, 0, mtp_pos_clamped, :]
                             host_cos = ttnn.from_torch(
                                 cos_gathered.unsqueeze(0).unsqueeze(2).to(torch.bfloat16),
                                 dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, mesh_mapper=mapper,
@@ -1518,15 +1534,19 @@ class Glm4MoeTT:
                     self._last_draft_token_ids = None
             else:
                 # Fallback: eager MTP (slower, 52ms overhead)
-                self._run_mtp_after_trace_replay(state, _output, active, tokens, positions, page_table, kv_cache)
+                # When num_main_lanes > 0, only process main users (not draft slots)
+                mtp_active = num_main_lanes if num_main_lanes > 0 else active
+                self._run_mtp_after_trace_replay(state, _output, mtp_active, tokens, positions, page_table, kv_cache)
 
         # Save main output token IDs for next step's MTP embed update
+        # Only save main users (not draft slots) when batch expansion is active
+        _save_active = num_main_lanes if num_main_lanes > 0 else active
         if self.mtp_enabled and _output is not None:
             try:
                 if _output.dim() >= 2 and _output.shape[-1] > 1:
-                    self._prev_main_ids = _output.reshape(active, -1).argmax(dim=-1).to(torch.int32)
+                    self._prev_main_ids = _output.reshape(active, -1)[:_save_active].argmax(dim=-1).to(torch.int32)
                 else:
-                    self._prev_main_ids = _output.reshape(-1)[:active].to(torch.int32)
+                    self._prev_main_ids = _output.reshape(-1)[:_save_active].to(torch.int32)
                 # MTP accuracy check: compare previous draft with current main output
                 prev_draft = getattr(self, '_prev_draft_for_compare', None)
                 if prev_draft is not None and self._prev_main_ids is not None:
@@ -1623,9 +1643,10 @@ class Glm4MoeTT:
             else:
                 main_ids = result.reshape(-1)[:active].to(torch.int32)
             mtp_positions = positions[:active] + 1
+
             self._last_draft_token_ids = self._mtp_forward_eager(
                 main_token_ids=main_ids,
-                hidden_state=state.mtp_hidden_tt,  # trace-owned clone of pre-norm hidden
+                hidden_state=state.mtp_hidden_tt,  # full trace batch — _mtp_forward_eager handles padding
                 mtp_positions=mtp_positions,
                 page_table=page_table[:active],
                 kv_cache=kv_cache,
@@ -1808,7 +1829,13 @@ class Glm4MoeTT:
         mtp_tt_positions = None
         mtp_cos_batch = None
         mtp_sin_batch = None
-        mtp_use_intrace_embed = self.mtp_enabled and self.embed_w is not None
+        # In-trace MTP requires argmax inside trace, but on TG/mesh devices
+        # argmax/to_layout/slice inside trace produce wrong results (line 2040).
+        # Only enable in-trace embed for non-mesh (single device).
+        mtp_use_intrace_embed = (
+            self.mtp_enabled and self.embed_w is not None
+            and not _is_mesh_device(self.device)
+        )
         if self.mtp_enabled and active <= self.mtp_max_batch:
             logger.info("  [MTP COMPILE] Allocating MTP persistent tensors for batch={}", active)
             hidden = int(self.hparams.hidden_size)
@@ -1935,6 +1962,34 @@ class Glm4MoeTT:
             )
             ttnn.copy_host_to_device_tensor(host_mtp_embed, mtp_embed_tt)
 
+        # Create persistent masked position tensors for two-call paged_update_cache.
+        # Must be created AFTER compile warmup (which uses single-call) and BEFORE
+        # trace capture (which records the two-call pattern into the command buffer).
+        _batch_expand = os.environ.get("GLM4_MOE_BATCH_EXPAND", "0").strip() == "1"
+        positions_main_tt = None
+        positions_draft_tt = None
+        if _batch_expand and self.mtp_enabled and active >= 2:
+            main_mask = positions.clone()  # all valid initially (capture uses main-only)
+            draft_mask = torch.full_like(positions, -1)  # all -1 (no drafts during capture)
+            # Use same DP sharding as regular positions
+            pos_mapper = mapper
+            if is_mesh and dp_shard_axis is not None:
+                mesh_shape = list(self.device.shape)
+                pos_dims = [None, None]
+                pos_dims[dp_shard_axis] = 0
+                pos_mapper = ttnn.ShardTensor2dMesh(self.device, dims=tuple(pos_dims), mesh_shape=mesh_shape)
+            positions_main_tt = ttnn.from_torch(
+                main_mask.view(-1).contiguous().to(torch.int32),
+                device=self.device, dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG, mesh_mapper=pos_mapper,
+            )
+            positions_draft_tt = ttnn.from_torch(
+                draft_mask.view(-1).contiguous().to(torch.int32),
+                device=self.device, dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG, mesh_mapper=pos_mapper,
+            )
+            logger.info("  Created masked position tensors for batch={} (dp_shard={})", active, dp_shard_axis is not None)
+
         # Now capture trace.
         logger.info("[DBG] _capture_decode_trace: compile warmup done, starting trace capture for batch={}", active)
         logger.info("Capturing decode trace for batch={}", active)
@@ -1966,7 +2021,9 @@ class Glm4MoeTT:
             _t_layer = time.time()
             dl = self.decoder_layers[layer_idx]
             x_next = dl.forward(x, tt_positions, rot_mats, page_table_tt, kv_cache[layer_idx], mode="decode",
-                                active_batch=active)
+                                active_batch=active,
+                                positions_main_tt=positions_main_tt,
+                                positions_draft_tt=positions_draft_tt)
             # Retain x instead of deallocating — keeps its DRAM address occupied
             # so the allocator cannot reuse it for prefill buffers.
             if layer_idx > 0:
@@ -1989,9 +2046,12 @@ class Glm4MoeTT:
         # MTP: run MTP decoder layer INSIDE the trace (after lm_head, before end_trace).
         # With in-trace embed: all_gather logits -> argmax -> embedding -> MTP forward.
         # This uses CURRENT token T_N (from argmax of main logits) instead of stale T_{N-1}.
-        # Without in-trace embed: uses persistent mtp_embed_tt buffer (stale, 0% acceptance).
+        # Without in-trace embed: MTP runs eagerly AFTER trace replay (see _run_mtp_after_trace_replay).
+        # On mesh devices: argmax/to_layout/slice inside trace produce wrong results,
+        # so in-trace MTP is SKIPPED — only eager MTP is used on mesh.
         mtp_logits_tt = None
-        if self.mtp_enabled and mtp_embed_tt is not None and mtp_hidden_tt is not None:
+        if (self.mtp_enabled and mtp_embed_tt is not None and mtp_hidden_tt is not None
+                and mtp_use_intrace_embed):
             mtp_current_embed_trace = None
             if mtp_use_intrace_embed:
                 # All-gather vocab shards -> full vocab -> argmax -> embedding
@@ -2079,6 +2139,8 @@ class Glm4MoeTT:
             mtp_sin_batch_tt=mtp_sin_batch,
             mtp_embed_tt=mtp_embed_tt,
             mtp_logits_tt=mtp_logits_tt,
+            positions_main_tt=positions_main_tt,
+            positions_draft_tt=positions_draft_tt,
         )
 
     def _copy_mtp_trace_inputs(
@@ -2145,6 +2207,7 @@ class Glm4MoeTT:
         tokens: torch.Tensor,
         positions: torch.Tensor,
         page_table: torch.Tensor,
+        num_main_lanes: int = 0,
     ) -> None:
         """Update persistent trace input tensors with new values."""
         is_mesh = _is_mesh_device(self.device)
@@ -2190,11 +2253,10 @@ class Glm4MoeTT:
             host_embed = ttnn.from_torch(
                 embed_torch.unsqueeze(0).unsqueeze(0).to(torch.bfloat16),  # [1, 1, B, hidden]
                 dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT,
-            mesh_mapper=mapper,
-        )
-        ttnn.copy_host_to_device_tensor(host_embed, state.embed_tt)
-
+                layout=ttnn.TILE_LAYOUT,
+                mesh_mapper=mapper,
+            )
+            ttnn.copy_host_to_device_tensor(host_embed, state.embed_tt)
 
         # Update positions (host tensor, then copy).
         host_positions = ttnn.from_torch(
@@ -2223,6 +2285,26 @@ class Glm4MoeTT:
         )
         ttnn.copy_host_to_device_tensor(host_cos, state.cos_batch_tt)
         ttnn.copy_host_to_device_tensor(host_sin, state.sin_batch_tt)
+
+        # Update masked position tensors for two-call paged_update_cache.
+        # When num_main_lanes > 0, slots [0..num_main_lanes) are main,
+        # slots [num_main_lanes..batch) are draft.
+        if state.positions_main_tt is not None and state.positions_draft_tt is not None and num_main_lanes > 0:
+            pos_main = positions.clone()
+            pos_draft = positions.clone()
+            pos_main[num_main_lanes:] = -1  # mask draft lanes in main tensor
+            pos_draft[:num_main_lanes] = -1  # mask main lanes in draft tensor
+            # Use DP sharding (same as regular positions) when batch is DP-distributed
+            host_pos_main = ttnn.from_torch(
+                pos_main.view(-1).contiguous().to(torch.int32),
+                dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT, mesh_mapper=dp_batch_mapper,
+            )
+            host_pos_draft = ttnn.from_torch(
+                pos_draft.view(-1).contiguous().to(torch.int32),
+                dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT, mesh_mapper=dp_batch_mapper,
+            )
+            ttnn.copy_host_to_device_tensor(host_pos_main, state.positions_main_tt)
+            ttnn.copy_host_to_device_tensor(host_pos_draft, state.positions_draft_tt)
 
         # DEBUG: truncate page_table to match capture-time width (if debug enabled).
         _debug_pt_width = int(os.environ.get("GLM4_MOE_DEBUG_PT_WIDTH", "") or "0")
@@ -2313,6 +2395,27 @@ class Glm4MoeTT:
         # 1. Embed main model's predicted tokens (HOST-SIDE)
         embed_torch = self.embed_w_cpu[main_token_ids.long()]  # [batch, hidden]
         hidden_batch = int(hidden_state.shape[-2])
+
+        # When hidden_state has more rows than batch (batch expansion puts draft in trace),
+        # slice the hidden state to main-only via D2H → slice → H2D.
+        if batch < hidden_batch:
+            try:
+                if _is_mesh_device(self.device):
+                    h_shard = ttnn.get_device_tensors(hidden_state)[0]
+                    h_host = ttnn.to_torch(h_shard.cpu()).to(torch.bfloat16)
+                else:
+                    h_host = ttnn.to_torch(hidden_state.cpu()).to(torch.bfloat16)
+                # Slice to main users only: [1,1,batch,hidden]
+                h_main = h_host[..., :batch, :hidden].contiguous()
+                hidden_state = ttnn.from_torch(
+                    h_main, device=self.device, dtype=ttnn.bfloat16,
+                    layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    mesh_mapper=ttnn.ReplicateTensorToMesh(self.device) if is_mesh else None,
+                )
+                hidden_batch = batch  # now matches
+            except Exception:
+                pass  # fallback: use original hidden_state with padding
+
         if batch < hidden_batch:
             pad = torch.zeros(hidden_batch - batch, hidden, dtype=embed_torch.dtype)
             embed_torch = torch.cat([embed_torch, pad], dim=0)
@@ -2389,9 +2492,11 @@ class Glm4MoeTT:
         logits_tt = ttnn.linear(x, self.mtp_shared_head_w)
         _dealloc(x, force=False)
 
-        # 7. Host-side argmax
+        # 7. Host-side argmax — use `batch` (real active count), NOT `hidden_batch`
+        # (which may be tile-padded to 32). Reading too many rows causes
+        # _host_argmax_from_trace_logits to mix batch and vocab dims → garbage drafts.
         draft_token_ids = self._host_argmax_from_trace_logits(
-            logits_tt, hidden_batch, int(self.hparams.vocab_size)
+            logits_tt, batch, int(self.hparams.vocab_size)
         )
 
         # Cleanup

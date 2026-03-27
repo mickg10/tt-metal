@@ -513,6 +513,8 @@ class Glm4MoeAttention(LightweightModule):
         page_table=None,
         kv_cache=None,
         active_batch: int | None = None,
+        positions_main_tt: "ttnn.Tensor | None" = None,
+        positions_draft_tt: "ttnn.Tensor | None" = None,
     ) -> ttnn.Tensor:
         """Decode forward: single token per sequence.
 
@@ -617,14 +619,21 @@ class Glm4MoeAttention(LightweightModule):
         k = ttnn.interleaved_to_sharded(k, _shard_cfgs["k"])
 
         # 6. KV cache update
+        # When spec decode is active (positions_main_tt provided), write ONLY
+        # main lanes' KV (draft lanes masked to -1 → skipped). This avoids
+        # the RMW race in trace mode where two batch entries sharing the same
+        # page table corrupt each other's tile writes.
+        # Draft SDPA reads stale/zero KV — acceptable for verification
+        # (missing 1 K/V out of hundreds has negligible softmax impact).
         keys = kv_cache[0]
         values = kv_cache[1]
+        _pos = positions_main_tt if positions_main_tt is not None else current_pos
 
         ttnn.experimental.paged_update_cache(
-            keys, k, update_idxs_tensor=current_pos, page_table=page_table
+            keys, k, update_idxs_tensor=_pos, page_table=page_table
         )
         ttnn.experimental.paged_update_cache(
-            values, v, update_idxs_tensor=current_pos, page_table=page_table
+            values, v, update_idxs_tensor=_pos, page_table=page_table
         )
 
         _dealloc(k)
@@ -756,10 +765,13 @@ class Glm4MoeAttention(LightweightModule):
         _sync("before QKV linear")
 
         # 1. QKV linear (reshape for long sequences)
-        if seq_len > self.MAX_QKV_MM_SEQ_LEN:
-            if seq_len % self.MAX_QKV_MM_SEQ_LEN != 0:
-                raise ValueError(f"seq_len {seq_len} must be divisible by {self.MAX_QKV_MM_SEQ_LEN}")
-            x = ttnn.reshape(x, [1, seq_len // self.MAX_QKV_MM_SEQ_LEN, self.MAX_QKV_MM_SEQ_LEN, -1])
+        # Use total_seq (U*T for batched, T for single) for the long-sequence reshape.
+        # The input x is [1, 1, total_seq, hidden] — the FULL concatenated sequence.
+        # Splitting by per-user seq_len when batch>1 would mix batch into hidden dim.
+        if total_seq > self.MAX_QKV_MM_SEQ_LEN:
+            if total_seq % self.MAX_QKV_MM_SEQ_LEN != 0:
+                raise ValueError(f"total_seq {total_seq} must be divisible by {self.MAX_QKV_MM_SEQ_LEN}")
+            x = ttnn.reshape(x, [1, total_seq // self.MAX_QKV_MM_SEQ_LEN, self.MAX_QKV_MM_SEQ_LEN, -1])
 
         xqkv = ttnn.linear(
             x,
@@ -790,13 +802,13 @@ class Glm4MoeAttention(LightweightModule):
         # 3. Split into Q, K, V heads (prefill)
         q, k, v = ttnn.experimental.nlp_create_qkv_heads(
             xqkv,
-            num_heads=self.n_local_heads,  # 12
-            num_kv_heads=self.n_local_kv_heads,  # 1
+            num_heads=self.n_local_heads,  # 24 (TP=4) or 12 (TP=8)
+            num_kv_heads=self.n_local_kv_heads,  # 2 (TP=4) or 1 (TP=8)
             transpose_k_heads=False,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
-        # Single user: q[1, 12, T, 128], k[1, 1, T, 128], v[1, 1, T, 128]
-        # Batched:     q[U, 12, T, 128], k[U, 1, T, 128], v[U, 1, T, 128]
+        # Single user: q[1, n_local_heads, T, 128], k[1, n_local_kv, T, 128]
+        # Batched:     q[U, n_local_heads, T, 128], k[U, n_local_kv, T, 128]
 
         _dealloc(xqkv)
 
@@ -957,6 +969,8 @@ class Glm4MoeAttention(LightweightModule):
         kv_cache=None,
         active_batch: int | None = None,
         batch_size: int = 1,
+        positions_main_tt=None,
+        positions_draft_tt=None,
     ):
         if mode == "prefill":
             return self.forward_prefill(
@@ -977,6 +991,8 @@ class Glm4MoeAttention(LightweightModule):
                 page_table=page_table,
                 kv_cache=kv_cache,
                 active_batch=active_batch,
+                positions_main_tt=positions_main_tt,
+                positions_draft_tt=positions_draft_tt,
             )
 
     def _prefill_prepare_tensor_for_kv_cache(self, key_or_value_layer, user_id):

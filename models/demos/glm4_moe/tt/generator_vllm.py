@@ -371,6 +371,7 @@ class Glm4MoeForCausalLM(nn.Module):
             page_table[:, 0] = torch.arange(page_table.shape[0], dtype=torch.int32)
 
         self._ensure_tt_runner()
+        num_main_lanes: int = int(kwargs.get("num_main_lanes", 0))
         tt_out = self._tt_runner.decode(
             tokens=tokens,
             start_pos=start_pos,
@@ -378,6 +379,7 @@ class Glm4MoeForCausalLM(nn.Module):
             kv_cache=kv_cache,
             sampling_params=sampling_params,
             enable_trace=enable_trace,
+            num_main_lanes=num_main_lanes,
         )
 
         # Harvest MTP draft tokens (if available)

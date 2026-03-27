@@ -189,6 +189,8 @@ class Glm4MoeDecoderLayer:
         chunk_start_idx: int | None = None,
         user_id: int = 0,
         batch_size: int = 1,
+        positions_main_tt: "ttnn.Tensor | None" = None,
+        positions_draft_tt: "ttnn.Tensor | None" = None,
     ) -> ttnn.Tensor:
         """Forward pass for one decoder layer.
 
@@ -216,7 +218,10 @@ class Glm4MoeDecoderLayer:
             print(f"  [DEBUG DL{_lid_fwd}] forward entry ({mode}) sync OK", flush=True, file=_sys.stderr)
 
         if mode == "decode":
-            return self._forward_decode(x, current_pos, rot_mats, page_table, kv_cache, active_batch=active_batch)
+            return self._forward_decode(x, current_pos, rot_mats, page_table, kv_cache,
+                                        active_batch=active_batch,
+                                        positions_main_tt=positions_main_tt,
+                                        positions_draft_tt=positions_draft_tt)
         else:
             return self._forward_prefill(
                 x, current_pos, rot_mats, page_table, kv_cache,
@@ -232,6 +237,8 @@ class Glm4MoeDecoderLayer:
         page_table: ttnn.Tensor,
         kv_cache: list[ttnn.Tensor],
         active_batch: int | None = None,
+        positions_main_tt: "ttnn.Tensor | None" = None,
+        positions_draft_tt: "ttnn.Tensor | None" = None,
     ) -> ttnn.Tensor:
         """Decode forward: batch in dim=2, seq_len=1 per token."""
         w = self.layer_weights
@@ -267,6 +274,7 @@ class Glm4MoeDecoderLayer:
         attn_out = self.attention.forward(
             h, current_pos, rot_mats, mode="decode", page_table=page_table, kv_cache=kv_cache,
             active_batch=active_batch,
+            positions_main_tt=positions_main_tt, positions_draft_tt=positions_draft_tt,
         )
         if _DBG_DECODE:
             logger.info("[DBG] DL{} after attention: attn_out.shape={}", self.layer_idx, list(attn_out.shape))
