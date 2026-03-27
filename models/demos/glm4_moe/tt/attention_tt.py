@@ -618,21 +618,18 @@ class Glm4MoeAttention(LightweightModule):
         q = ttnn.interleaved_to_sharded(q, _shard_cfgs["q"])
         k = ttnn.interleaved_to_sharded(k, _shard_cfgs["k"])
 
-        # 6. KV cache update
-        # Two-call masked pattern for spec decode: serialize writes to avoid
-        # RMW race when batch entries share same page table.
+        # 6. KV cache update — two-call masked pattern for spec decode
+        # share_cache=True can't be used in trace mode (semaphore writes not supported).
         keys = kv_cache[0]
         values = kv_cache[1]
 
         if positions_main_tt is not None and positions_draft_tt is not None:
-            # Call 1: main lanes only (draft positions masked to -1 → skipped)
             ttnn.experimental.paged_update_cache(
                 keys, k, update_idxs_tensor=positions_main_tt, page_table=page_table
             )
             ttnn.experimental.paged_update_cache(
                 values, v, update_idxs_tensor=positions_main_tt, page_table=page_table
             )
-            # Call 2: draft lanes only (main positions masked to -1 → skipped)
             ttnn.experimental.paged_update_cache(
                 keys, k, update_idxs_tensor=positions_draft_tt, page_table=page_table
             )
