@@ -2306,7 +2306,7 @@ class MLA1D(AbstractModule):
                 ttnn.BufferType.L1,
                 ttnn.ShardSpec(
                     ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(1, 1))}),
-                    (128, 128),
+                    (128, 256),
                     ttnn.ShardOrientation.ROW_MAJOR,
                 ),
             ),

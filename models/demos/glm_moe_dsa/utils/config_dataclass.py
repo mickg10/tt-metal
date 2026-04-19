@@ -236,7 +236,6 @@ class DeepseekMoEReduceScatterConfig(OpConfigBase):
                         ttnn.CoreRange(ttnn.CoreCoord(3, 5), ttnn.CoreCoord(3, 5)),
                         ttnn.CoreRange(ttnn.CoreCoord(6, 0), ttnn.CoreCoord(6, 0)),
                         ttnn.CoreRange(ttnn.CoreCoord(6, 5), ttnn.CoreCoord(6, 5)),
-                        ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 0)),
                     ]
                 ),
                 ttnn.ShardOrientation.ROW_MAJOR,
