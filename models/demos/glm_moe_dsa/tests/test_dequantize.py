@@ -10,8 +10,8 @@ from typing import Sequence
 import pytest
 import torch
 
-from models.demos.deepseek_v3.utils.hf_model_utils import load_weight_from_weights_dict
-from models.demos.deepseek_v3.utils.test_utils import load_state_dict
+from models.demos.glm_moe_dsa.utils.hf_model_utils import load_weight_from_weights_dict
+from models.demos.glm_moe_dsa.utils.test_utils import load_state_dict
 
 REFERENCE_WEIGHT_KEYS = [
     # Embedding + LM head (full model endpoints)

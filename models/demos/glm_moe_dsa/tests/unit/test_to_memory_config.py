@@ -7,7 +7,7 @@ import pytest
 import torch
 
 import ttnn
-from models.demos.deepseek_v3.tests.unit.utils import random_torch_tensor, run_test
+from models.demos.glm_moe_dsa.tests.unit.utils import random_torch_tensor, run_test
 from tests.tt_eager.python_api_testing.sweep_tests.comparison_funcs import comp_equal
 from tests.ttnn.utils_for_testing import assert_with_pcc, maybe_trace
 

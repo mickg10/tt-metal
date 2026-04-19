@@ -12,12 +12,12 @@ from loguru import logger
 from torch.nn import Embedding as EmbeddingReference
 
 import ttnn
-from models.demos.deepseek_v3.tests.pytest_utils import DEFAULT_PREFILL_SEQ_LEN
-from models.demos.deepseek_v3.tt.embedding.embedding1d import Embedding1D
-from models.demos.deepseek_v3.tt.embedding.embedding2d import Embedding2D
-from models.demos.deepseek_v3.utils.config_helpers import get_fabric_config, sub_state_dict
-from models.demos.deepseek_v3.utils.run_config import create_run_config
-from models.demos.deepseek_v3.utils.test_utils import (
+from models.demos.glm_moe_dsa.tests.pytest_utils import DEFAULT_PREFILL_SEQ_LEN
+from models.demos.glm_moe_dsa.tt.embedding.embedding1d import Embedding1D
+from models.demos.glm_moe_dsa.tt.embedding.embedding2d import Embedding2D
+from models.demos.glm_moe_dsa.utils.config_helpers import get_fabric_config, sub_state_dict
+from models.demos.glm_moe_dsa.utils.run_config import create_run_config
+from models.demos.glm_moe_dsa.utils.test_utils import (
     assert_hidden_dim_pcc,
     get_model_config,
     get_test_weight_config,

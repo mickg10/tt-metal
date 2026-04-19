@@ -8,7 +8,7 @@ import torch
 
 import ttnn
 from models.common.sampling import SamplingGenerator, SamplingParams, format_sampling_params
-from models.demos.deepseek_v3.utils.config_helpers import USERS_PER_ROW, get_fabric_config, make_deepseek_sampling_args
+from models.demos.glm_moe_dsa.utils.config_helpers import USERS_PER_ROW, get_fabric_config, make_deepseek_sampling_args
 
 
 def _make_lm_head_sharded_logits(torch_input, mesh_device):

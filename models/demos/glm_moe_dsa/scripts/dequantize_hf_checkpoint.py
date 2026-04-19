@@ -14,7 +14,7 @@ the exported checkpoint can be loaded by the dequantized-only DeepSeek runtime.
 import argparse
 from pathlib import Path
 
-from models.demos.deepseek_v3.utils.hf_model_utils import default_dequantized_model_path, save_dequantized_hf_checkpoint
+from models.demos.glm_moe_dsa.utils.hf_model_utils import default_dequantized_model_path, save_dequantized_hf_checkpoint
 
 
 def create_parser() -> argparse.ArgumentParser:

@@ -16,7 +16,7 @@ from loguru import logger
 from tracy.common import clear_profiler_runtime_artifacts
 from tracy.process_model_log import get_latest_ops_log_filename, run_device_profiler
 
-from models.demos.deepseek_v3.utils.device_perf_utils import compute_e2e_time, filter_profile_csv, process_profile_stats
+from models.demos.glm_moe_dsa.utils.device_perf_utils import compute_e2e_time, filter_profile_csv, process_profile_stats
 
 
 # ---------------------------------------------------------------------------

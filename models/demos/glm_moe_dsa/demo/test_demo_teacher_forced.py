@@ -9,11 +9,11 @@ import torch
 from loguru import logger
 
 import ttnn
-from models.demos.deepseek_v3.demo.demo import run_demo
-from models.demos.deepseek_v3.demo.token_accuracy import TokenAccuracy
-from models.demos.deepseek_v3.utils.config_helpers import DEFAULT_MAX_SEQ_LEN, K_CHUNK_SIZE
-from models.demos.deepseek_v3.utils.hf_model_utils import load_tokenizer
-from models.demos.deepseek_v3.utils.test_utils import system_name_to_mesh_shape
+from models.demos.glm_moe_dsa.demo.demo import run_demo
+from models.demos.glm_moe_dsa.demo.token_accuracy import TokenAccuracy
+from models.demos.glm_moe_dsa.utils.config_helpers import DEFAULT_MAX_SEQ_LEN, K_CHUNK_SIZE
+from models.demos.glm_moe_dsa.utils.hf_model_utils import load_tokenizer
+from models.demos.glm_moe_dsa.utils.test_utils import system_name_to_mesh_shape
 
 MODEL_PATH = Path(
     os.getenv(

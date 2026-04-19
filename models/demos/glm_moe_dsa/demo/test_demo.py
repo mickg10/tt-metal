@@ -9,8 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from models.demos.deepseek_v3.demo.demo import load_prompts_from_json, run_demo
-from models.demos.deepseek_v3.utils.test_utils import system_name_to_mesh_shape
+from models.demos.glm_moe_dsa.demo.demo import load_prompts_from_json, run_demo
+from models.demos.glm_moe_dsa.utils.test_utils import system_name_to_mesh_shape
 
 MODEL_PATH = Path(
     os.getenv("DEEPSEEK_V3_HF_MODEL", "/mnt/MLPerf/tt_dnn-models/deepseek-ai/DeepSeek-R1-0528-dequantized")

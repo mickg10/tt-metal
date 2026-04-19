@@ -8,9 +8,9 @@ import re
 from pathlib import Path
 from typing import Any
 
-from models.demos.deepseek_v3.utils.config_dataclass import SavedWeight
-from models.demos.deepseek_v3.utils.config_helpers import TENSOR_CACHE_EXTENSION
-from models.demos.deepseek_v3.utils.weight_config import (
+from models.demos.glm_moe_dsa.utils.config_dataclass import SavedWeight
+from models.demos.glm_moe_dsa.utils.config_helpers import TENSOR_CACHE_EXTENSION
+from models.demos.glm_moe_dsa.utils.weight_config import (
     WeightConfigEncoder,
     locked_file,
     try_decode_saved_weight,

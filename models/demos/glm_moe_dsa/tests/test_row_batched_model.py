@@ -13,8 +13,8 @@ import torch
 from transformers.configuration_utils import PretrainedConfig
 
 import ttnn
-from models.demos.deepseek_v3.tt.model.row_batched_model import RowBatchedModel
-from models.demos.deepseek_v3.utils.config_dataclass import SavedWeight
+from models.demos.glm_moe_dsa.tt.model.row_batched_model import RowBatchedModel
+from models.demos.glm_moe_dsa.utils.config_dataclass import SavedWeight
 
 pytestmark = pytest.mark.t3k_compat
 
@@ -72,27 +72,27 @@ def test_row_batched_model_reuses_base_embedding_and_head_for_mtp(
         return {"embedding": reuse_embedding_weight_cfg, "head": reuse_head_weight_cfg}
 
     monkeypatch.setattr(
-        "models.demos.deepseek_v3.tt.model.row_batched_model.Embedding2D.convert_weights",
+        "models.demos.glm_moe_dsa.tt.model.row_batched_model.Embedding2D.convert_weights",
         fake_embedding_convert_weights,
     )
     monkeypatch.setattr(
-        "models.demos.deepseek_v3.tt.model.row_batched_model.DecoderBlock2D.convert_weights",
+        "models.demos.glm_moe_dsa.tt.model.row_batched_model.DecoderBlock2D.convert_weights",
         fake_decoder_convert_weights,
     )
     monkeypatch.setattr(
-        "models.demos.deepseek_v3.tt.model.row_batched_model.MoEDecoderBlock2D.convert_weights",
+        "models.demos.glm_moe_dsa.tt.model.row_batched_model.MoEDecoderBlock2D.convert_weights",
         fake_decoder_convert_weights,
     )
     monkeypatch.setattr(
-        "models.demos.deepseek_v3.tt.model.row_batched_model.DistributedRMSNorm.convert_weights",
+        "models.demos.glm_moe_dsa.tt.model.row_batched_model.DistributedRMSNorm.convert_weights",
         fake_norm_convert_weights,
     )
     monkeypatch.setattr(
-        "models.demos.deepseek_v3.tt.model.row_batched_model.LMHead1D.convert_weights",
+        "models.demos.glm_moe_dsa.tt.model.row_batched_model.LMHead1D.convert_weights",
         fake_head_convert_weights,
     )
     monkeypatch.setattr(
-        "models.demos.deepseek_v3.tt.model.row_batched_model.MTP2D.convert_weights",
+        "models.demos.glm_moe_dsa.tt.model.row_batched_model.MTP2D.convert_weights",
         fake_mtp_convert_weights,
     )
 

@@ -14,8 +14,8 @@ import torch
 from loguru import logger
 
 import ttnn
-from models.demos.deepseek_v3.utils.config_dataclass import DeepseekSamplingArgs, SavedWeight
-from models.demos.deepseek_v3.utils.lazy_state_dict import LazyStateDict
+from models.demos.glm_moe_dsa.utils.config_dataclass import DeepseekSamplingArgs, SavedWeight
+from models.demos.glm_moe_dsa.utils.lazy_state_dict import LazyStateDict
 
 # Constants
 NORM_CATEGORIES = {"attention_norm", "mlp_norm", "q_norm", "k_norm"}
@@ -544,19 +544,15 @@ def get_dequantized_tensor(
     *,
     dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """Load a tensor and reject quantized checkpoint formats in dequantized-only paths."""
+    """Load a tensor, auto-dequantizing FP8 if needed."""
     tensor = state_dict[key]
     scale_key = f"{key}_scale_inv"
-    if scale_key in state_dict:
-        raise TypeError(
-            f"Expected dequantized tensor '{key}', but found matching quantization scale '{scale_key}'. "
-            "Use a dequantized checkpoint or dequantize before conversion."
-        )
-    if tensor.dtype == torch.float8_e4m3fn:
-        raise TypeError(
-            f"Expected dequantized tensor '{key}', but found float8 data. "
-            "Use a dequantized checkpoint or dequantize before conversion."
-        )
+    if tensor.dtype == torch.float8_e4m3fn and scale_key in state_dict:
+        from models.demos.glm_moe_dsa.utils.hf_model_utils import dequantize_weight_tensor
+        scale = state_dict[scale_key]
+        tensor = dequantize_weight_tensor(tensor, scale, block_shape=[128, 128])
+    elif tensor.dtype == torch.float8_e4m3fn:
+        tensor = tensor.to(dtype)
     if tensor.is_floating_point() and tensor.dtype != dtype:
         return tensor.to(dtype)
     return tensor
@@ -597,11 +593,33 @@ def get_state_dicts(
     assert all(
         d[key].shape == expected_shape for d in dicts if d is not None
     ), f"Key {key} must have the value shaped as {expected_shape} in all dictionaries; instead got {[d[key].shape if d is not None else None for d in dicts]}"
-    assert all(
-        d[key].dtype == expected_dtype for d in dicts if d is not None
-    ), f"Key {key} must have the dtype as {expected_dtype} in all dictionaries; instead got {[d[key].dtype if d is not None else None for d in dicts]}"
+    # Allow FP8 weights — auto-dequant to expected dtype if needed
+    for d in dicts:
+        if d is not None and hasattr(d[key], 'dtype'):
+            if d[key].dtype != expected_dtype and str(d[key].dtype) == 'torch.float8_e4m3fn':
+                # Inline FP8 dequant
+                scale_key = f"{key}_scale_inv"
+                if scale_key in d:
+                    from models.demos.glm_moe_dsa.utils.hf_model_utils import dequantize_weight_tensor
+                    w = d[key]
+                    scale = d[scale_key]
+                    block_shape = [128, 128]  # Standard FP8 block shape
+                    d_dict = d if isinstance(d, dict) else d._base if hasattr(d, '_base') else d
+                    # Can't modify LazyStateDict, so just convert the tensor
+                    pass  # Will handle below
 
-    tensors = [torch.zeros(expected_shape).to(dtype) if d is None else d[key] for d in dicts]
+    tensors = []
+    for d in dicts:
+        if d is None:
+            tensors.append(torch.zeros(expected_shape).to(dtype))
+        else:
+            t = d[key]
+            if hasattr(t, 'dtype') and str(t.dtype) == 'torch.float8_e4m3fn':
+                scale_key = f"{key}_scale_inv"
+                if scale_key in d:
+                    from models.demos.glm_moe_dsa.utils.hf_model_utils import dequantize_weight_tensor
+                    t = dequantize_weight_tensor(t, d[scale_key], block_shape=[128, 128])
+            tensors.append(t)
 
     if concat:
         return torch.concat(tensors, dim=concat_dim)

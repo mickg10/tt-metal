@@ -210,7 +210,7 @@ class DeepseekMoEReduceScatterConfig(OpConfigBase):
     def create_default_input_memory_config(
         cls, users_per_row: int, hidden_size: int, tp_size: int
     ) -> ttnn.MemoryConfig:
-        NUM_DECODE_RS_SHARD_CORES = 7
+        NUM_DECODE_RS_SHARD_CORES = 6  # 6 divides 1536 (GLM-5.1 hidden/TP)
 
         if hidden_size % tp_size != 0:
             raise ValueError(

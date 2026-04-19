@@ -5,8 +5,8 @@ import argparse
 
 import torch
 
-from models.demos.deepseek_v3.reference.deepseek_reference_outputs_gen import *
-from models.demos.deepseek_v3.utils.hf_model_utils import index_model_weights
+from models.demos.glm_moe_dsa.reference.deepseek_reference_outputs_gen import *
+from models.demos.glm_moe_dsa.utils.hf_model_utils import index_model_weights
 
 
 def create_parser() -> argparse.ArgumentParser:

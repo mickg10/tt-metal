@@ -8,7 +8,7 @@ from loguru import logger
 from tracy import signpost
 
 import ttnn
-from models.demos.deepseek_v3.tests.fused_op_unit_tests.mla.test_rope_deepseek import apply_rotary_pos_emb_torch
+from models.demos.glm_moe_dsa.tests.fused_op_unit_tests.mla.test_rope_deepseek import apply_rotary_pos_emb_torch
 from models.perf.benchmarking_utils import BenchmarkProfiler
 from tests.ttnn.utils_for_testing import assert_with_pcc
 

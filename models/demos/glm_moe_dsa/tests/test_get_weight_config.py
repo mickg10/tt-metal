@@ -14,9 +14,9 @@ import torch
 from transformers.configuration_utils import PretrainedConfig
 
 import ttnn
-from models.demos.deepseek_v3.utils.config_dataclass import SavedWeight
-from models.demos.deepseek_v3.utils.config_helpers import TENSOR_CACHE_EXTENSION
-from models.demos.deepseek_v3.utils.weight_config import (
+from models.demos.glm_moe_dsa.utils.config_dataclass import SavedWeight
+from models.demos.glm_moe_dsa.utils.config_helpers import TENSOR_CACHE_EXTENSION
+from models.demos.glm_moe_dsa.utils.weight_config import (
     WeightConfigEncoder,
     get_weight_config,
     normalize_weight_config_paths,

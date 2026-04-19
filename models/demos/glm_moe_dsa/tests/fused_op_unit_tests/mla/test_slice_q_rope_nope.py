@@ -9,8 +9,8 @@ from tracy import signpost
 
 import ttnn
 from models.common.utility_functions import nearest_y
-from models.demos.deepseek_v3.utils.config_dataclass import SliceConfig
-from models.demos.deepseek_v3.utils.config_helpers import USERS_PER_ROW
+from models.demos.glm_moe_dsa.utils.config_dataclass import SliceConfig
+from models.demos.glm_moe_dsa.utils.config_helpers import USERS_PER_ROW
 from models.perf.benchmarking_utils import BenchmarkProfiler
 from tests.ttnn.utils_for_testing import assert_equal
 

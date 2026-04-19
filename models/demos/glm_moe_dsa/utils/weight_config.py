@@ -15,9 +15,9 @@ from loguru import logger
 from transformers.configuration_utils import PretrainedConfig
 
 import ttnn
-from models.demos.deepseek_v3.utils.config_dataclass import SavedWeight
-from models.demos.deepseek_v3.utils.config_helpers import TENSOR_CACHE_EXTENSION
-from models.demos.deepseek_v3.utils.run_config import WeightConfig
+from models.demos.glm_moe_dsa.utils.config_dataclass import SavedWeight
+from models.demos.glm_moe_dsa.utils.config_helpers import TENSOR_CACHE_EXTENSION
+from models.demos.glm_moe_dsa.utils.run_config import WeightConfig
 
 
 @contextmanager
@@ -116,7 +116,7 @@ def _try_load_cached_config(config_path: Path, weight_cache_path: Path, force_re
 
 
 def get_weight_config(
-    ModuleClass: type["models.demos.deepseek_v3.utils.abstract_module.AbstractModule"],
+    ModuleClass: type["models.demos.glm_moe_dsa.utils.abstract_module.AbstractModule"],
     hf_config: PretrainedConfig,
     state_dicts: tuple[dict[str, torch.Tensor] | None, ...] | None = None,
     weight_cache_path: Path | None = None,
@@ -168,7 +168,7 @@ def get_weight_config(
     logger.info(f"Caching weights at {weight_cache_path}")
     if state_dicts is None:
         logger.info("State dict was not provided, preparing from random weights or model path")
-        from models.demos.deepseek_v3.utils.hf_model_utils import prepare_model_state_dict
+        from models.demos.glm_moe_dsa.utils.hf_model_utils import prepare_model_state_dict
 
         model_state = prepare_model_state_dict(
             hf_config=hf_config,

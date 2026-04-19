@@ -10,15 +10,15 @@ from loguru import logger
 
 import ttnn
 from models.common.utility_functions import comp_pcc
-from models.demos.deepseek_v3.reference.modeling_deepseek import DeepseekV3MLP
-from models.demos.deepseek_v3.tests.pytest_utils import DEFAULT_PREFILL_SEQ_LEN
-from models.demos.deepseek_v3.tt.mlp.mlp import MLP
-from models.demos.deepseek_v3.tt.mlp.mlp_dequant import MLPDequant
-from models.demos.deepseek_v3.tt.mlp.non_expert import NonExpert
-from models.demos.deepseek_v3.tt.mlp.shared_expert import SharedExpert
-from models.demos.deepseek_v3.utils.config_helpers import USERS_PER_ROW, get_fabric_config, sub_state_dict
-from models.demos.deepseek_v3.utils.run_config import create_run_config, load_weight
-from models.demos.deepseek_v3.utils.test_utils import (
+from models.demos.glm_moe_dsa.reference.modeling_deepseek import DeepseekV3MLP
+from models.demos.glm_moe_dsa.tests.pytest_utils import DEFAULT_PREFILL_SEQ_LEN
+from models.demos.glm_moe_dsa.tt.mlp.mlp import MLP
+from models.demos.glm_moe_dsa.tt.mlp.mlp_dequant import MLPDequant
+from models.demos.glm_moe_dsa.tt.mlp.non_expert import NonExpert
+from models.demos.glm_moe_dsa.tt.mlp.shared_expert import SharedExpert
+from models.demos.glm_moe_dsa.utils.config_helpers import USERS_PER_ROW, get_fabric_config, sub_state_dict
+from models.demos.glm_moe_dsa.utils.run_config import create_run_config, load_weight
+from models.demos.glm_moe_dsa.utils.test_utils import (
     assert_hidden_dim_pcc,
     get_model_config,
     get_test_weight_config,

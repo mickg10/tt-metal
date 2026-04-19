@@ -18,8 +18,8 @@ import pytest
 import torch
 
 import ttnn
-from models.demos.deepseek_v3.utils import config_helpers
-from models.demos.deepseek_v3.utils.config_helpers import get_fabric_config
+from models.demos.glm_moe_dsa.utils import config_helpers
+from models.demos.glm_moe_dsa.utils.config_helpers import get_fabric_config
 
 pytestmark = pytest.mark.t3k_compat
 

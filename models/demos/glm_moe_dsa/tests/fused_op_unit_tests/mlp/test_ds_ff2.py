@@ -12,8 +12,8 @@ import torch
 from loguru import logger
 
 import ttnn
-from models.demos.deepseek_v3.reference.modeling_deepseek import DeepseekV3MLP
-from models.demos.deepseek_v3.tests.fused_op_unit_tests.test_utils import (
+from models.demos.glm_moe_dsa.reference.modeling_deepseek import DeepseekV3MLP
+from models.demos.glm_moe_dsa.tests.fused_op_unit_tests.test_utils import (
     collect_device_perf,
     compare_with_reference,
     deallocate_outputs,
@@ -23,10 +23,10 @@ from models.demos.deepseek_v3.tests.fused_op_unit_tests.test_utils import (
     measure_perf_us,
     skip_single_device_sharded,
 )
-from models.demos.deepseek_v3.tt.mlp.mlp import MLP
-from models.demos.deepseek_v3.utils.config_helpers import USERS_PER_ROW
-from models.demos.deepseek_v3.utils.run_config import create_run_config
-from models.demos.deepseek_v3.utils.test_utils import (
+from models.demos.glm_moe_dsa.tt.mlp.mlp import MLP
+from models.demos.glm_moe_dsa.utils.config_helpers import USERS_PER_ROW
+from models.demos.glm_moe_dsa.utils.run_config import create_run_config
+from models.demos.glm_moe_dsa.utils.test_utils import (
     get_model_config,
     get_test_weight_config,
     system_name_to_mesh_shape,
@@ -350,7 +350,7 @@ def _build_ff2_inputs(
     # Match production: mul output is L1 WIDTH_SHARDED for decode (cfg["mul"]["memory_config"])
     # For prefill, use DRAM INTERLEAVED (production uses DRAM for prefill)
     if mode == "decode":
-        from models.demos.deepseek_v3.utils.config_helpers import get_activation_sharding_core_counts_for_dram_matmul
+        from models.demos.glm_moe_dsa.utils.config_helpers import get_activation_sharding_core_counts_for_dram_matmul
 
         max_num_cores = mesh_device.core_grid.x * mesh_device.core_grid.y
         inner_num_cores = max(

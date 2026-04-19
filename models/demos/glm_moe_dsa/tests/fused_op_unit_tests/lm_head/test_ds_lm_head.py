@@ -31,7 +31,7 @@ import torch.nn as nn
 from loguru import logger
 
 import ttnn
-from models.demos.deepseek_v3.tests.fused_op_unit_tests.test_utils import (
+from models.demos.glm_moe_dsa.tests.fused_op_unit_tests.test_utils import (
     collect_device_perf,
     compare_with_reference,
     get_int_env,
@@ -39,10 +39,10 @@ from models.demos.deepseek_v3.tests.fused_op_unit_tests.test_utils import (
     maybe_skip_long_seq,
     measure_perf_us,
 )
-from models.demos.deepseek_v3.tt.lm_head1d import LMHead1D
-from models.demos.deepseek_v3.utils.config_helpers import USERS_PER_ROW, sub_state_dict
-from models.demos.deepseek_v3.utils.run_config import create_run_config
-from models.demos.deepseek_v3.utils.test_utils import get_model_config, get_test_weight_config, pad_or_trim_seq_len
+from models.demos.glm_moe_dsa.tt.lm_head1d import LMHead1D
+from models.demos.glm_moe_dsa.utils.config_helpers import USERS_PER_ROW, sub_state_dict
+from models.demos.glm_moe_dsa.utils.run_config import create_run_config
+from models.demos.glm_moe_dsa.utils.test_utils import get_model_config, get_test_weight_config, pad_or_trim_seq_len
 from models.perf.benchmarking_utils import BenchmarkData, BenchmarkProfiler
 
 LONG_SEQ_ENV_VAR = "DEEPSEEK_V3_LONG_SEQ_TESTS"

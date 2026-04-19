@@ -6,9 +6,9 @@ import json
 
 import pytest
 
-from models.demos.deepseek_v3.demo import demo as demo_module
-from models.demos.deepseek_v3.demo.make_lmeval_prompts import resolve_task_name as resolve_prompt_task_name
-from models.demos.deepseek_v3.demo.score_lmeval_outputs import extract_gpqa_choice, load_generations_by_index
+from models.demos.glm_moe_dsa.demo import demo as demo_module
+from models.demos.glm_moe_dsa.demo.make_lmeval_prompts import resolve_task_name as resolve_prompt_task_name
+from models.demos.glm_moe_dsa.demo.score_lmeval_outputs import extract_gpqa_choice, load_generations_by_index
 
 
 class _FakeTokenizer:

@@ -12,8 +12,8 @@ import torch
 from loguru import logger
 
 import ttnn
-from models.demos.deepseek_v3.reference.modeling_deepseek import DeepseekV3MLP
-from models.demos.deepseek_v3.tests.fused_op_unit_tests.test_utils import (
+from models.demos.glm_moe_dsa.reference.modeling_deepseek import DeepseekV3MLP
+from models.demos.glm_moe_dsa.tests.fused_op_unit_tests.test_utils import (
     collect_device_perf,
     compare_with_reference,
     deallocate_outputs,
@@ -23,10 +23,10 @@ from models.demos.deepseek_v3.tests.fused_op_unit_tests.test_utils import (
     measure_perf_us,
     skip_single_device_sharded,
 )
-from models.demos.deepseek_v3.tt.mlp.mlp import MLP
-from models.demos.deepseek_v3.utils.config_helpers import USERS_PER_ROW
-from models.demos.deepseek_v3.utils.run_config import create_run_config
-from models.demos.deepseek_v3.utils.test_utils import (
+from models.demos.glm_moe_dsa.tt.mlp.mlp import MLP
+from models.demos.glm_moe_dsa.utils.config_helpers import USERS_PER_ROW
+from models.demos.glm_moe_dsa.utils.run_config import create_run_config
+from models.demos.glm_moe_dsa.utils.test_utils import (
     get_model_config,
     get_test_weight_config,
     system_name_to_mesh_shape,
@@ -263,7 +263,7 @@ def _build_ff1_3_inputs(
         "down_proj.weight": torch.randn(hf_config.hidden_size, hf_config.intermediate_size, dtype=torch.bfloat16),
     }
 
-    from models.demos.deepseek_v3.tt.mlp.mlp import MLP
+    from models.demos.glm_moe_dsa.tt.mlp.mlp import MLP
 
     weight_config = get_test_weight_config(
         MLP,

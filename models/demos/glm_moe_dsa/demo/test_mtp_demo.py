@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from models.demos.deepseek_v3.demo.demo import load_prompts_from_json, run_demo
+from models.demos.glm_moe_dsa.demo.demo import load_prompts_from_json, run_demo
 
 MODEL_PATH = Path(os.environ["DEEPSEEK_V3_HF_MODEL"])
 CACHE_DIR = Path(os.environ["DEEPSEEK_V3_CACHE"])

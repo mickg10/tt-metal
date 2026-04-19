@@ -48,13 +48,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 
 import ttnn
 from models.common.utility_functions import comp_pcc
-from models.demos.deepseek_v3.tt.mla.mla2d import MLA2D
-from models.demos.deepseek_v3.tt.model.row_batched_model import RowBatchedModel, get_fabric_config
-from models.demos.deepseek_v3.utils.config_helpers import USERS_PER_ROW, sub_state_dict
-from models.demos.deepseek_v3.utils.hf_model_utils import default_dequantized_model_path
-from models.demos.deepseek_v3.utils.lazy_state_dict import LazyStateDict
-from models.demos.deepseek_v3.utils.run_config import create_run_config
-from models.demos.deepseek_v3.utils.test_utils import (
+from models.demos.glm_moe_dsa.tt.mla.mla2d import MLA2D
+from models.demos.glm_moe_dsa.tt.model.row_batched_model import RowBatchedModel, get_fabric_config
+from models.demos.glm_moe_dsa.utils.config_helpers import USERS_PER_ROW, sub_state_dict
+from models.demos.glm_moe_dsa.utils.hf_model_utils import default_dequantized_model_path
+from models.demos.glm_moe_dsa.utils.lazy_state_dict import LazyStateDict
+from models.demos.glm_moe_dsa.utils.run_config import create_run_config
+from models.demos.glm_moe_dsa.utils.test_utils import (
     get_model_config,
     get_rope_tensors,
     get_test_weight_config,
@@ -147,8 +147,8 @@ def _preprocess_experts_with_bspm(
     2 → bfp2  (1 mantissa bit,  low-saliency tiles)
     3 → zero  (tile zeroed out, dead/pruned tiles)
     """
-    from models.demos.deepseek_v3_b1.compressed_tensor.bspm_loader import load_bspm_for_layer
-    from models.demos.deepseek_v3_b1.compressed_tensor.tile_utils import quantize_dequantize_bfp
+    from models.demos.glm_moe_dsa_b1.compressed_tensor.bspm_loader import load_bspm_for_layer
+    from models.demos.glm_moe_dsa_b1.compressed_tensor.tile_utils import quantize_dequantize_bfp
 
     # tt-metal code → mantissa bits (None = zero tile)
     TT_CODE_TO_MANT: dict[int, int | None] = {0: 7, 1: 3, 2: 1, 3: None}

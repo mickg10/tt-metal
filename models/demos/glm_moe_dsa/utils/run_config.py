@@ -11,7 +11,7 @@ from typing import Any, overload
 from loguru import logger
 
 import ttnn
-from models.demos.deepseek_v3.utils.config_dataclass import FromWeightConfig, MeshDeviceStub, OpConfigBase, SavedWeight
+from models.demos.glm_moe_dsa.utils.config_dataclass import FromWeightConfig, MeshDeviceStub, OpConfigBase, SavedWeight
 
 MESH_DEVICE_STATE_DICT_KEY = "mesh_device"
 

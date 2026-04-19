@@ -15,8 +15,8 @@ from loguru import logger
 
 import ttnn
 from models.common.sampling.sampling_params import SamplingParams
-from models.demos.deepseek_v3.tt.generator import DeepseekGenerator as DeepseekGeneratorDP
-from models.demos.deepseek_v3.utils.config_helpers import (
+from models.demos.glm_moe_dsa.tt.generator import DeepseekGenerator as DeepseekGeneratorDP
+from models.demos.glm_moe_dsa.utils.config_helpers import (
     DEFAULT_MAX_SEQ_LEN,
     DEFAULT_SAMPLING_TEMPERATURE,
     DEFAULT_SAMPLING_TOP_K,
@@ -24,8 +24,8 @@ from models.demos.deepseek_v3.utils.config_helpers import (
     USERS_PER_ROW,
     get_fabric_config,
 )
-from models.demos.deepseek_v3.utils.hf_model_utils import load_tokenizer
-from models.demos.deepseek_v3.utils.test_utils import system_name_to_mesh_shape
+from models.demos.glm_moe_dsa.utils.hf_model_utils import load_tokenizer
+from models.demos.glm_moe_dsa.utils.test_utils import system_name_to_mesh_shape
 
 
 def _prompt_text_for_index(prompts: list[str] | None, random_weights: bool, index: int) -> str:
@@ -593,7 +593,7 @@ def run_demo(
                 raise SystemExit("--token-accuracy requires --reference-file pointing to a .pt/.refpt file")
 
             # Lazy import to avoid overhead when not used
-            from models.demos.deepseek_v3.demo.token_accuracy import TokenAccuracy
+            from models.demos.glm_moe_dsa.demo.token_accuracy import TokenAccuracy
 
             token_acc = TokenAccuracy(str(reference_file), prompt_len=tf_prompt_len)
         if generator == "bp":

@@ -631,7 +631,7 @@ class MLA1D(AbstractModule):
                 ttnn.core.roundup(batch_size_per_row, ttnn.TILE_SIZE),
                 hidden_size_per_device,
             ),
-            core_grid=ttnn.CoreGrid(y=3, x=8)  # 24 cores for hidden=6144,
+            core_grid=ttnn.CoreGrid(y=3, x=8)  ,  # 24 cores for hidden=6144
             strategy=ttnn.ShardStrategy.WIDTH,
         )
 

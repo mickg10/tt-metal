@@ -11,12 +11,12 @@ from transformers.configuration_utils import PretrainedConfig
 
 import ttnn
 from models.common.utility_functions import comp_pcc
-from models.demos.deepseek_v3.reference.modeling_deepseek import DeepseekV3Attention
-from models.demos.deepseek_v3.tests.pytest_utils import DEFAULT_PREFILL_SEQ_LEN, build_test_cases_and_ids
-from models.demos.deepseek_v3.tt.mla.mla2d import MLA2D
-from models.demos.deepseek_v3.utils.config_helpers import USERS_PER_ROW, get_fabric_config, sub_state_dict
-from models.demos.deepseek_v3.utils.run_config import create_run_config
-from models.demos.deepseek_v3.utils.test_utils import (
+from models.demos.glm_moe_dsa.reference.modeling_deepseek import DeepseekV3Attention
+from models.demos.glm_moe_dsa.tests.pytest_utils import DEFAULT_PREFILL_SEQ_LEN, build_test_cases_and_ids
+from models.demos.glm_moe_dsa.tt.mla.mla2d import MLA2D
+from models.demos.glm_moe_dsa.utils.config_helpers import USERS_PER_ROW, get_fabric_config, sub_state_dict
+from models.demos.glm_moe_dsa.utils.run_config import create_run_config
+from models.demos.glm_moe_dsa.utils.test_utils import (
     get_model_config,
     get_rope_tensors,
     get_test_weight_config,

@@ -78,8 +78,8 @@ class _BsprnStateDict:
         self._budget = budget
         self._codes_cache: dict[int, np.ndarray | None] = {}  # layer → codes or None
 
-        from models.demos.deepseek_v3_b1.compressed_tensor.bspm_loader import load_bspm_for_layer
-        from models.demos.deepseek_v3_b1.compressed_tensor.tile_utils import quantize_dequantize_bfp
+        from models.demos.glm_moe_dsa_b1.compressed_tensor.bspm_loader import load_bspm_for_layer
+        from models.demos.glm_moe_dsa_b1.compressed_tensor.tile_utils import quantize_dequantize_bfp
 
         self._load_bspm = load_bspm_for_layer
         self._qdq = quantize_dequantize_bfp
@@ -217,8 +217,8 @@ def main() -> None:
     args = create_parser().parse_args()
 
     # ── Resolve dequantized model path ──────────────────────────────────────
-    from models.demos.deepseek_v3.utils.hf_model_utils import default_dequantized_model_path
-    from models.demos.deepseek_v3.utils.lazy_state_dict import LazyStateDict
+    from models.demos.glm_moe_dsa.utils.hf_model_utils import default_dequantized_model_path
+    from models.demos.glm_moe_dsa.utils.lazy_state_dict import LazyStateDict
 
     deq_path = default_dequantized_model_path(args.model_path)
     if not deq_path.exists():
@@ -262,11 +262,11 @@ def main() -> None:
 
     # ── Device setup ────────────────────────────────────────────────────────
     import ttnn
-    from models.demos.deepseek_v3.tt.model.row_batched_model import RowBatchedModel, get_fabric_config
-    from models.demos.deepseek_v3.utils.weight_config import get_weight_config
+    from models.demos.glm_moe_dsa.tt.model.row_batched_model import RowBatchedModel, get_fabric_config
+    from models.demos.glm_moe_dsa.utils.weight_config import get_weight_config
 
     mesh_shape_env = os.environ.get("MESH_DEVICE", "TG")
-    from models.demos.deepseek_v3.utils.test_utils import SYSTEM_NAME_TO_MESH_SHAPE
+    from models.demos.glm_moe_dsa.utils.test_utils import SYSTEM_NAME_TO_MESH_SHAPE
 
     mesh_shape = SYSTEM_NAME_TO_MESH_SHAPE.get(mesh_shape_env, (4, 8))
     logger.info(f"Opening mesh device {mesh_shape[0]}×{mesh_shape[1]} ({mesh_shape_env})")

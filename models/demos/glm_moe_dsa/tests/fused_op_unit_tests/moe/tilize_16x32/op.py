@@ -13,7 +13,7 @@ This implements tilize operation on a single core where:
 import torch
 
 import ttnn
-from models.demos.deepseek_v3_b1.unified_kernel_descriptor import (
+from models.demos.glm_moe_dsa_b1.unified_kernel_descriptor import (
     UnifiedCompileTimeCoreDescriptor,
     UnifiedKernelDescriptor,
 )

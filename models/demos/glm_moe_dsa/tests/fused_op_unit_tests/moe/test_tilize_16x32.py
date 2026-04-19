@@ -16,7 +16,7 @@ from loguru import logger
 
 import ttnn
 from models.common.utility_functions import comp_pcc
-from models.demos.deepseek_v3.tests.fused_op_unit_tests.moe.tilize_16x32.op import golden, tilize_16x32_kernel
+from models.demos.glm_moe_dsa.tests.fused_op_unit_tests.moe.tilize_16x32.op import golden, tilize_16x32_kernel
 
 
 @pytest.mark.requires_device(["N150", "N300", "T3K", "TG", "DUAL", "QUAD"])

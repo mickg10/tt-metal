@@ -23,7 +23,7 @@ try:
 except ImportError:
     tqdm = None
 
-from models.demos.deepseek_v3.utils.hf_model_utils import (
+from models.demos.glm_moe_dsa.utils.hf_model_utils import (
     DEQUANTIZED_CHECKPOINT_ERROR_GUIDANCE,
     apply_with_names,
     index_model_weights,

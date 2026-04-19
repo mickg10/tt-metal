@@ -9,12 +9,12 @@ import torch
 from loguru import logger
 
 import ttnn
-from models.demos.deepseek_v3.reference.modeling_deepseek import MoEGate as ReferenceMoEGate
-from models.demos.deepseek_v3.tests.pytest_utils import DEFAULT_PREFILL_SEQ_LEN
-from models.demos.deepseek_v3.tt.moe_gate import MoEGate
-from models.demos.deepseek_v3.utils.config_helpers import USERS_PER_ROW
-from models.demos.deepseek_v3.utils.run_config import create_run_config
-from models.demos.deepseek_v3.utils.test_utils import get_model_config, get_test_weight_config, run_module_forward
+from models.demos.glm_moe_dsa.reference.modeling_deepseek import MoEGate as ReferenceMoEGate
+from models.demos.glm_moe_dsa.tests.pytest_utils import DEFAULT_PREFILL_SEQ_LEN
+from models.demos.glm_moe_dsa.tt.moe_gate import MoEGate
+from models.demos.glm_moe_dsa.utils.config_helpers import USERS_PER_ROW
+from models.demos.glm_moe_dsa.utils.run_config import create_run_config
+from models.demos.glm_moe_dsa.utils.test_utils import get_model_config, get_test_weight_config, run_module_forward
 from tests.ttnn.utils_for_testing import comp_pcc
 
 _max_seq_len_env = os.getenv("DEEPSEEK_MAX_SEQ_LEN_OVERRIDE")

@@ -16,18 +16,18 @@ from transformers.configuration_utils import PretrainedConfig
 
 import ttnn
 from models.common.utility_functions import comp_pcc
-from models.demos.deepseek_v3.scripts.generate_test_inputs_outputs import __file__ as REFERENCE_IO_SCRIPT_NAME
-from models.demos.deepseek_v3.tt.rope import RotarySetup
-from models.demos.deepseek_v3.utils.abstract_module import AbstractModule
-from models.demos.deepseek_v3.utils.config_helpers import even_int_div
-from models.demos.deepseek_v3.utils.hf_model_utils import dequantize_state_dict as _dequantize_state_dict
-from models.demos.deepseek_v3.utils.weight_config import get_weight_config
+from models.demos.glm_moe_dsa.scripts.generate_test_inputs_outputs import __file__ as REFERENCE_IO_SCRIPT_NAME
+from models.demos.glm_moe_dsa.tt.rope import RotarySetup
+from models.demos.glm_moe_dsa.utils.abstract_module import AbstractModule
+from models.demos.glm_moe_dsa.utils.config_helpers import even_int_div
+from models.demos.glm_moe_dsa.utils.hf_model_utils import dequantize_state_dict as _dequantize_state_dict
+from models.demos.glm_moe_dsa.utils.weight_config import get_weight_config
 from models.tt_transformers.tt.common import PagedAttentionConfig
 
 
 def load_state_dict(model_path: Path, module_path: str):
     # Lazily load HF weights: only access tensors when keys are used.
-    from models.demos.deepseek_v3.utils.lazy_state_dict import LazyStateDict
+    from models.demos.glm_moe_dsa.utils.lazy_state_dict import LazyStateDict
 
     lazy = LazyStateDict(model_path)
     if module_path:

@@ -12,11 +12,11 @@ import torch.nn as nn
 from loguru import logger
 
 import ttnn
-from models.demos.deepseek_v3.tt.ccl import CCL
-from models.demos.deepseek_v3.tt.lm_head1d import LMHead1D
-from models.demos.deepseek_v3.utils.config_helpers import get_fabric_config, sub_state_dict
-from models.demos.deepseek_v3.utils.run_config import create_run_config
-from models.demos.deepseek_v3.utils.test_utils import (
+from models.demos.glm_moe_dsa.tt.ccl import CCL
+from models.demos.glm_moe_dsa.tt.lm_head1d import LMHead1D
+from models.demos.glm_moe_dsa.utils.config_helpers import get_fabric_config, sub_state_dict
+from models.demos.glm_moe_dsa.utils.run_config import create_run_config
+from models.demos.glm_moe_dsa.utils.test_utils import (
     assert_hidden_dim_pcc,
     get_model_config,
     get_test_weight_config,

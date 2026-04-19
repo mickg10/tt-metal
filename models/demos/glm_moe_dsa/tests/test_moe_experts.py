@@ -13,12 +13,12 @@ import torch.nn as nn
 import ttnn
 
 # Import from local reference files instead of HuggingFace
-from models.demos.deepseek_v3.reference.modeling_deepseek import DeepseekV3MLP as ReferenceExpert
-from models.demos.deepseek_v3.tests.pytest_utils import DEFAULT_PREFILL_SEQ_LEN
-from models.demos.deepseek_v3.tt.experts import Experts as TTExperts
-from models.demos.deepseek_v3.utils.config_helpers import USERS_PER_ROW, even_int_div, sub_state_dict
-from models.demos.deepseek_v3.utils.run_config import create_run_config
-from models.demos.deepseek_v3.utils.test_utils import get_model_config, get_test_weight_config, run_module_forward
+from models.demos.glm_moe_dsa.reference.modeling_deepseek import DeepseekV3MLP as ReferenceExpert
+from models.demos.glm_moe_dsa.tests.pytest_utils import DEFAULT_PREFILL_SEQ_LEN
+from models.demos.glm_moe_dsa.tt.experts import Experts as TTExperts
+from models.demos.glm_moe_dsa.utils.config_helpers import USERS_PER_ROW, even_int_div, sub_state_dict
+from models.demos.glm_moe_dsa.utils.run_config import create_run_config
+from models.demos.glm_moe_dsa.utils.test_utils import get_model_config, get_test_weight_config, run_module_forward
 
 
 class DeepseekV3MoEExperts(nn.Module):

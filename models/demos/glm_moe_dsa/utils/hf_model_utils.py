@@ -20,7 +20,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import no_init_weights
 
-from models.demos.deepseek_v3.reference.modeling_deepseek import DeepseekV3ForCausalLM
+from models.demos.glm_moe_dsa.reference.modeling_deepseek import DeepseekV3ForCausalLM
 
 MODEL_INDEX_FILENAME = "model.safetensors.index.json"
 DEQUANTIZED_CHECKPOINT_SUFFIX = "-dequantized"
@@ -52,7 +52,7 @@ executor = concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count())
 
 
 def index_model_weights(model_path: str | Path) -> Mapping[str, torch.Tensor]:
-    from models.demos.deepseek_v3.utils.lazy_state_dict import LazyStateDict
+    from models.demos.glm_moe_dsa.utils.lazy_state_dict import LazyStateDict
 
     return LazyStateDict(Path(model_path))
 
@@ -537,25 +537,40 @@ def prepare_model_state_dict(
                 "Set DEEPSEEK_V3_HF_MODEL to a directory containing DeepSeek-V3 safetensors, or pass --model-path."
             )
         if any(name.endswith("_scale_inv") for name in model_state):
-            # Auto-dequantize FP8 weights instead of raising error
-            logger.info("Detected FP8 quantized weights (*_scale_inv). Auto-dequantizing to BF16...")
-            dequant_keys = [k for k in model_state if not k.endswith("_scale_inv")]
-            for key in dequant_keys:
-                scale_key = f"{key}_scale_inv"
-                if scale_key in model_state:
-                    w = model_state[key]
-                    if hasattr(w, 'dtype') and str(w.dtype) == 'torch.float8_e4m3fn':
-                        import torch
-                        scale = model_state[scale_key]
-                        block_shape = _get_weight_block_shape_from_quant_config(
-                            getattr(hf_config, 'quantization_config', None) or {}
-                        )
-                        model_state[key] = dequantize_weight_tensor(w, scale, block_shape=block_shape)
-                        del model_state[scale_key]
-            # Remove remaining scale tensors
-            for key in list(model_state.keys()):
-                if key.endswith("_scale_inv"):
-                    del model_state[key]
-            logger.info("FP8 dequantization complete.")
+            # Wrap LazyStateDict with auto-dequantizing proxy
+            logger.info("Detected FP8 quantized weights (*_scale_inv). Wrapping with auto-dequant...")
+            block_shape = _get_weight_block_shape_from_quant_config(
+                getattr(hf_config, 'quantization_config', None) or {}
+            )
+            import torch
+            class DequantProxy:
+                """Wraps a LazyStateDict to auto-dequantize FP8 on access."""
+                def __init__(self, base, block_shape):
+                    self._base = base
+                    self._block_shape = block_shape
+                def __getitem__(self, key):
+                    if key.endswith("_scale_inv"):
+                        return self._base[key]
+                    val = self._base[key]
+                    if hasattr(val, 'dtype') and val.dtype == torch.float8_e4m3fn:
+                        scale_key = f"{key}_scale_inv"
+                        if scale_key in self._base:
+                            scale = self._base[scale_key]
+                            val = dequantize_weight_tensor(val, scale, block_shape=self._block_shape)
+                    return val
+                def __contains__(self, key):
+                    return key in self._base
+                def __iter__(self):
+                    return (k for k in self._base if not k.endswith("_scale_inv"))
+                def keys(self):
+                    return [k for k in self._base.keys() if not k.endswith("_scale_inv")]
+                def __len__(self):
+                    return len(self.keys())
+                def view_with_prefix(self, *args, **kwargs):
+                    return DequantProxy(self._base.view_with_prefix(*args, **kwargs), self._block_shape)
+                def __getattr__(self, name):
+                    return getattr(self._base, name)
+            model_state = DequantProxy(model_state, block_shape)
+            logger.info("FP8 auto-dequant proxy enabled.")
 
     return model_state

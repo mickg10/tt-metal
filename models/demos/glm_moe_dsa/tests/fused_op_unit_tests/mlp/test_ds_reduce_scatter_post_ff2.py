@@ -11,21 +11,21 @@ from loguru import logger
 
 import ttnn
 from models.common.utility_functions import profiler
-from models.demos.deepseek_v3.tests.fused_op_unit_tests.test_utils import (
+from models.demos.glm_moe_dsa.tests.fused_op_unit_tests.test_utils import (
     collect_device_perf,
     compare_with_reference,
     get_int_env,
     log_run_mode,
     maybe_skip_long_seq,
 )
-from models.demos.deepseek_v3.tt.mlp.mlp import MLP
-from models.demos.deepseek_v3.utils.config_helpers import (
+from models.demos.glm_moe_dsa.tt.mlp.mlp import MLP
+from models.demos.glm_moe_dsa.utils.config_helpers import (
     USERS_PER_ROW,
     even_int_div,
     get_activation_sharding_core_counts_for_dram_matmul,
 )
-from models.demos.deepseek_v3.utils.run_config import create_run_config
-from models.demos.deepseek_v3.utils.test_utils import (
+from models.demos.glm_moe_dsa.utils.run_config import create_run_config
+from models.demos.glm_moe_dsa.utils.test_utils import (
     get_model_config,
     get_test_weight_config,
     system_name_to_mesh_shape,

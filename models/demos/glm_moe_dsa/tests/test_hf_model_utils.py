@@ -12,7 +12,7 @@ import pytest
 import safetensors.torch
 import torch
 
-from models.demos.deepseek_v3.utils.hf_model_utils import (
+from models.demos.glm_moe_dsa.utils.hf_model_utils import (
     index_model_weights,
     load_weight_from_weights_dict,
     materialize_model_weights,
@@ -20,8 +20,8 @@ from models.demos.deepseek_v3.utils.hf_model_utils import (
     save_dequantized_hf_checkpoint,
     unload_weight_from_weights_dict,
 )
-from models.demos.deepseek_v3.utils.lazy_state_dict import LazyStateDict
-from models.demos.deepseek_v3.utils.test_utils import dequantize_state_dict, load_state_dict
+from models.demos.glm_moe_dsa.utils.lazy_state_dict import LazyStateDict
+from models.demos.glm_moe_dsa.utils.test_utils import dequantize_state_dict, load_state_dict
 
 pytestmark = pytest.mark.t3k_compat
 

@@ -9,7 +9,7 @@ import torch
 from loguru import logger
 
 import ttnn
-from models.demos.deepseek_v3.tests.fused_op_unit_tests.test_utils import (
+from models.demos.glm_moe_dsa.tests.fused_op_unit_tests.test_utils import (
     collect_device_perf,
     compare_with_reference,
     get_int_env,
@@ -17,10 +17,10 @@ from models.demos.deepseek_v3.tests.fused_op_unit_tests.test_utils import (
     maybe_skip_long_seq,
     measure_perf_us,
 )
-from models.demos.deepseek_v3.tt.embedding.embedding1d import Embedding1D
-from models.demos.deepseek_v3.utils.config_helpers import USERS_PER_ROW, even_int_div
-from models.demos.deepseek_v3.utils.run_config import create_run_config
-from models.demos.deepseek_v3.utils.test_utils import (
+from models.demos.glm_moe_dsa.tt.embedding.embedding1d import Embedding1D
+from models.demos.glm_moe_dsa.utils.config_helpers import USERS_PER_ROW, even_int_div
+from models.demos.glm_moe_dsa.utils.run_config import create_run_config
+from models.demos.glm_moe_dsa.utils.test_utils import (
     get_model_config,
     get_test_weight_config,
     system_name_to_mesh_shape,
@@ -276,7 +276,7 @@ def _build_embedding_inputs(
     use_real_weights: bool,
     state_dict: dict = None,
 ):
-    from models.demos.deepseek_v3.tt.embedding.embedding1d import Embedding1D
+    from models.demos.glm_moe_dsa.tt.embedding.embedding1d import Embedding1D
 
     # For real weights, we need the state dict
     # For random weights, we generate a random embedding weight tensor
@@ -448,7 +448,7 @@ def test_ds_embedding(
     # For real weights, get the embedding state dict
     embedding_state_dict = None
     if use_real_weights:
-        from models.demos.deepseek_v3.utils.config_helpers import sub_state_dict
+        from models.demos.glm_moe_dsa.utils.config_helpers import sub_state_dict
 
         embedding_state_dict = sub_state_dict(state_dict, "model.embed_tokens.")
 
@@ -561,7 +561,7 @@ def test_ds_embedding_single_device(
 
     # For reference, use per-device weight slice
     if use_real_weights:
-        from models.demos.deepseek_v3.utils.config_helpers import sub_state_dict
+        from models.demos.glm_moe_dsa.utils.config_helpers import sub_state_dict
 
         embedding_state_dict = sub_state_dict(state_dict, "model.embed_tokens.")
         torch_weight = embedding_state_dict["weight"][:, :per_device_hidden_size].float()

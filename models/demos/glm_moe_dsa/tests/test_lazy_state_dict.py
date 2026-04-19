@@ -11,9 +11,9 @@ import pytest
 import safetensors.torch
 import torch
 
-from models.demos.deepseek_v3.utils import lazy_state_dict as lsd
-from models.demos.deepseek_v3.utils.config_helpers import get_state_dicts, sub_state_dict
-from models.demos.deepseek_v3.utils.test_utils import load_state_dict
+from models.demos.glm_moe_dsa.utils import lazy_state_dict as lsd
+from models.demos.glm_moe_dsa.utils.config_helpers import get_state_dicts, sub_state_dict
+from models.demos.glm_moe_dsa.utils.test_utils import load_state_dict
 
 pytestmark = pytest.mark.t3k_compat
 
