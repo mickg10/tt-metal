@@ -537,10 +537,25 @@ def prepare_model_state_dict(
                 "Set DEEPSEEK_V3_HF_MODEL to a directory containing DeepSeek-V3 safetensors, or pass --model-path."
             )
         if any(name.endswith("_scale_inv") for name in model_state):
-            raise RuntimeError(
-                "Detected quantized HF tensors (*_scale_inv) in model weights. "
-                "DeepSeek-V3 TT conversion now only supports already-dequantized bf16 checkpoints. "
-                f"{DEQUANTIZED_CHECKPOINT_ERROR_GUIDANCE}"
-            )
+            # Auto-dequantize FP8 weights instead of raising error
+            logger.info("Detected FP8 quantized weights (*_scale_inv). Auto-dequantizing to BF16...")
+            dequant_keys = [k for k in model_state if not k.endswith("_scale_inv")]
+            for key in dequant_keys:
+                scale_key = f"{key}_scale_inv"
+                if scale_key in model_state:
+                    w = model_state[key]
+                    if hasattr(w, 'dtype') and str(w.dtype) == 'torch.float8_e4m3fn':
+                        import torch
+                        scale = model_state[scale_key]
+                        block_shape = _get_weight_block_shape_from_quant_config(
+                            getattr(hf_config, 'quantization_config', None) or {}
+                        )
+                        model_state[key] = dequantize_weight_tensor(w, scale, block_shape=block_shape)
+                        del model_state[scale_key]
+            # Remove remaining scale tensors
+            for key in list(model_state.keys()):
+                if key.endswith("_scale_inv"):
+                    del model_state[key]
+            logger.info("FP8 dequantization complete.")
 
     return model_state
