@@ -218,7 +218,7 @@ def mesh_row(mesh_device):
     and returns the first row. Otherwise, returns the original mesh_device.
     """
     if ttnn.get_num_devices() >= 32:
-        rows = mesh_device.create_submeshes(ttnn.MeshShape(1, 8))
+        rows = mesh_device.create_submeshes(ttnn.MeshShape(1, 4))
         yield rows[0]
     else:
         yield mesh_device

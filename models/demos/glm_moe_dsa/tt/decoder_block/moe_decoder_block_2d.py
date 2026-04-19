@@ -196,7 +196,7 @@ class MoEDecoderBlock2D(DecoderBlock2DBase):
         if x_dim == hidden_size // tp_size:
             # Single reduce_scatter on combined output using MoE's config for consistency
 
-            if cfg["moe"]["fabric_config"] == ttnn.FabricConfig.FABRIC_1D_RING and tp_size == 8:
+            if cfg["moe"]["fabric_config"] == ttnn.FabricConfig.FABRIC_1D_RING and tp_size in (4, 8):
                 summed_experts = ttnn.experimental.deepseek_moe_fast_reduce_nc(
                     combined_out,
                     dim=0,

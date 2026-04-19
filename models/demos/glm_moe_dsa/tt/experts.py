@@ -93,7 +93,7 @@ class Experts(AbstractModule):
         Returns:
             True if the device is supported, False otherwise.
         """
-        return mesh_device.shape[1] == 8
+        return mesh_device.shape[1] in (4, 8)
 
     @classmethod
     @classmethod

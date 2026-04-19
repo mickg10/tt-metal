@@ -586,7 +586,7 @@ class MoE(SharedStateAddOn, AbstractModule):
             ccl = cfg["ccl"]
             tp_size = cfg["mesh_device"].shape[1]
 
-            if cfg["fabric_config"] == ttnn.FabricConfig.FABRIC_1D_RING and tp_size == 8:
+            if cfg["fabric_config"] == ttnn.FabricConfig.FABRIC_1D_RING and tp_size in (4, 8):
                 output = ttnn.experimental.deepseek_moe_fast_reduce_nc(
                     output,
                     dim=0,
