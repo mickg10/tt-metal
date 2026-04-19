@@ -656,7 +656,7 @@ class MLA1D(AbstractModule):
         qkv_a_n = q_lora_rank + kv_lora_rank + qk_rope_head_dim  # 2112
         qkv_a_n_padded = pad_n_to_dram_banks(qkv_a_n, tile_size=32, num_dram_banks=num_dram_banks)  # 2304
         qkv_a_in0_core_grid = ttnn.CoreGrid(y=1, x=6)  # 6 cores for qkv_a
-        qkv_a_out_core_grid = ttnn.CoreGrid(y=7, x=1)
+        qkv_a_out_core_grid = ttnn.CoreGrid(y=8, x=1)
 
         # Program config for qkv_a
         qkv_a_num_in0_cores = qkv_a_in0_core_grid.x * qkv_a_in0_core_grid.y
@@ -698,7 +698,7 @@ class MLA1D(AbstractModule):
             wq_b_n, tile_size=32, num_dram_banks=num_dram_banks
         )  # 3072 (already aligned)
         wq_b_in0_core_grid = ttnn.CoreGrid(y=8, x=2)
-        wq_b_out_core_grid = ttnn.CoreGrid(y=6, x=2)
+        wq_b_out_core_grid = ttnn.CoreGrid(y=8, x=2)
 
         # Program config for wq_b
         wq_b_num_in0_cores = wq_b_in0_core_grid.x * wq_b_in0_core_grid.y
