@@ -735,25 +735,6 @@ class MLA1D(AbstractModule):
         wkv_b2_in0_memory_config = ttnn.L1_MEMORY_CONFIG
         wkv_b2_output_tile = ttnn.Tile((32, 32))
 
-        wkv_b2_output_tile = ttnn.Tile((wkv_b2_tile_h, tile_size))
-
-        wkv_b2_in0_shard_grid = ttnn.CoreRangeSet(
-            [ttnn.CoreRange(ttnn.CoreCoord(c.x, c.y), ttnn.CoreCoord(c.x, c.y)) for c in optimal_worker_cores]
-        )
-        wkv_b2_in0_shard_shape = [wkv_b2_batches_per_core * wkv_b2_m, wkv_b2_k]
-        wkv_b2_in0_memory_config = ttnn.MemoryConfig(
-            ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1,
-            ttnn.ShardSpec(wkv_b2_in0_shard_grid, wkv_b2_in0_shard_shape, ttnn.ShardOrientation.ROW_MAJOR)
-        )
-
-        wkv_b2_config = LinearConfig(
-            input_tensor_b=FromWeightConfig(mesh_device),
-            memory_config=wkv_b2_out_memory_config,
-            compute_kernel_config=compute_kernel_config,
-            program_config=wkv_b2_program_config,
-            output_tile=wkv_b2_output_tile,
-        )
-
         # =====================================================================
         # wo: m=32, k=16384, n=896 (pads to 1152)
         # in0_core_grid=(8,2), out_core_grid=(6,2), WIDTH sharding
