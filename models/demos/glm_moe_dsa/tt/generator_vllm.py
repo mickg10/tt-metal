@@ -63,6 +63,7 @@ class DeepseekV3ForCausalLM(DeepseekGenerator):
             )
         tokenizer = load_tokenizer(model_path)
 
+        enable_mtp = int(os.environ.get("DEEPSEEK_V3_MTP", "0")) > 0
         model = cls(
             hf_config=hf_config,
             mesh_device=mesh_device,
@@ -70,6 +71,7 @@ class DeepseekV3ForCausalLM(DeepseekGenerator):
             cache_dir=Path(cache_dir),
             tokenizer=tokenizer,
             max_seq_len=max_seq_len,
+            enable_mtp=enable_mtp,
         )
 
         return model
