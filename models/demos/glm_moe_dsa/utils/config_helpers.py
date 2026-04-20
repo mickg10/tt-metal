@@ -317,7 +317,7 @@ def matmul_1d_config_from_tensor_shapes(
 
 
 def get_dram_weight_grid(mesh_device):
-    """Create DRAM weight grid from mesh device."""
+    """Create DRAM weight grid from mesh device using DRAM bank coordinates."""
     dram_grid_size = mesh_device.dram_grid_size()
     return ttnn.CoreRangeSet(
         {

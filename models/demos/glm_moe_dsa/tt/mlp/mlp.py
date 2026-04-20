@@ -50,7 +50,7 @@ class MLP(AbstractModule):
     """
 
     WEIGHT_TORCH_DTYPE = torch.bfloat16
-    WEIGHT_DTYPE = ttnn.bfloat8_b
+    WEIGHT_DTYPE = ttnn.bfloat8_b  # BF8 for shared MLP (BF4 too lossy for quality)
 
     @dataclass
     class ProgramConfigData(OpConfigBase):
@@ -166,10 +166,14 @@ class MLP(AbstractModule):
             ModelPrefillConfig containing operator configurations for prefill mode
         """
         grid_size = mesh_device.compute_with_storage_grid_size()
+        num_dram_banks = mesh_device.dram_grid_size().x
+        # Cap grid_x at num_dram_banks for DRAM-sharded weight matmuls
+        # BH has 8 DRAM banks but 13 compute columns — using more cores than banks
+        # causes the MatmulMultiCoreReuseMultiCastProgramConfig to read garbage DRAM
         matmul_core_grid_size = ttnn.CoreCoord(
-            grid_size.x,
+            min(grid_size.x, num_dram_banks),
             grid_size.y,
-        )  # NOTE: we might modify this later during optimization stage
+        )
 
         # Calculate device metrics
         _, mesh_width = mesh_device.shape

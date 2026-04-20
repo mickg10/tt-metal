@@ -100,6 +100,16 @@ class DecoderBlock2DBase(DecoderBlockBase):
         mla_out = MLA2D.forward_prefill(mla_norm_out, user_id, cfg["mla"], rope_tensors, page_table)
         ttnn.deallocate(mla_norm_out)
 
+        import os
+        if os.environ.get("GLM5_DEBUG") and not getattr(cls, "_pf_block_debug", False):
+            try:
+                m_cpu = ttnn.to_torch(mla_out, mesh_composer=ttnn.ConcatMeshToTensor(mla_out.device(), dim=0))
+                print(f"[GLM5_DEBUG] PF block MLA out: shape={m_cpu.shape} "
+                      f"min={m_cpu.float().min():.4f} max={m_cpu.float().max():.4f} "
+                      f"inf={m_cpu.isinf().any()}", flush=True)
+            except Exception as e:
+                print(f"[GLM5_DEBUG] PF block MLA out: FAILED {e}", flush=True)
+
         # MLA Residual
         x += mla_out
         ttnn.deallocate(mla_out)
@@ -110,6 +120,16 @@ class DecoderBlock2DBase(DecoderBlockBase):
         # MLP
         mlp_out = cls.forward_mlp_prefill(mlp_norm_out, cfg["mlp"])
         ttnn.deallocate(mlp_norm_out)
+
+        if os.environ.get("GLM5_DEBUG") and not getattr(cls, "_pf_block_debug", False):
+            try:
+                m_cpu = ttnn.to_torch(mlp_out, mesh_composer=ttnn.ConcatMeshToTensor(mlp_out.device(), dim=0))
+                print(f"[GLM5_DEBUG] PF block MLP out: shape={m_cpu.shape} "
+                      f"min={m_cpu.float().min():.4f} max={m_cpu.float().max():.4f} "
+                      f"inf={m_cpu.isinf().any()}", flush=True)
+            except Exception as e:
+                print(f"[GLM5_DEBUG] PF block MLP out: FAILED {e}", flush=True)
+            cls._pf_block_debug = True
 
         # MLP Residual
         x += mlp_out

@@ -310,6 +310,18 @@ class RowBatchedModel(SharedStateAddOn, AbstractModule):
 
         x = Embedding2D.forward_decode(x, cfg["embedding"])
 
+        # Debug: dump tensor stats after embedding (first call only)
+        import os
+        if os.environ.get("GLM5_DEBUG") and not getattr(cls, "_debug_done", False):
+            try:
+                x_cpu = ttnn.to_torch(x, mesh_composer=ttnn.ConcatMeshToTensor(x.device(), dim=0))
+                import torch
+                print(f"[GLM5_DEBUG] After embedding: shape={x_cpu.shape} dtype={x_cpu.dtype} "
+                      f"min={x_cpu.float().min():.4f} max={x_cpu.float().max():.4f} "
+                      f"mean={x_cpu.float().mean():.4f} nan={x_cpu.isnan().any()} inf={x_cpu.isinf().any()}", flush=True)
+            except Exception as e:
+                print(f"[GLM5_DEBUG] After embedding: FAILED {e}", flush=True)
+
         if profile_decode:
             # Profile mode: run only first dense layer + first MoE layer
             # First dense layer (MLP)
@@ -330,6 +342,7 @@ class RowBatchedModel(SharedStateAddOn, AbstractModule):
 
         else:
             # Normal mode: run all layers
+            layer_idx = 0
             for (block_cfg, BlockClass), page_table in zip(
                 itertools.chain(
                     zip(cfg["mlp_decoder_block"], itertools.repeat(DecoderBlock2D)),
@@ -340,11 +353,35 @@ class RowBatchedModel(SharedStateAddOn, AbstractModule):
             ):
                 x = BlockClass.forward_decode(x, position_idxs, block_cfg, rope_tensors, page_table)
 
+                # Debug: dump stats after first few layers
+                if os.environ.get("GLM5_DEBUG") and not getattr(cls, "_debug_done", False) and layer_idx in (0, 3, 10, 30, 50, 70, 77):
+                    try:
+                        x_cpu = ttnn.to_torch(x, mesh_composer=ttnn.ConcatMeshToTensor(x.device(), dim=0))
+                        import torch
+                        print(f"[GLM5_DEBUG] After layer {layer_idx} ({BlockClass.__name__}): "
+                              f"shape={x_cpu.shape} min={x_cpu.float().min():.4f} max={x_cpu.float().max():.4f} "
+                              f"mean={x_cpu.float().mean():.6f} nan={x_cpu.isnan().any()} inf={x_cpu.isinf().any()}", flush=True)
+                    except Exception as e:
+                        print(f"[GLM5_DEBUG] After layer {layer_idx}: FAILED {e}", flush=True)
+                layer_idx += 1
+
+            if os.environ.get("GLM5_DEBUG") and not getattr(cls, "_debug_done", False):
+                cls._debug_done = True
+
         # Capture pre-norm hidden states for MTP; MTP applies its own hnorm.
         hidden_for_mtp = x if return_hidden else None
 
         x = ttnn.to_memory_config(x, **cfg["norm_reshard"])
         x = DistributedRMSNorm.forward_decode(x, cfg["norm"])
+
+        if os.environ.get("GLM5_DEBUG") and not getattr(cls, "_debug_done2", False):
+            try:
+                x_cpu = ttnn.to_torch(x, mesh_composer=ttnn.ConcatMeshToTensor(x.device(), dim=0))
+                print(f"[GLM5_DEBUG] After final norm: shape={x_cpu.shape} "
+                      f"min={x_cpu.float().min():.4f} max={x_cpu.float().max():.4f} "
+                      f"mean={x_cpu.float().mean():.6f}", flush=True)
+            except Exception as e:
+                print(f"[GLM5_DEBUG] After final norm: FAILED {e}", flush=True)
 
         ccl = cfg["lm_head"]["ccl"]
 
@@ -356,6 +393,21 @@ class RowBatchedModel(SharedStateAddOn, AbstractModule):
             return logits, hidden_for_mtp
 
         logits = LMHead1D.forward_decode(x, cfg["lm_head"])
+
+        if os.environ.get("GLM5_DEBUG") and not getattr(cls, "_debug_done2", False):
+            try:
+                l_cpu = ttnn.to_torch(logits, mesh_composer=ttnn.ConcatMeshToTensor(logits.device(), dim=0))
+                print(f"[GLM5_DEBUG] Logits: shape={l_cpu.shape} "
+                      f"min={l_cpu.float().min():.4f} max={l_cpu.float().max():.4f} "
+                      f"mean={l_cpu.float().mean():.6f}", flush=True)
+                # Top-5 token IDs
+                import torch
+                top5 = torch.topk(l_cpu[0, 0, 0, :].float(), 5)
+                print(f"[GLM5_DEBUG] Top-5 tokens: ids={top5.indices.tolist()} vals={top5.values.tolist()}", flush=True)
+                cls._debug_done2 = True
+            except Exception as e:
+                print(f"[GLM5_DEBUG] Logits: FAILED {e}", flush=True)
+
         return logits
 
     @classmethod
@@ -372,6 +424,19 @@ class RowBatchedModel(SharedStateAddOn, AbstractModule):
 
         x = Embedding2D.forward_prefill(x, cfg["embedding"])
 
+        import os
+        _pf_debug = os.environ.get("GLM5_DEBUG") and not getattr(cls, "_pf_layer_debug_done", False)
+
+        if _pf_debug:
+            try:
+                x_cpu = ttnn.to_torch(x, mesh_composer=ttnn.ConcatMeshToTensor(x.device(), dim=0))
+                print(f"[GLM5_DEBUG] PREFILL after embedding: shape={x_cpu.shape} "
+                      f"min={x_cpu.float().min():.4f} max={x_cpu.float().max():.4f} "
+                      f"nan={x_cpu.isnan().any()} inf={x_cpu.isinf().any()}", flush=True)
+            except Exception as e:
+                print(f"[GLM5_DEBUG] PREFILL after embedding: FAILED {e}", flush=True)
+
+        pf_layer_idx = 0
         for (block_cfg, BlockClass), page_table in zip(
             itertools.chain(
                 zip(cfg["mlp_decoder_block"], itertools.repeat(DecoderBlock2D)),
@@ -381,6 +446,19 @@ class RowBatchedModel(SharedStateAddOn, AbstractModule):
             strict=True,
         ):
             x = BlockClass.forward_prefill(x, user_id, block_cfg, rope_tensors, page_table)
+
+            if _pf_debug and pf_layer_idx in (0, 1, 2, 3, 5, 10, 20, 40, 60, 77):
+                try:
+                    x_cpu = ttnn.to_torch(x, mesh_composer=ttnn.ConcatMeshToTensor(x.device(), dim=0))
+                    print(f"[GLM5_DEBUG] PREFILL layer {pf_layer_idx}: shape={x_cpu.shape} "
+                          f"min={x_cpu.float().min():.4f} max={x_cpu.float().max():.4f} "
+                          f"absmax={x_cpu.float().abs().max():.4f}", flush=True)
+                except Exception as e:
+                    print(f"[GLM5_DEBUG] PREFILL layer {pf_layer_idx}: FAILED {e}", flush=True)
+            pf_layer_idx += 1
+
+        if _pf_debug:
+            cls._pf_layer_debug_done = True
 
         # Capture pre-norm hidden states for MTP; MTP applies its own hnorm.
         hidden_for_mtp = x if return_hidden else None
@@ -397,6 +475,26 @@ class RowBatchedModel(SharedStateAddOn, AbstractModule):
             return logits, hidden_for_mtp
 
         logits = LMHead1D.forward_prefill(x, cfg["lm_head"])
+
+        import os
+        if os.environ.get("GLM5_DEBUG") and not getattr(cls, "_prefill_debug_done", False):
+            try:
+                l_cpu = ttnn.to_torch(logits, mesh_composer=ttnn.ConcatMeshToTensor(logits.device(), dim=0))
+                import torch
+                # Get logits for last token of first device
+                last_tok_logits = l_cpu[0, 0, -1, :].float()
+                top5 = torch.topk(last_tok_logits, 5)
+                from transformers import AutoTokenizer
+                tok = AutoTokenizer.from_pretrained('/home/mick/models/GLM-5.1', trust_remote_code=True)
+                top_tokens = [tok.decode([tid]) for tid in top5.indices.tolist()]
+                print(f"[GLM5_DEBUG] PREFILL logits: shape={l_cpu.shape} "
+                      f"min={l_cpu.float().min():.4f} max={l_cpu.float().max():.4f}", flush=True)
+                print(f"[GLM5_DEBUG] PREFILL top-5 last token: ids={top5.indices.tolist()} "
+                      f"vals={[f'{v:.2f}' for v in top5.values.tolist()]} tokens={top_tokens}", flush=True)
+                cls._prefill_debug_done = True
+            except Exception as e:
+                print(f"[GLM5_DEBUG] PREFILL logits: FAILED {e}", flush=True)
+
         return logits
 
     @classmethod

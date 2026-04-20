@@ -2735,6 +2735,9 @@ class DeepseekGenerator(WarmupForwardMixin):
         self.enable_trace = enable_trace
 
         if not enable_trace:
+            if not getattr(self, '_eager_warned', False):
+                logger.warning("decode_forward: EAGER mode (enable_trace=False)")
+                self._eager_warned = True
             return self._decode_step(tokens, start_pos, page_table, sample_on_device)
         else:
             # Capture trace and return trace output
@@ -2834,8 +2837,39 @@ class DeepseekGenerator(WarmupForwardMixin):
             return logits.squeeze(0).squeeze(0)
 
     def warmup_model_prefill(self, kv_cache, enable_trace, can_sample_on_device, non_greedy_decoding_on_device) -> None:
-        logger.warning("Warmup model prefill not implemented for DeepseekGenerator")
-        logger.warning("Tracing in prefill mode is not supported for DeepseekGenerator")
+        """Run a single prefill pass with dummy tokens to pre-compile all kernels.
+
+        This MUST run before trace capture to ensure prefill doesn't allocate new
+        DRAM buffers that could corrupt active trace addresses.
+        """
+        if enable_trace:
+            logger.warning("Tracing in prefill mode is not supported for DeepseekGenerator")
+            return
+
+        import torch
+        # Create dummy prefill inputs: 1 user, short sequence
+        dummy_seq_len = 8
+        dummy_tokens = torch.randint(0, 1000, (1, dummy_seq_len), dtype=torch.long)
+        dummy_prompt_lens = torch.tensor([dummy_seq_len], dtype=torch.long)
+        dummy_start_pos = torch.zeros(1, dtype=torch.long)
+        # Create a simple page table (1 user, enough blocks for the dummy sequence)
+        num_blocks = 2
+        dummy_page_table = torch.arange(num_blocks, dtype=torch.int32).unsqueeze(0)
+
+        logger.info(f"Starting prefill warmup (seq_len={dummy_seq_len}) to pre-allocate buffers...")
+        try:
+            self.prefill_forward(
+                tokens=dummy_tokens,
+                prompt_lens=dummy_prompt_lens,
+                start_pos=dummy_start_pos,
+                page_table=dummy_page_table,
+                kv_cache=kv_cache,
+                enable_trace=False,
+            )
+            logger.info("Prefill warmup completed — buffers pre-allocated")
+        except Exception as e:
+            logger.warning(f"Prefill warmup failed (non-fatal): {e}")
+            logger.warning("First real prefill request will trigger compilation")
 
     def get_kv_cache(self):
         assert self.model_state is not None, "Model state is not initialized"
