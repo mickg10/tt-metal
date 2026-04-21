@@ -388,8 +388,9 @@ class RowBatchedModel(SharedStateAddOn, AbstractModule):
         x = ttnn.experimental.all_gather_async(x, **ccl.populate_all_gather_runtime_args(cfg["lm_head"]["all_gather"]))
         if return_hidden:
             lm_head_in = ttnn.clone(x)
-            ttnn.deallocate(x)
+            # Do NOT deallocate x — hidden_for_mtp references it and will be used by MTP predict
             logits = LMHead1D.forward_decode(lm_head_in, cfg["lm_head"])
+            ttnn.deallocate(lm_head_in)
             return logits, hidden_for_mtp
 
         logits = LMHead1D.forward_decode(x, cfg["lm_head"])
@@ -470,8 +471,9 @@ class RowBatchedModel(SharedStateAddOn, AbstractModule):
         x = ttnn.experimental.all_gather_async(x, **ccl.populate_all_gather_runtime_args(cfg["lm_head"]["all_gather"]))
         if return_hidden:
             lm_head_in = ttnn.clone(x)
-            ttnn.deallocate(x)
+            # Do NOT deallocate x — hidden_for_mtp references it for MTP predict
             logits = LMHead1D.forward_prefill(lm_head_in, cfg["lm_head"])
+            ttnn.deallocate(lm_head_in)
             return logits, hidden_for_mtp
 
         logits = LMHead1D.forward_prefill(x, cfg["lm_head"])
