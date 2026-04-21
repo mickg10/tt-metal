@@ -268,6 +268,7 @@ class DeepseekGenerator(WarmupForwardMixin):
         self._trace_positions: ttnn.Tensor | None = None
         self._trace_rot_idxs: ttnn.Tensor | None = None
         self._trace_output: ttnn.Tensor | None = None
+        self._trace_hidden_output: ttnn.Tensor | None = None
         self._trace_page_tables_to_use: tuple[ttnn.Tensor, ...] | None = None
         self._mtp_verify_trace_id: int | None = None
         self._mtp_verify_trace_tokens: ttnn.Tensor | None = None
@@ -2705,6 +2706,8 @@ class DeepseekGenerator(WarmupForwardMixin):
 
         # Only capture the rot_mats generation from rot_idxs (all ttnn ops, no from_torch)
         rope_tensors = self.rope_setup.get_rot_mats_from_rot_idxs(self._trace_rot_idxs)
+        # NOTE: return_hidden=True causes "Writes not supported during trace capture"
+        # MTP predict must happen OUTSIDE the trace path
         self._trace_output = RowBatchedModel.forward_decode(
             x=self._trace_tokens,
             position_idxs=self._trace_positions,
@@ -2713,6 +2716,7 @@ class DeepseekGenerator(WarmupForwardMixin):
             page_tables=self._trace_page_tables_to_use,
             profile_decode=self.profile_decode,
         )
+        self._trace_hidden_output = None
         ttnn.end_trace_capture(self.mesh_device, trace_id, cq_id=0)
         if self.signpost:
             signpost(header="decode_trace_capture")

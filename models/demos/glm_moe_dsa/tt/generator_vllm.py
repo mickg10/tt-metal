@@ -205,14 +205,8 @@ class DeepseekV3ForCausalLM(DeepseekGenerator):
             sample_on_device=sample_on_device,
         )
 
-        # Harvest MTP draft tokens for speculative decode (if model produces them)
-        if not hasattr(self, '_last_draft_token_ids'):
-            self._last_draft_token_ids = None
-        # The generator stores MTP predictions internally; expose them for vLLM model runner
-        # Check if the generator has produced MTP speculative tokens
-        if hasattr(self, 'mtp_spec_tokens') and self.mtp_spec_tokens is not None:
-            self._last_draft_token_ids = self.mtp_spec_tokens
-            self.mtp_spec_tokens = None
+        # MTP draft tokens are now set by the base generator's decode_forward
+        # via _mtp_predict_logits after trace execution (see generator.py)
 
         if sample_on_device:
             decode_output = self._sample_tokens_device(decode_step_output, enable_trace=enable_trace)
