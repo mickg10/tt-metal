@@ -47,7 +47,10 @@ def convert_expert_weights_sparse(
     """Convert expert weights to WIDTH_SHARDED format for DRAMStreamingExpertsMatmul.
 
     Each expert's weights are uploaded as a separate WIDTH_SHARDED tensor in DRAM.
-    Sequential allocation ensures contiguous placement for indexed access.
+    Sequential allocation ensures contiguous placement — the kernel uses
+    base_addr + expert_idx * expert_size_bytes to access different experts.
+
+    Tile layout within each bank shard is column-major (K tiles contiguous per N column).
 
     Args:
         expert_weights_torch: [1, num_experts_total, K, N] tensor (already transposed)
@@ -58,7 +61,8 @@ def convert_expert_weights_sparse(
         tag: Identifier for cache file naming
 
     Returns:
-        List of ttnn tensors (one per local expert), first tensor is used as base for kernel
+        List of ttnn tensors (one per local expert). First tensor is used as input_b
+        for DRAMStreamingExpertsMatmul (base address for indexed access).
     """
     num_devices = mesh_device.get_num_devices()
     total_experts = expert_weights_torch.shape[1]
@@ -89,17 +93,17 @@ def convert_expert_weights_sparse(
         shard_spec,
     )
 
-    # Shard experts across devices: device D gets experts [D*E, (D+1)*E)
-    # For each device, upload experts sequentially to ensure contiguous DRAM allocation
+    # Upload each expert sequentially to ensure contiguous DRAM allocation.
+    # CRITICAL: no other DRAM allocations should happen between expert uploads
+    # on the same device, or the contiguity assumption breaks.
     expert_tensors = []
 
     for expert_local_idx in range(num_experts_per_device):
-        # Collect this local expert's weights across all devices
-        # Device D gets global expert D * num_experts_per_device + expert_local_idx
+        # Build per-device weights for this local expert
         per_device_weights = []
         for device_id in range(num_devices):
             global_expert_id = device_id * num_experts_per_device + expert_local_idx
-            w = expert_weights_torch[0, global_expert_id]  # [K, N]
+            w = expert_weights_torch[0, global_expert_id].clone()  # [K, N]
 
             # Pad N if needed
             if N_padded != N:
@@ -110,11 +114,9 @@ def convert_expert_weights_sparse(
             w_shuffled = w_shuffled.reshape(1, 1, K, N_padded)
             per_device_weights.append(w_shuffled)
 
-        # Stack for mesh mapper: [num_devices, 1, K, N_padded] -> shard across devices
-        # Use ShardTensorToMesh to place each device's expert on that device
-        stacked = torch.cat(per_device_weights, dim=0)  # [num_devices, 1, K, N_padded]
+        # Stack for mesh mapper: [num_devices, 1, K, N_padded]
+        stacked = torch.cat(per_device_weights, dim=0)
 
-        # Check cache
         cache_file = None
         if cache_path is not None:
             cache_file = str(cache_path / f"{tag}_expert_{expert_local_idx}_sparse_ws")
