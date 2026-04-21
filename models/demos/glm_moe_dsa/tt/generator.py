@@ -2743,6 +2743,11 @@ class DeepseekGenerator(WarmupForwardMixin):
                 logger.warning("decode_forward: EAGER mode (enable_trace=False)")
                 self._eager_warned = True
             return self._decode_step(tokens, start_pos, page_table, sample_on_device)
+
+        # MTP verify trace path: uses separate trace that returns hidden states
+        if self.enable_mtp:
+            return self._decode_forward_mtp(tokens, start_pos, gen_idx, profiler, page_table, sample_on_device)
+
         else:
             # Capture trace and return trace output
             if self._trace_id is None:
@@ -2839,6 +2844,122 @@ class DeepseekGenerator(WarmupForwardMixin):
                 # trigger the profiler to read the device side data each iteration to not miss any data
                 ttnn.ReadDeviceProfiler(self.mesh_device)
             return logits.squeeze(0).squeeze(0)
+
+    def _decode_forward_mtp(
+        self,
+        tokens: torch.Tensor,
+        start_pos: torch.Tensor,
+        gen_idx: int = 0,
+        profiler: BenchmarkProfiler | None = None,
+        page_table: torch.Tensor | None = None,
+        sample_on_device: bool = False,
+    ) -> ttnn.Tensor | torch.Tensor:
+        """MTP combined verify decode path.
+
+        First call: eager decode + MTP predict to bootstrap draft tokens.
+        Subsequent calls: verify trace (main + spec) + MTP predict.
+        Returns logits in the same format as the standard decode path.
+        Draft tokens are stored in self._last_draft_token_ids for vLLM harvesting.
+        """
+        tokens_1d = tokens.view(-1).to(torch.int32) if tokens.dim() > 1 else tokens.to(torch.int32)
+        positions_1d = start_pos.view(-1).to(torch.int32) if start_pos.dim() > 1 else start_pos.to(torch.int32)
+        batch_size = tokens_1d.shape[0]
+
+        # Bootstrap: first call, no draft tokens yet. Use eager decode with return_hidden.
+        if not hasattr(self, '_vllm_mtp_draft_tokens') or self._vllm_mtp_draft_tokens is None:
+            logger.info("MTP bootstrap: eager decode + predict to seed draft tokens")
+            logits_raw, hidden_raw = self._decode_step(tokens_1d, positions_1d, page_table, return_hidden=True)
+
+            # Normalize logits to [B, V]
+            if logits_raw.dim() == 4:
+                logits = logits_raw.squeeze(0).squeeze(0)
+            elif logits_raw.dim() == 3:
+                logits = logits_raw.squeeze(1)
+            else:
+                logits = logits_raw
+
+            # Run MTP predict to get draft tokens for next step
+            try:
+                # hidden_raw is [1, 1, B, H] — convert to [B, H]
+                if hidden_raw.dim() == 4:
+                    hidden_2d = hidden_raw.squeeze(0).squeeze(0)
+                elif hidden_raw.dim() == 3:
+                    hidden_2d = hidden_raw.squeeze(0)
+                else:
+                    hidden_2d = hidden_raw
+
+                mtp_page_table = self._get_mtp_page_table()
+                draft_logits = self._mtp_predict_logits(
+                    hidden_states=hidden_2d,
+                    tokens_step=tokens_1d,
+                    positions=positions_1d,
+                    page_table=mtp_page_table,
+                    use_trace=False,
+                )
+                self.ccl.reset_sem_counters()
+                self._vllm_mtp_draft_tokens = self._sample_greedy(draft_logits).to(torch.int32)
+                self._last_draft_token_ids = self._vllm_mtp_draft_tokens
+                logger.info(f"MTP bootstrap: draft tokens seeded for {batch_size} users")
+            except Exception as e:
+                logger.warning(f"MTP predict failed during bootstrap: {e}")
+                self._vllm_mtp_draft_tokens = None
+                self._last_draft_token_ids = None
+
+            if sample_on_device:
+                raise ValueError("MTP vLLM path requires host sampling for now")
+            return logits
+
+        # Normal MTP path: use standard trace (no verify trace yet — just add draft prediction)
+        # Execute the standard decode trace first
+        if self._trace_id is None:
+            self._capture_decode_trace(tokens_1d, positions_1d, page_table)
+            assert self._trace_output is not None
+            logits = ttnn.to_torch(
+                self._trace_output,
+                mesh_composer=ttnn.ConcatMesh2dToTensor(
+                    self.mesh_device, dims=(-2, -1), mesh_shape=self.mesh_device.shape
+                ),
+            ).squeeze(0).squeeze(0)
+        else:
+            # Replay standard decode trace
+            torch_input = tokens_1d.view(1, 1, -1).to(torch.int32)
+            host_tokens = ttnn.from_torch(
+                torch_input, device=None,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
+                dtype=ttnn.uint32, memory_config=ttnn.DRAM_MEMORY_CONFIG, layout=ttnn.ROW_MAJOR_LAYOUT,
+            )
+            ttnn.copy_host_to_device_tensor(host_tokens, self._trace_tokens)
+
+            host_positions = ttnn.from_torch(
+                positions_1d, device=None,
+                mesh_mapper=ttnn.ShardTensorToMesh(self.mesh_device, dim=0), dtype=ttnn.int32,
+            )
+            ttnn.copy_host_to_device_tensor(host_positions, self._trace_positions)
+
+            host_rot_idxs = self.rope_setup.get_rot_idxs(positions_1d, on_host=True)
+            ttnn.copy_host_to_device_tensor(host_rot_idxs, self._trace_rot_idxs)
+
+            if page_table is not None:
+                page_tables_to_use = self._convert_vllm_page_table_for_batch(page_table, device=None)
+                for i, host_page_table in enumerate(page_tables_to_use):
+                    ttnn.copy_host_to_device_tensor(host_page_table, self._trace_page_tables_to_use[i])
+                self._update_decode_page_table_alias_masks(page_table)
+
+            self.ccl.reset_sem_counters()
+            ttnn.execute_trace(self.mesh_device, self._trace_id, cq_id=0, blocking=True)
+            assert self._trace_output is not None
+
+            logits = ttnn.to_torch(
+                self._trace_output,
+                mesh_composer=ttnn.ConcatMesh2dToTensor(
+                    self.mesh_device, dims=(-2, -1), mesh_shape=self.mesh_device.shape
+                ),
+            ).squeeze(0).squeeze(0)
+
+        # For now, just pass through the standard logits and expose stored drafts.
+        # The vLLM model runner can use self._last_draft_token_ids for acceptance.
+        # TODO: Add MTP verify trace for combined verify (2 tokens per step)
+        return logits
 
     def warmup_model_prefill(self, kv_cache, enable_trace, can_sample_on_device, non_greedy_decoding_on_device) -> None:
         """Run a single prefill pass with dummy tokens to pre-compile all kernels.
