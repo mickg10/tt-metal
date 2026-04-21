@@ -473,7 +473,9 @@ class MoE(SharedStateAddOn, AbstractModule):
             )
 
             sparse_mode = cfg["moe_experts"].get("sparse_mode", False)
-            if sparse_mode and cfg["moe_experts"].get("w1_experts", {}).get("sparse_tensors") is not None:
+            # Sparse forward disabled — weight conversion happens but forward uses dense path
+            # TODO: Enable once sparse_expert_forward is trace-compatible
+            if False and sparse_mode and cfg["moe_experts"].get("w1_experts", {}).get("sparse_tensors") is not None:
                 # ===== SPARSE PATH: DRAMStreamingExpertsMatmul =====
                 # No repeat — dispatch output goes directly to sparse kernel
                 dispatch_chunk_tile = ttnn.to_layout(dispatch_chunk, ttnn.TILE_LAYOUT)
