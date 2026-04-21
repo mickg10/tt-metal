@@ -19,9 +19,14 @@ from models.demos.glm_moe_dsa.micro_ops.dram_streaming_experts_matmul.op import 
 
 
 def test_sparse_matmul(device, M, K, N, num_experts, selected_expert, dtype_b=ttnn.bfloat16, fused_silu=False):
-    """Test DRAMStreamingExpertsMatmul with given dimensions."""
+    """Test DRAMStreamingExpertsMatmul with given dimensions.
+
+    IMPORTANT: This kernel uses custom_mm_block which only supports
+    in0 tile shapes [1,32], [2,32], [4,32], or [8,32]. M must be <= 8.
+    """
+    assert M in (1, 2, 4, 8), f"M must be 1, 2, 4, or 8 for custom_mm_block (got {M})"
     num_banks = device.dram_grid_size().x
-    tile_size = 32
+    tile_size = 32  # in1 tile size is always 32x32
     N_padded = pad_n_to_dram_banks(N, tile_size, num_banks)
     per_core_N = N_padded // num_banks
 
@@ -36,7 +41,8 @@ def test_sparse_matmul(device, M, K, N, num_experts, selected_expert, dtype_b=tt
         [ttnn.CoreRange(ttnn.CoreCoord(c.x, c.y), ttnn.CoreCoord(c.x, c.y)) for c in all_worker_cores]
     )
 
-    # ===== Input A: HEIGHT_SHARDED replicated =====
+    # ===== Input A: HEIGHT_SHARDED replicated (uses tiny tiles [M, 32]) =====
+    in0_tile = ttnn.Tile([M, 32])  # Tiny tile: M rows × 32 cols
     torch.manual_seed(42)
     torch_in0 = torch.randn(1, 1, M, K).bfloat16().float()
     in0_replicated = torch_in0.repeat(1, 1, num_cores, 1)  # [1, 1, M*cores, K]
@@ -44,7 +50,7 @@ def test_sparse_matmul(device, M, K, N, num_experts, selected_expert, dtype_b=tt
     in0_mem = ttnn.MemoryConfig(ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, in0_spec)
     in0_t = ttnn.from_torch(
         in0_replicated.bfloat16(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-        device=device, memory_config=in0_mem, tile=ttnn.Tile([32, 32]),
+        device=device, memory_config=in0_mem, tile=in0_tile,
         mesh_mapper=ttnn.ReplicateTensorToMesh(device),
     )
 
@@ -93,21 +99,24 @@ def test_sparse_matmul(device, M, K, N, num_experts, selected_expert, dtype_b=tt
         mesh_mapper=ttnn.ReplicateTensorToMesh(device),
     )
 
-    # ===== Output tensor =====
+    # ===== Output tensor (uses same tiny tile as in0) =====
+    out_tile = ttnn.Tile([M, 32])
     out_spec = ttnn.ShardSpec(compute_core_grid, [M, per_core_N], ttnn.ShardOrientation.ROW_MAJOR)
     out_mem = ttnn.MemoryConfig(ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.L1, out_spec)
     out_t = ttnn.from_torch(
         torch.zeros(1, 1, M, N_padded).bfloat16(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-        device=device, memory_config=out_mem, tile=ttnn.Tile([32, 32]),
+        device=device, memory_config=out_mem, tile=out_tile,
         mesh_mapper=ttnn.ReplicateTensorToMesh(device),
     )
 
     # ===== Run kernel =====
     Kt = K // tile_size
+    # custom_mm_block requires subblock_k >= 2 and even
     subblock_k = Kt if Kt <= 8 else Kt // 2
-    # Make sure subblock_k divides Kt
-    while Kt % subblock_k != 0:
+    # Make sure subblock_k divides Kt and is even
+    while Kt % subblock_k != 0 or subblock_k % 2 != 0:
         subblock_k -= 1
+    assert subblock_k >= 2, f"subblock_k must be >= 2 (got {subblock_k} for Kt={Kt})"
 
     # Working buffer for CB1 (required by kernel for address wrapping)
     in1_tile_obj = ttnn.Tile([tile_size, tile_size])
@@ -234,32 +243,32 @@ def main():
     ttnn.deallocate(tt_c)
     all_pass &= pcc_0 > 0.99
 
-    # Test 1a: WITHOUT indexing (expert 0 only, no index tensor) to isolate tile shuffle
+    # Test 1: M=1 tiny tile, small dims, no indexing
     logger.info("=" * 60)
-    logger.info("Test 1a: Small dims NO INDEX (M=32, K=64, N=256, 1 expert)")
-    all_pass &= test_sparse_matmul(device, M=32, K=64, N=256, num_experts=1, selected_expert=0)
+    logger.info("Test 1: M=1 small (K=64, N=256, 1 expert)")
+    all_pass &= test_sparse_matmul(device, M=1, K=64, N=256, num_experts=1, selected_expert=0)
 
-    # Test 1b: With indexing, expert 0 (should match expert 0)
+    # Test 2: M=1, expert indexing
     logger.info("=" * 60)
-    logger.info("Test 1b: Small dims INDEX=0 (M=32, K=64, N=256, 4 experts)")
-    all_pass &= test_sparse_matmul(device, M=32, K=64, N=256, num_experts=4, selected_expert=0)
+    logger.info("Test 2: M=1 small INDEX=2 (K=64, N=256, 4 experts)")
+    all_pass &= test_sparse_matmul(device, M=1, K=64, N=256, num_experts=4, selected_expert=2)
 
-    # Test 2: Expert 2 selection
+    # Test 3: M=1, GLM-5.1 gate/up dims with BF4
     logger.info("=" * 60)
-    logger.info("Test 2: Small dims INDEX=2 (M=32, K=64, N=256, 4 experts)")
-    all_pass &= test_sparse_matmul(device, M=32, K=64, N=256, num_experts=4, selected_expert=2)
-
-    # Test 3: GLM-5.1 gate/up dimensions (K=6144, N=2048) - expert 0 no index
-    logger.info("=" * 60)
-    logger.info("Test 3: GLM-5.1 gate/up dims NO INDEX (M=32, K=6144, N=2048, 1 expert)")
-    all_pass &= test_sparse_matmul(device, M=32, K=6144, N=2048, num_experts=1, selected_expert=0,
+    logger.info("Test 3: M=1 GLM-5.1 gate/up (K=6144, N=2048, 8 experts, BF4)")
+    all_pass &= test_sparse_matmul(device, M=1, K=6144, N=2048, num_experts=8, selected_expert=5,
                                     dtype_b=ttnn.bfloat4_b)
 
-    # Test 4: GLM-5.1 down dimensions (K=2048, N=6144) - expert 0 no index
+    # Test 4: M=1, GLM-5.1 down dims with BF8
     logger.info("=" * 60)
-    logger.info("Test 4: GLM-5.1 down dims NO INDEX (M=32, K=2048, N=6144, 1 expert)")
-    all_pass &= test_sparse_matmul(device, M=32, K=2048, N=6144, num_experts=1, selected_expert=0,
+    logger.info("Test 4: M=1 GLM-5.1 down (K=2048, N=6144, 8 experts, BF8)")
+    all_pass &= test_sparse_matmul(device, M=1, K=2048, N=6144, num_experts=8, selected_expert=3,
                                     dtype_b=ttnn.bfloat8_b)
+
+    # Test 5: M=1, SiLU fused
+    logger.info("=" * 60)
+    logger.info("Test 5: M=1 small SiLU (K=64, N=256, 4 experts)")
+    all_pass &= test_sparse_matmul(device, M=1, K=64, N=256, num_experts=4, selected_expert=1, fused_silu=True)
 
     logger.info("=" * 60)
     if all_pass:
