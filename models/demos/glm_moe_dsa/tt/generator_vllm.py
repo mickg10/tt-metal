@@ -63,7 +63,14 @@ class DeepseekV3ForCausalLM(DeepseekGenerator):
             )
         tokenizer = load_tokenizer(model_path)
 
+        # Check env var first, then fall back to file-based flag
+        # The file check allows changing MTP without container recreation
         enable_mtp = int(os.environ.get("DEEPSEEK_V3_MTP", "0")) > 0
+        if not enable_mtp:
+            mtp_flag_path = Path("/tt-metal/models/demos/glm_moe_dsa/.enable_mtp")
+            if mtp_flag_path.exists():
+                enable_mtp = True
+                logger.info(f"MTP enabled via flag file: {mtp_flag_path}")
         model = cls(
             hf_config=hf_config,
             mesh_device=mesh_device,
