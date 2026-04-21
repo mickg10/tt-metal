@@ -2956,9 +2956,11 @@ class DeepseekGenerator(WarmupForwardMixin):
                 ),
             ).squeeze(0).squeeze(0)
 
-        # For now, just pass through the standard logits and expose stored drafts.
-        # The vLLM model runner can use self._last_draft_token_ids for acceptance.
-        # TODO: Add MTP verify trace for combined verify (2 tokens per step)
+        # Update draft tokens from current step's greedy output for next step
+        # logits shape: [B, V] — argmax gives next predicted token per user
+        if logits.dim() >= 2:
+            self._vllm_mtp_draft_tokens = logits.argmax(dim=-1).to(torch.int32)
+            self._last_draft_token_ids = self._vllm_mtp_draft_tokens
         return logits
 
     def warmup_model_prefill(self, kv_cache, enable_trace, can_sample_on_device, non_greedy_decoding_on_device) -> None:
