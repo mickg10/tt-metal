@@ -8,6 +8,7 @@ Validates:
 4. GLM-5.1 expert dimensions (K=6144, N=2048 for gate/up; K=2048, N=6144 for down)
 """
 
+import os
 import sys
 import torch
 import ttnn
@@ -27,8 +28,9 @@ def test_sparse_matmul(device, M, K, N, num_experts, selected_expert, dtype_b=tt
     logger.info(f"Test: M={M}, K={K}, N={N}, N_padded={N_padded}, per_core_N={per_core_N}, "
                 f"experts={num_experts}, selected={selected_expert}, silu={fused_silu}")
 
-    # Compute cores
-    all_worker_cores = device.get_optimal_dram_bank_to_logical_worker_assignment(ttnn.NOC.NOC_0)
+    # Compute cores — use PINNED cores (same as kernel) for BH Galaxy mesh compatibility
+    from models.demos.glm_moe_dsa.b1_utils import get_pinned_optimal_dram_bank_to_logical_worker_assignment
+    all_worker_cores = get_pinned_optimal_dram_bank_to_logical_worker_assignment(device, ttnn.NOC.NOC_0)
     num_cores = len(all_worker_cores)
     compute_core_grid = ttnn.CoreRangeSet(
         [ttnn.CoreRange(ttnn.CoreCoord(c.x, c.y), ttnn.CoreCoord(c.x, c.y)) for c in all_worker_cores]
@@ -60,12 +62,17 @@ def test_sparse_matmul(device, M, K, N, num_experts, selected_expert, dtype_b=tt
         w = torch.randn(1, 1, K, N).bfloat16().float()
         expert_weights_torch.append(w)
 
-        # Pad and shuffle
+        # Pad (skip shuffle to debug - kernel reads tiles as-is from DRAM)
         w_padded = w.clone()
         if N_padded != N:
             w_padded = torch.nn.functional.pad(w_padded, (0, N_padded - N))
-        w_shuffled = shuffle_dram_tiles(w_padded.reshape(1, K, N_padded), tile_size, num_banks)
-        w_shuffled = w_shuffled.reshape(1, 1, K, N_padded)
+        # DEBUGGING: Try both shuffled and unshuffled to see which gives better PCC
+        use_shuffle = os.environ.get("SHUFFLE", "1") == "1"
+        if use_shuffle:
+            w_shuffled = shuffle_dram_tiles(w_padded.reshape(1, K, N_padded), tile_size, num_banks)
+            w_shuffled = w_shuffled.reshape(1, 1, K, N_padded)
+        else:
+            w_shuffled = w_padded  # No shuffle
 
         et = ttnn.from_torch(
             w_shuffled.bfloat16(), dtype=dtype_b, layout=ttnn.TILE_LAYOUT,
@@ -97,8 +104,10 @@ def test_sparse_matmul(device, M, K, N, num_experts, selected_expert, dtype_b=tt
 
     # ===== Run kernel =====
     Kt = K // tile_size
-    # Use subblock_k=1 for debugging (process one K tile at a time)
-    subblock_k = 1
+    subblock_k = Kt if Kt <= 8 else Kt // 2
+    # Make sure subblock_k divides Kt
+    while Kt % subblock_k != 0:
+        subblock_k -= 1
 
     # Working buffer for CB1 (required by kernel for address wrapping)
     in1_tile_obj = ttnn.Tile([tile_size, tile_size])

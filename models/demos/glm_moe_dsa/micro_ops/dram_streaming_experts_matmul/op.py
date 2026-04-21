@@ -229,9 +229,14 @@ class DRAMStreamingExpertsMatmul:
         # Data formats
         in1_dtype = input_b.dtype
 
-        # Get compute cores
+        # Get compute cores — use PINNED cores to avoid per-device harvesting differences on BH Galaxy mesh
         in1_noc = ttnn.NOC.NOC_0
-        all_worker_cores = device.get_optimal_dram_bank_to_logical_worker_assignment(in1_noc)
+        arch = device.arch()
+        if arch == ttnn.device.Arch.BLACKHOLE:
+            from models.demos.glm_moe_dsa.b1_utils import get_pinned_optimal_dram_bank_to_logical_worker_assignment
+            all_worker_cores = get_pinned_optimal_dram_bank_to_logical_worker_assignment(device, in1_noc)
+        else:
+            all_worker_cores = device.get_optimal_dram_bank_to_logical_worker_assignment(in1_noc)
         num_cores = len(all_worker_cores)
 
         logger.debug(f"num_cores={num_cores}, Mt={Mt}, Kt={Kt}, per_core_N={per_core_N}")
