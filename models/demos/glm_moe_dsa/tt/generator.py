@@ -2898,11 +2898,13 @@ class DeepseekGenerator(WarmupForwardMixin):
                 else:
                     hidden_2d = hidden_raw
 
+                # MTP contract: tokens_step=sampled output token, positions=P+1
+                main_output_tokens_boot = logits.argmax(dim=-1).to(torch.int32) if logits.dim() >= 2 else tokens_1d
                 mtp_page_table = self._get_mtp_page_table()
                 draft_logits = self._mtp_predict_logits(
                     hidden_states=hidden_2d,
-                    tokens_step=tokens_1d,
-                    positions=positions_1d,
+                    tokens_step=main_output_tokens_boot,
+                    positions=positions_1d + 1,
                     page_table=mtp_page_table,
                     use_trace=False,
                 )
@@ -2967,13 +2969,16 @@ class DeepseekGenerator(WarmupForwardMixin):
             ).squeeze(0).squeeze(0)
 
         # Run MTP predict if hidden states available from trace
+        # MTP contract: predict token at P+2 given hidden at P and sampled token at P+1
         if self._trace_hidden_output is not None:
             try:
+                # First, sample the main output token (greedy argmax)
+                main_output_tokens = logits.argmax(dim=-1).to(torch.int32) if logits.dim() >= 2 else tokens_1d
                 mtp_page_table = self._get_mtp_page_table()
                 draft_logits = self._mtp_predict_logits(
                     hidden_states=self._trace_hidden_output,
-                    tokens_step=tokens_1d,
-                    positions=positions_1d,
+                    tokens_step=main_output_tokens,  # Token at P+1 (the model's output)
+                    positions=positions_1d + 1,       # Position P+1
                     page_table=mtp_page_table,
                     use_trace=False,
                 )
