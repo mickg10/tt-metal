@@ -91,6 +91,77 @@ def generate_mm_weights(shape, dtype):
     # return torch_mm_weights
 
 
+def shuffle_dram_tiles(tensor, tile_size, num_banks):
+    """Reorder tiles within each DRAM bank shard from row-major to column-major.
+
+    WIDTH_SHARDED DRAM layout stores tiles row-major, but the streaming
+    matmul kernel expects K tiles contiguous for each N column. This
+    function transposes the tile order within each shard so that the
+    kernel can linearly read K tiles at a time.
+
+    Args:
+        tensor: [*, K, N] tensor (supports batch dimensions).
+        tile_size: Tile dimension (square tiles assumed).
+        num_banks: Number of DRAM banks (shards).
+
+    Returns:
+        Same-shape tensor with tiles rearranged per shard.
+    """
+    import torch
+
+    orig_shape = tensor.shape
+    K, N = orig_shape[-2], orig_shape[-1]
+
+    lcm = tile_size * num_banks
+    n_padded = ((N + lcm - 1) // lcm) * lcm
+    needs_padding = n_padded != N
+
+    tensor = tensor.reshape(-1, K, N)
+    batch_size = tensor.shape[0]
+
+    if needs_padding:
+        tensor = torch.nn.functional.pad(tensor, (0, n_padded - N))
+
+    K_tiles = K // tile_size
+    per_N = n_padded // num_banks
+    per_N_tiles = per_N // tile_size
+    num_tiles_per_shard = K_tiles * per_N_tiles
+
+    tensor = tensor.reshape(batch_size, K, num_banks, per_N)
+    tensor = tensor.permute(0, 2, 1, 3).contiguous()
+    shards = tensor.reshape(-1, K, per_N)
+
+    tiles = shards.reshape(-1, K_tiles, tile_size, per_N_tiles, tile_size)
+    tiles = tiles.permute(0, 1, 3, 2, 4).contiguous()
+    tiles = tiles.reshape(-1, num_tiles_per_shard, tile_size, tile_size)
+
+    i = torch.arange(num_tiles_per_shard, device=tensor.device)
+    source_idx = (i % K_tiles) * per_N_tiles + (i // K_tiles)
+    shuffled_tiles = tiles[:, source_idx, :, :]
+
+    shuffled_tiles = shuffled_tiles.reshape(-1, K_tiles, per_N_tiles, tile_size, tile_size)
+    shuffled_tiles = shuffled_tiles.permute(0, 1, 3, 2, 4).contiguous()
+    shuffled_shards = shuffled_tiles.reshape(-1, K, per_N)
+
+    shuffled = shuffled_shards.reshape(batch_size, num_banks, K, per_N)
+    shuffled = shuffled.permute(0, 2, 1, 3).contiguous()
+    shuffled = shuffled.reshape(batch_size, K, n_padded)
+
+    if needs_padding:
+        shuffled = shuffled[:, :, :N]
+
+    return shuffled.reshape(*orig_shape)
+
+
+def pad_n_to_dram_banks(n, tile_size, num_banks):
+    """Pad N dimension to align with DRAM bank sharding.
+
+    Returns N_padded such that N_padded is divisible by (tile_size * num_banks).
+    """
+    lcm = tile_size * num_banks
+    return ((n + lcm - 1) // lcm) * lcm
+
+
 # Hardcoded optimal DRAM bank to logical worker assignment for Blackhole to avoid differences from harvesting
 def get_pinned_optimal_dram_bank_to_logical_worker_assignment(device, noc):
     import ttnn

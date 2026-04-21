@@ -180,6 +180,10 @@ def _merge_run_config(
         logger.warning(f"Cached weight {weight_config_item.path} is not needed by the model config, ignoring it.")
         return None
 
+    # Pass through pre-loaded tensors (e.g., sparse expert WIDTH_SHARDED tensors)
+    if model_state_config_item is None and weight_config_item is not None:
+        return weight_config_item
+
     raise ValueError(
         f"Unsupported model and weight config items to merge: {model_state_config_item} and {weight_config_item}. Try recalculating cached weights."
     )

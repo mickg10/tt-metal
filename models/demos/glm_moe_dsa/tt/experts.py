@@ -64,6 +64,33 @@ class Experts(AbstractModule):
 
             return torch.stack(expert_weights)
 
+        sparse_mode = os.getenv("GLM5_SPARSE_EXPERTS", "0") == "1"
+
+        if sparse_mode:
+            from models.demos.glm_moe_dsa.tt.sparse_experts import convert_expert_weights_sparse
+
+            logger.info("Loading expert weights in SPARSE (WIDTH_SHARDED) format for DRAMStreamingExpertsMatmul")
+            num_experts_per_device = cls._get_num_experts_per_device(hf_config, mesh_device)
+            result = {}
+            for hf_name, ttnn_name in [
+                ("gate_proj", "w1_experts"),
+                ("down_proj", "w2_experts"),
+                ("up_proj", "w3_experts"),
+            ]:
+                weights = _load_expert_weight(hf_name).unsqueeze(0).transpose(-1, -2).contiguous()
+                dtype = ttnn.bfloat8_b if hf_name == "down_proj" else ttnn.bfloat4_b
+                expert_tensors = convert_expert_weights_sparse(
+                    weights,
+                    num_experts_per_device=num_experts_per_device,
+                    mesh_device=mesh_device,
+                    dtype=dtype,
+                    cache_path=output_path / "sparse",
+                    tag=ttnn_name,
+                )
+                result[ttnn_name] = {"sparse_tensors": expert_tensors}
+            return result
+
+        # Dense (default) path: batched interleaved DRAM
         return {
             ttnn_name: {
                 "input_tensor_b": shard_and_save(
@@ -96,7 +123,6 @@ class Experts(AbstractModule):
         return mesh_device.shape[1] in (4, 8)
 
     @classmethod
-    @classmethod
     def _create_model_config(
         cls, hf_config: PretrainedConfig, mesh_device: ttnn.Device, mode: str
     ) -> ModelPrefillConfig | ModelDecodeConfig:
@@ -105,6 +131,8 @@ class Experts(AbstractModule):
         # Calculate dimensions
         hidden_size = hf_config.hidden_size
         moe_intermediate_size = hf_config.moe_intermediate_size
+
+        sparse_mode = os.getenv("GLM5_SPARSE_EXPERTS", "0") == "1"
 
         # Calculate input and output memory configurations
         if mode == "decode":
@@ -115,31 +143,50 @@ class Experts(AbstractModule):
             output_memory_config = ttnn.DRAM_MEMORY_CONFIG
 
         # Construct the config
-        return {
+        base_config = {
             "mesh_device": MeshDeviceStub(mesh_device.shape),
-            "w1_experts": LinearConfig(
-                input_tensor_b=FromWeightConfig(MeshDeviceStub(mesh_device.shape)),
-                memory_config=output_memory_config,
-                compute_kernel_config=COMPUTE_KERNEL_CONFIG_LOFI,
-            ),
-            "w2_experts": LinearConfig(
-                input_tensor_b=FromWeightConfig(MeshDeviceStub(mesh_device.shape)),
-                memory_config=output_memory_config,
-                compute_kernel_config=COMPUTE_KERNEL_CONFIG_HIFI2,
-            ),
-            "w3_experts": LinearConfig(
-                input_tensor_b=FromWeightConfig(MeshDeviceStub(mesh_device.shape)),
-                memory_config=output_memory_config,
-                compute_kernel_config=COMPUTE_KERNEL_CONFIG_LOFI,
-            ),
-            "mul_experts": MulConfig(
-                memory_config=output_memory_config,
-                input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
-            ),
+            "sparse_mode": sparse_mode,
+            "hidden_size": hidden_size,
+            "moe_intermediate_size": moe_intermediate_size,
             "input_memory_config": input_memory_config,
             "output_memory_config": output_memory_config,
             "num_experts_per_device": num_experts_per_device,
         }
+
+        if sparse_mode:
+            # Sparse mode: weight tensors are pre-loaded WIDTH_SHARDED in DRAM.
+            # The "sparse_tensors" key is a placeholder filled by the config merge
+            # from convert_weights output. No LinearConfig needed.
+            base_config.update({
+                "w1_experts": {"sparse_tensors": None},  # Filled by merge with pre-loaded tensors
+                "w2_experts": {"sparse_tensors": None},
+                "w3_experts": {"sparse_tensors": None},
+            })
+        else:
+            # Dense mode: standard batched matmul with LinearConfig
+            base_config.update({
+                "w1_experts": LinearConfig(
+                    input_tensor_b=FromWeightConfig(MeshDeviceStub(mesh_device.shape)),
+                    memory_config=output_memory_config,
+                    compute_kernel_config=COMPUTE_KERNEL_CONFIG_LOFI,
+                ),
+                "w2_experts": LinearConfig(
+                    input_tensor_b=FromWeightConfig(MeshDeviceStub(mesh_device.shape)),
+                    memory_config=output_memory_config,
+                    compute_kernel_config=COMPUTE_KERNEL_CONFIG_HIFI2,
+                ),
+                "w3_experts": LinearConfig(
+                    input_tensor_b=FromWeightConfig(MeshDeviceStub(mesh_device.shape)),
+                    memory_config=output_memory_config,
+                    compute_kernel_config=COMPUTE_KERNEL_CONFIG_LOFI,
+                ),
+                "mul_experts": MulConfig(
+                    memory_config=output_memory_config,
+                    input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
+                ),
+            })
+
+        return base_config
 
     @classmethod
     def decode_model_config(cls, hf_config: PretrainedConfig, mesh_device: ttnn.Device) -> ModelDecodeConfig:

@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from pathlib import Path
 from time import perf_counter
 
@@ -11,6 +12,7 @@ from transformers.configuration_utils import PretrainedConfig
 import ttnn
 from models.demos.glm_moe_dsa.tt.ccl import CCL
 from models.demos.glm_moe_dsa.tt.experts import Experts as MoEExperts
+from models.demos.glm_moe_dsa.tt.sparse_experts import sparse_expert_forward
 from models.demos.glm_moe_dsa.tt.moe_gate import MoEGate
 from models.demos.glm_moe_dsa.utils.abstract_module import AbstractModule
 from models.demos.glm_moe_dsa.utils.config_dataclass import (
@@ -469,19 +471,49 @@ class MoE(SharedStateAddOn, AbstractModule):
                 all_to_all_dispatch_output_tensors,
                 shape=(1, 1, batch_size_chunk * seq_len, cfg["hidden_size"]),
             )
-            dispatch_chunk = ttnn.repeat(dispatch_chunk, **cfg["activations_repeat"])
-            dispatch_chunk_rm = dispatch_chunk
-            dispatch_chunk = ttnn.to_layout(dispatch_chunk_rm, ttnn.TILE_LAYOUT)
-            ttnn.deallocate(dispatch_chunk_rm)
-            ttnn.deallocate(all_to_all_dispatch_output_tensors)
 
-            experts_output = MoEExperts._forward(dispatch_chunk, cfg["moe_experts"])
-            ttnn.deallocate(dispatch_chunk)
+            sparse_mode = cfg["moe_experts"].get("sparse_mode", False)
+            if sparse_mode and cfg["moe_experts"].get("w1_experts", {}).get("sparse_tensors") is not None:
+                # ===== SPARSE PATH: DRAMStreamingExpertsMatmul =====
+                # No repeat — dispatch output goes directly to sparse kernel
+                dispatch_chunk_tile = ttnn.to_layout(dispatch_chunk, ttnn.TILE_LAYOUT)
+                ttnn.deallocate(dispatch_chunk)
+                ttnn.deallocate(all_to_all_dispatch_output_tensors)
 
-            experts_output = ttnn.to_layout(experts_output, ttnn.ROW_MAJOR_LAYOUT)
-            experts_output = ttnn.reshape(
-                experts_output, shape=(cfg["num_experts_per_device"], batch_size_chunk, seq_len, cfg["hidden_size"])
-            )
+                device = dispatch_chunk_tile.device()
+                experts_output = sparse_expert_forward(
+                    x=dispatch_chunk_tile,
+                    gate_expert_tensors=cfg["moe_experts"]["w1_experts"]["sparse_tensors"],
+                    up_expert_tensors=cfg["moe_experts"]["w3_experts"]["sparse_tensors"],
+                    down_expert_tensors=cfg["moe_experts"]["w2_experts"]["sparse_tensors"],
+                    num_experts_per_device=cfg["num_experts_per_device"],
+                    hidden_size=cfg["hidden_size"],
+                    intermediate_size=cfg["moe_experts"]["moe_intermediate_size"],
+                    device=device,
+                    selected_experts_k=cfg["num_experts_per_device"],  # All experts for now
+                )
+                ttnn.deallocate(dispatch_chunk_tile)
+
+                # Reshape to [num_experts_per_device, batch, seq, hidden] for combine
+                experts_output = ttnn.to_layout(experts_output, ttnn.ROW_MAJOR_LAYOUT)
+                experts_output = ttnn.reshape(
+                    experts_output, shape=(cfg["num_experts_per_device"], batch_size_chunk, seq_len, cfg["hidden_size"])
+                )
+            else:
+                # ===== DENSE PATH: Repeat + batched matmul =====
+                dispatch_chunk = ttnn.repeat(dispatch_chunk, **cfg["activations_repeat"])
+                dispatch_chunk_rm = dispatch_chunk
+                dispatch_chunk = ttnn.to_layout(dispatch_chunk_rm, ttnn.TILE_LAYOUT)
+                ttnn.deallocate(dispatch_chunk_rm)
+                ttnn.deallocate(all_to_all_dispatch_output_tensors)
+
+                experts_output = MoEExperts._forward(dispatch_chunk, cfg["moe_experts"])
+                ttnn.deallocate(dispatch_chunk)
+
+                experts_output = ttnn.to_layout(experts_output, ttnn.ROW_MAJOR_LAYOUT)
+                experts_output = ttnn.reshape(
+                    experts_output, shape=(cfg["num_experts_per_device"], batch_size_chunk, seq_len, cfg["hidden_size"])
+                )
 
             all_to_all_dispatch_metadata_tensors = ttnn.reshape(
                 all_to_all_dispatch_metadata_tensors,
