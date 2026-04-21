@@ -2670,10 +2670,16 @@ class DeepseekGenerator(WarmupForwardMixin):
         assert self._trace_id is None, "Trace already captured"
 
         # 1) Warm-up compile run (no trace) to keep compilation out of capture
-        logger.info("Running warm-up decode step (no trace)...")
+        # When MTP enabled, warm up WITH return_hidden=True so the trace can include it
+        use_hidden = self.enable_mtp
+        logger.info(f"Running warm-up decode step (no trace, return_hidden={use_hidden})...")
         if self.signpost:
             signpost(header="decode_warmup")
-        _ = self._decode_step(init_tokens, positions, page_tables=page_tables, sample_on_device=False)
+        if use_hidden:
+            _ = self._decode_step_tt(init_tokens, positions, batch_size_per_row=self.batch_size_per_row,
+                                      page_tables=page_tables, return_hidden=True)
+        else:
+            _ = self._decode_step(init_tokens, positions, page_tables=page_tables, sample_on_device=False)
         ttnn.synchronize_device(self.mesh_device)
         if self.signpost:
             signpost(header="decode_warmup")
@@ -2706,17 +2712,21 @@ class DeepseekGenerator(WarmupForwardMixin):
 
         # Only capture the rot_mats generation from rot_idxs (all ttnn ops, no from_torch)
         rope_tensors = self.rope_setup.get_rot_mats_from_rot_idxs(self._trace_rot_idxs)
-        # NOTE: return_hidden=True causes "Writes not supported during trace capture"
-        # MTP predict must happen OUTSIDE the trace path
-        self._trace_output = RowBatchedModel.forward_decode(
+        # When MTP enabled AND warmup compiled with return_hidden=True, capture with hidden
+        trace_fwd_result = RowBatchedModel.forward_decode(
             x=self._trace_tokens,
             position_idxs=self._trace_positions,
             cfg=self.model_run_config_decode,
             rope_tensors=rope_tensors,
             page_tables=self._trace_page_tables_to_use,
             profile_decode=self.profile_decode,
+            return_hidden=use_hidden,
         )
-        self._trace_hidden_output = None
+        if use_hidden:
+            self._trace_output, self._trace_hidden_output = trace_fwd_result
+        else:
+            self._trace_output = trace_fwd_result
+            self._trace_hidden_output = None
         ttnn.end_trace_capture(self.mesh_device, trace_id, cq_id=0)
         if self.signpost:
             signpost(header="decode_trace_capture")
@@ -2956,11 +2966,33 @@ class DeepseekGenerator(WarmupForwardMixin):
                 ),
             ).squeeze(0).squeeze(0)
 
-        # Update draft tokens from current step's greedy output for next step
-        # logits shape: [B, V] — argmax gives next predicted token per user
-        if logits.dim() >= 2:
-            self._vllm_mtp_draft_tokens = logits.argmax(dim=-1).to(torch.int32)
-            self._last_draft_token_ids = self._vllm_mtp_draft_tokens
+        # Run MTP predict if hidden states available from trace
+        if self._trace_hidden_output is not None:
+            try:
+                mtp_page_table = self._get_mtp_page_table()
+                draft_logits = self._mtp_predict_logits(
+                    hidden_states=self._trace_hidden_output,
+                    tokens_step=tokens_1d,
+                    positions=positions_1d,
+                    page_table=mtp_page_table,
+                    use_trace=False,
+                )
+                self.ccl.reset_sem_counters()
+                self._vllm_mtp_draft_tokens = self._sample_greedy(draft_logits).to(torch.int32)
+                self._last_draft_token_ids = self._vllm_mtp_draft_tokens
+            except Exception as e:
+                if not getattr(self, '_mtp_predict_err_count', 0):
+                    logger.warning(f"MTP predict failed: {e}")
+                self._mtp_predict_err_count = getattr(self, '_mtp_predict_err_count', 0) + 1
+                # Fallback: greedy from logits
+                if logits.dim() >= 2:
+                    self._vllm_mtp_draft_tokens = logits.argmax(dim=-1).to(torch.int32)
+                    self._last_draft_token_ids = self._vllm_mtp_draft_tokens
+        else:
+            # No hidden states — fallback to greedy from logits
+            if logits.dim() >= 2:
+                self._vllm_mtp_draft_tokens = logits.argmax(dim=-1).to(torch.int32)
+                self._last_draft_token_ids = self._vllm_mtp_draft_tokens
         return logits
 
     def warmup_model_prefill(self, kv_cache, enable_trace, can_sample_on_device, non_greedy_decoding_on_device) -> None:
