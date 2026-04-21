@@ -2921,8 +2921,7 @@ class DeepseekGenerator(WarmupForwardMixin):
                 raise ValueError("MTP vLLM path requires host sampling for now")
             return logits
 
-        # Normal MTP path: use standard trace (no verify trace yet — just add draft prediction)
-        # Execute the standard decode trace first
+        # Normal MTP path: use standard trace + MTP predict trace
         if self._trace_id is None:
             self._capture_decode_trace(tokens_1d, positions_1d, page_table)
             assert self._trace_output is not None
@@ -2932,6 +2931,25 @@ class DeepseekGenerator(WarmupForwardMixin):
                     self.mesh_device, dims=(-2, -1), mesh_shape=self.mesh_device.shape
                 ),
             ).squeeze(0).squeeze(0)
+
+            # Also capture MTP predict trace using the hidden states from decode trace
+            if self._trace_hidden_output is not None and self._mtp_predict_trace_id is None:
+                try:
+                    main_out = logits.argmax(dim=-1).to(torch.int32) if logits.dim() >= 2 else tokens_1d
+                    # Convert hidden to host for trace buffer allocation
+                    hidden_host = self._hidden_tt_to_host_for_mtp(self._trace_hidden_output)
+                    mtp_pt = self._get_mtp_page_table()
+                    self._capture_mtp_predict_trace(
+                        hidden_states=hidden_host,
+                        tokens_step=main_out,
+                        positions=positions_1d + 1,
+                        page_table=mtp_pt,
+                        compile_run=True,
+                    )
+                    logger.info("MTP predict trace captured for vLLM path")
+                except Exception as e:
+                    logger.warning(f"Failed to capture MTP predict trace: {e}")
+                    self._mtp_predict_trace_id = None
         else:
             # Replay standard decode trace
             torch_input = tokens_1d.view(1, 1, -1).to(torch.int32)
@@ -2975,12 +2993,15 @@ class DeepseekGenerator(WarmupForwardMixin):
                 # First, sample the main output token (greedy argmax)
                 main_output_tokens = logits.argmax(dim=-1).to(torch.int32) if logits.dim() >= 2 else tokens_1d
                 mtp_page_table = self._get_mtp_page_table()
+                # Use eager MTP predict for now (traced gives lower acceptance)
+                # TODO: Fix traced predict hidden states conversion
+                use_traced_predict = False  # self._mtp_predict_trace_id is not None
                 draft_logits = self._mtp_predict_logits(
-                    hidden_states=self._trace_hidden_output,
-                    tokens_step=main_output_tokens,  # Token at P+1 (the model's output)
-                    positions=positions_1d + 1,       # Position P+1
+                    hidden_states=self._trace_hidden_output,  # ttnn tensor from trace
+                    tokens_step=main_output_tokens,
+                    positions=positions_1d + 1,
                     page_table=mtp_page_table,
-                    use_trace=False,
+                    use_trace=use_traced_predict,
                 )
                 self.ccl.reset_sem_counters()
                 self._vllm_mtp_draft_tokens = self._sample_greedy(draft_logits).to(torch.int32)
