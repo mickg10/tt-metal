@@ -69,7 +69,7 @@ class Experts(AbstractModule):
         if sparse_mode:
             from models.demos.glm_moe_dsa.tt.sparse_experts import convert_expert_weights_sparse
 
-            logger.info("Loading expert weights in SPARSE (WIDTH_SHARDED) format for DRAMStreamingExpertsMatmul")
+            logger.info("Loading expert weights in SPARSE (WIDTH_SHARDED) format")
             num_experts_per_device = cls._get_num_experts_per_device(hf_config, mesh_device)
             result = {}
             for hf_name, ttnn_name in [
@@ -154,15 +154,14 @@ class Experts(AbstractModule):
         }
 
         if sparse_mode:
-            # Sparse mode: weight tensors are pre-loaded WIDTH_SHARDED in DRAM.
-            # The "sparse_tensors" key is a placeholder filled by the config merge
-            # from convert_weights output. No LinearConfig needed.
+            # Sparse mode: No LinearConfig needed. Expert compute uses DRAMStreamingExpertsMatmul.
+            # The "sparse_tensors" placeholders get filled by config merge from convert_weights.
             base_config.update({
-                "w1_experts": {"sparse_tensors": None},  # Filled by merge with pre-loaded tensors
+                "w1_experts": {"sparse_tensors": None},
                 "w2_experts": {"sparse_tensors": None},
                 "w3_experts": {"sparse_tensors": None},
             })
-        else:
+            return base_config
             # Dense mode: standard batched matmul with LinearConfig
             base_config.update({
                 "w1_experts": LinearConfig(

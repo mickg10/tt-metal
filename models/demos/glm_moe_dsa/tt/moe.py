@@ -473,11 +473,25 @@ class MoE(SharedStateAddOn, AbstractModule):
             )
 
             sparse_mode = cfg["moe_experts"].get("sparse_mode", False)
-            # Sparse forward disabled — weight conversion happens but forward uses dense path
-            # TODO: Enable once sparse_expert_forward is trace-compatible
-            if False and sparse_mode and cfg["moe_experts"].get("w1_experts", {}).get("sparse_tensors") is not None:
+            if sparse_mode:
                 # ===== SPARSE PATH: DRAMStreamingExpertsMatmul =====
-                # No repeat — dispatch output goes directly to sparse kernel
+                w1_sparse = cfg["moe_experts"].get("w1_experts", {})
+                if isinstance(w1_sparse, dict):
+                    w1_sparse = w1_sparse.get("sparse_tensors")
+                w3_sparse = cfg["moe_experts"].get("w3_experts", {})
+                if isinstance(w3_sparse, dict):
+                    w3_sparse = w3_sparse.get("sparse_tensors")
+                w2_sparse = cfg["moe_experts"].get("w2_experts", {})
+                if isinstance(w2_sparse, dict):
+                    w2_sparse = w2_sparse.get("sparse_tensors")
+
+                if w1_sparse is None or w3_sparse is None or w2_sparse is None:
+                    raise RuntimeError(
+                        f"Sparse expert mode enabled but sparse_tensors not loaded. "
+                        f"w1={type(w1_sparse)}, w3={type(w3_sparse)}, w2={type(w2_sparse)}. "
+                        f"Config keys: {list(cfg['moe_experts'].keys())}"
+                    )
+
                 dispatch_chunk_tile = ttnn.to_layout(dispatch_chunk, ttnn.TILE_LAYOUT)
                 ttnn.deallocate(dispatch_chunk)
                 ttnn.deallocate(all_to_all_dispatch_output_tensors)
@@ -485,9 +499,9 @@ class MoE(SharedStateAddOn, AbstractModule):
                 device = dispatch_chunk_tile.device()
                 experts_output = sparse_expert_forward(
                     x=dispatch_chunk_tile,
-                    gate_expert_tensors=cfg["moe_experts"]["w1_experts"]["sparse_tensors"],
-                    up_expert_tensors=cfg["moe_experts"]["w3_experts"]["sparse_tensors"],
-                    down_expert_tensors=cfg["moe_experts"]["w2_experts"]["sparse_tensors"],
+                    gate_expert_tensors=w1_sparse,
+                    up_expert_tensors=w3_sparse,
+                    down_expert_tensors=w2_sparse,
                     num_experts_per_device=cfg["num_experts_per_device"],
                     hidden_size=cfg["hidden_size"],
                     intermediate_size=cfg["moe_experts"]["moe_intermediate_size"],
