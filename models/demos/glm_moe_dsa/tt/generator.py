@@ -2610,13 +2610,15 @@ class DeepseekGenerator(WarmupForwardMixin):
         positions: torch.Tensor,
         page_table: ttnn.Tensor | None = None,
     ) -> torch.Tensor:
-        hidden_host = (
-            self._hidden_tt_to_host_for_mtp(hidden_states) if isinstance(hidden_states, ttnn.Tensor) else hidden_states
-        )
-        hidden_host = self._normalize_hidden_host_for_mtp(hidden_host)
+        is_device_tensor = isinstance(hidden_states, ttnn.Tensor)
 
-        mtp_page_table = page_table if page_table is not None else self._get_mtp_page_table()
+        # For trace capture (first call), we always need host tensors
         if self._mtp_predict_trace_id is None:
+            hidden_host = (
+                self._hidden_tt_to_host_for_mtp(hidden_states) if is_device_tensor else hidden_states
+            )
+            hidden_host = self._normalize_hidden_host_for_mtp(hidden_host)
+            mtp_page_table = page_table if page_table is not None else self._get_mtp_page_table()
             self._capture_mtp_predict_trace(hidden_host, tokens_step, positions, mtp_page_table)
         else:
             assert (
@@ -2626,8 +2628,21 @@ class DeepseekGenerator(WarmupForwardMixin):
                 and self._mtp_predict_trace_rot_idxs is not None
                 and self._mtp_predict_trace_output is not None
             )
-            host_hidden = self._tt_from_hidden_states_step(hidden_host, device=None)
-            ttnn.copy_host_to_device_tensor(host_hidden, self._mtp_predict_trace_hidden)
+
+            # Update hidden states: use device-to-device copy if possible (faster)
+            if is_device_tensor:
+                try:
+                    ttnn.copy(hidden_states, self._mtp_predict_trace_hidden)
+                except Exception:
+                    # Fallback to host round-trip if shapes/layouts don't match
+                    hidden_host = self._hidden_tt_to_host_for_mtp(hidden_states)
+                    hidden_host = self._normalize_hidden_host_for_mtp(hidden_host)
+                    host_hidden = self._tt_from_hidden_states_step(hidden_host, device=None)
+                    ttnn.copy_host_to_device_tensor(host_hidden, self._mtp_predict_trace_hidden)
+            else:
+                hidden_host = self._normalize_hidden_host_for_mtp(hidden_states)
+                host_hidden = self._tt_from_hidden_states_step(hidden_host, device=None)
+                ttnn.copy_host_to_device_tensor(host_hidden, self._mtp_predict_trace_hidden)
 
             host_tokens = ttnn.from_torch(
                 tokens_step.view(1, 1, -1).to(torch.int32),
@@ -2932,8 +2947,8 @@ class DeepseekGenerator(WarmupForwardMixin):
                 ),
             ).squeeze(0).squeeze(0)
 
-            # Also capture MTP predict trace using the hidden states from decode trace
-            if self._trace_hidden_output is not None and self._mtp_predict_trace_id is None:
+            # Skip MTP predict trace capture — D2D copy corrupts hidden states, eager predict works
+            if False and self._trace_hidden_output is not None and self._mtp_predict_trace_id is None:
                 try:
                     main_out = logits.argmax(dim=-1).to(torch.int32) if logits.dim() >= 2 else tokens_1d
                     # Convert hidden to host for trace buffer allocation
@@ -2993,9 +3008,9 @@ class DeepseekGenerator(WarmupForwardMixin):
                 # First, sample the main output token (greedy argmax)
                 main_output_tokens = logits.argmax(dim=-1).to(torch.int32) if logits.dim() >= 2 else tokens_1d
                 mtp_page_table = self._get_mtp_page_table()
-                # Use eager MTP predict for now (traced gives lower acceptance)
-                # TODO: Fix traced predict hidden states conversion
-                use_traced_predict = False  # self._mtp_predict_trace_id is not None
+                # Traced predict gives 0% acceptance (D2D copy corrupts hidden states)
+                # Use eager predict which gives 50% acceptance
+                use_traced_predict = False
                 draft_logits = self._mtp_predict_logits(
                     hidden_states=self._trace_hidden_output,  # ttnn tensor from trace
                     tokens_step=main_output_tokens,
