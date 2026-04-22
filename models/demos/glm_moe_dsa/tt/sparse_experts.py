@@ -30,18 +30,14 @@ def convert_expert_weights_sparse(
     num_devices = mesh_device.get_num_devices()
     total_experts = expert_weights_torch.shape[1]
     assert total_experts == num_experts_per_device * num_devices
-
     _, _, K, N = expert_weights_torch.shape
     num_banks = BH_NUM_DRAM_BANKS
     N_padded = pad_n_to_dram_banks(N, TILE_SIZE, num_banks)
     per_core_N = N_padded // num_banks
-
     logger.info(f"Sparse [{tag}]: K={K}, N={N}, N_padded={N_padded}, dtype={dtype}, E/dev={num_experts_per_device}")
-
     dram_grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(num_banks - 1, 0))})
     shard_spec = ttnn.ShardSpec(dram_grid, [K, per_core_N], ttnn.ShardOrientation.ROW_MAJOR)
     mem_config = ttnn.MemoryConfig(ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.DRAM, shard_spec)
-
     expert_tensors = []
     for e_idx in range(num_experts_per_device):
         per_dev = []
@@ -64,6 +60,10 @@ def convert_expert_weights_sparse(
     return expert_tensors
 
 
+# Persistent buffers for sparse expert forward (allocated once, reused)
+_sparse_buffers = {}
+
+
 def sparse_expert_forward(
     x, gate_expert_tensors, up_expert_tensors, down_expert_tensors,
     num_experts_per_device, hidden_size, intermediate_size, device,
@@ -71,12 +71,13 @@ def sparse_expert_forward(
 ):
     """Sparse expert forward using DRAMStreamingExpertsMatmul.
 
-    Processes dispatch output through gate(SiLU) + up(mul) + down pipeline.
-    Uses eager mode with per-token tiny-tile processing.
+    Uses M=1 with per-token processing. Pre-allocates persistent buffers
+    on first call to avoid allocation overhead.
 
     x: [1, 1, total_tokens, hidden_size] in TILE layout
     Returns: [1, num_experts_per_device, total_tokens, hidden_size]
     """
+    global _sparse_buffers
     _, _, total_tokens, _ = x.shape
     num_banks = BH_NUM_DRAM_BANKS
     N_gate = pad_n_to_dram_banks(intermediate_size, TILE_SIZE, num_banks)
@@ -88,13 +89,11 @@ def sparse_expert_forward(
     num_cores = len(all_workers)
     cg = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(c.x, c.y), ttnn.CoreCoord(c.x, c.y)) for c in all_workers])
 
-    # subblock_k for gate/up (K=hidden_size)
+    # subblock_k calculations
     Kt_gate = hidden_size // TILE_SIZE
     sk_gate = Kt_gate // 2
     while Kt_gate % sk_gate != 0 or sk_gate % 2 != 0:
         sk_gate -= 1
-
-    # subblock_k for down (K=intermediate_size)
     Kt_down = intermediate_size // TILE_SIZE
     sk_down = Kt_down // 2
     while Kt_down % sk_down != 0 or sk_down % 2 != 0:
@@ -105,92 +104,111 @@ def sparse_expert_forward(
     idx_tile = ttnn.Tile([1, 16])
     in1_tile = ttnn.Tile([32, 32])
 
-    # Index tensor: [0,1,...,K-1] for all experts
-    idx_data = torch.zeros(num_cores, 16, dtype=torch.int32)
-    for e in range(min(selected_experts_k, 16)):
-        idx_data[:, e] = e
-    idx_shard = ttnn.ShardSpec(cg, (1, 16), ttnn.ShardOrientation.ROW_MAJOR)
-    idx_mem = ttnn.MemoryConfig(ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, idx_shard)
-    idx_t = ttnn.from_torch(idx_data.to(torch.uint16), dtype=ttnn.uint16, layout=ttnn.TILE_LAYOUT,
-                             device=device, memory_config=idx_mem, tile=idx_tile,
-                             mesh_mapper=ttnn.ReplicateTensorToMesh(device))
+    # Pre-allocate persistent buffers on first call
+    buf_key = f"{hidden_size}_{intermediate_size}_{selected_experts_k}"
+    if buf_key not in _sparse_buffers:
+        logger.info(f"Allocating sparse expert buffers (one-time, key={buf_key})...")
 
-    # Working buffer for gate/up
-    cb_tiles_gate = sk_gate * 3
-    wb_w_gate = cb_tiles_gate * 32 * num_cores
-    wb_spec_gate = ttnn.ShardSpec(cg, (32, cb_tiles_gate * 32), ttnn.ShardOrientation.ROW_MAJOR)
-    wb_mem_gate = ttnn.MemoryConfig(ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.L1, wb_spec_gate)
-    gate_dtype = gate_expert_tensors[0].dtype
-    wb_gate = ttnn.from_torch(torch.zeros(1, 1, 32, wb_w_gate).bfloat16(), dtype=gate_dtype,
-                               layout=ttnn.TILE_LAYOUT, device=device, memory_config=wb_mem_gate, tile=in1_tile,
-                               mesh_mapper=ttnn.ReplicateTensorToMesh(device))
+        # Index tensor
+        idx_data = torch.zeros(num_cores, 16, dtype=torch.int32)
+        for e in range(min(selected_experts_k, 16)):
+            idx_data[:, e] = e
+        idx_shard = ttnn.ShardSpec(cg, (1, 16), ttnn.ShardOrientation.ROW_MAJOR)
+        idx_mem = ttnn.MemoryConfig(ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, idx_shard)
+        idx_t = ttnn.from_torch(idx_data.to(torch.uint16), dtype=ttnn.uint16, layout=ttnn.TILE_LAYOUT,
+                                 device=device, memory_config=idx_mem, tile=idx_tile,
+                                 mesh_mapper=ttnn.ReplicateTensorToMesh(device))
 
-    # Working buffer for down
-    cb_tiles_down = sk_down * 3
-    wb_w_down = cb_tiles_down * 32 * num_cores
-    wb_spec_down = ttnn.ShardSpec(cg, (32, cb_tiles_down * 32), ttnn.ShardOrientation.ROW_MAJOR)
-    wb_mem_down = ttnn.MemoryConfig(ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.L1, wb_spec_down)
-    down_dtype = down_expert_tensors[0].dtype
-    wb_down = ttnn.from_torch(torch.zeros(1, 1, 32, wb_w_down).bfloat16(), dtype=down_dtype,
-                               layout=ttnn.TILE_LAYOUT, device=device, memory_config=wb_mem_down, tile=in1_tile,
-                               mesh_mapper=ttnn.ReplicateTensorToMesh(device))
+        # Working buffers
+        cb_g = sk_gate * 3
+        wb_spec_g = ttnn.ShardSpec(cg, (32, cb_g * 32), ttnn.ShardOrientation.ROW_MAJOR)
+        wb_mem_g = ttnn.MemoryConfig(ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.L1, wb_spec_g)
+        wb_gate = ttnn.from_torch(torch.zeros(1, 1, 32, cb_g * 32 * num_cores).bfloat16(),
+                                   dtype=gate_expert_tensors[0].dtype, layout=ttnn.TILE_LAYOUT,
+                                   device=device, memory_config=wb_mem_g, tile=in1_tile,
+                                   mesh_mapper=ttnn.ReplicateTensorToMesh(device))
 
+        cb_d = sk_down * 3
+        wb_spec_d = ttnn.ShardSpec(cg, (32, cb_d * 32), ttnn.ShardOrientation.ROW_MAJOR)
+        wb_mem_d = ttnn.MemoryConfig(ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.L1, wb_spec_d)
+        wb_down = ttnn.from_torch(torch.zeros(1, 1, 32, cb_d * 32 * num_cores).bfloat16(),
+                                   dtype=down_expert_tensors[0].dtype, layout=ttnn.TILE_LAYOUT,
+                                   device=device, memory_config=wb_mem_d, tile=in1_tile,
+                                   mesh_mapper=ttnn.ReplicateTensorToMesh(device))
+
+        # Per-expert index tensors for down_proj
+        e_idxs = []
+        for e in range(selected_experts_k):
+            ed = torch.zeros(num_cores, 16, dtype=torch.int32)
+            ed[:, 0] = e
+            ei = ttnn.from_torch(ed.to(torch.uint16), dtype=ttnn.uint16, layout=ttnn.TILE_LAYOUT,
+                                  device=device, memory_config=idx_mem, tile=idx_tile,
+                                  mesh_mapper=ttnn.ReplicateTensorToMesh(device))
+            e_idxs.append(ei)
+
+        _sparse_buffers[buf_key] = {
+            "idx_t": idx_t, "wb_gate": wb_gate, "wb_down": wb_down,
+            "e_idxs": e_idxs, "cg": cg, "idx_mem": idx_mem,
+        }
+        logger.info(f"Sparse expert buffers allocated (key={buf_key})")
+
+    bufs = _sparse_buffers[buf_key]
+
+    # Convert dispatch output to host for tiny-tile conversion
     x_rm = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
     token_outputs = []
 
     for t in range(total_tokens):
-        # Extract token: [1, 1, 1, hidden]
+        # Extract + convert token to HEIGHT_SHARDED tiny tile (via host)
         tok = ttnn.slice(x_rm, [0, 0, t, 0], [1, 1, t + 1, hidden_size])
-        # Convert token to HOST, then upload as HEIGHT_SHARDED with tiny tile
-        dev_tensors = ttnn.get_device_tensors(tok)
-        tok_host = ttnn.to_torch(dev_tensors[0])  # [1, 1, 1, hidden] from device 0
+        tok_devs = ttnn.get_device_tensors(tok)
+        tok_host = ttnn.to_torch(tok_devs[0])  # [1, 1, 1, hidden]
         ttnn.deallocate(tok)
-        tok_rep_host = tok_host.repeat(1, 1, num_cores, 1)  # [1, 1, num_cores, hidden]
+        tok_rep = tok_host.repeat(1, 1, num_cores, 1).bfloat16()
+
         in0_spec = ttnn.ShardSpec(cg, [1, hidden_size], ttnn.ShardOrientation.ROW_MAJOR)
         in0_mem = ttnn.MemoryConfig(ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, in0_spec)
-        tok_hs = ttnn.from_torch(
-            tok_rep_host.bfloat16(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-            device=device, memory_config=in0_mem, tile=in0_tile,
-            mesh_mapper=ttnn.ReplicateTensorToMesh(device),
-        )
+        tok_hs = ttnn.from_torch(tok_rep, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                                  device=device, memory_config=in0_mem, tile=in0_tile,
+                                  mesh_mapper=ttnn.ReplicateTensorToMesh(device))
 
-        # Gate output
+        # Gate (SiLU fused) + Up (mul fused) in 2 kernel calls
         gate_out_w = per_core_N_gate * selected_experts_k
         gate_out_spec = ttnn.ShardSpec(cg, [1, gate_out_w], ttnn.ShardOrientation.ROW_MAJOR)
         gate_out_mem = ttnn.MemoryConfig(ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.L1, gate_out_spec)
-        gate_n_total = N_gate * selected_experts_k
-        gate_out = ttnn.from_torch(torch.zeros(1, 1, 1, gate_n_total).bfloat16(), dtype=ttnn.bfloat16,
-                                    layout=ttnn.TILE_LAYOUT, device=device, memory_config=gate_out_mem, tile=out_tile,
-                                    mesh_mapper=ttnn.ReplicateTensorToMesh(device))
+        gate_n = N_gate * selected_experts_k
+        gate_out = ttnn.from_torch(torch.zeros(1, 1, 1, gate_n).bfloat16(), dtype=ttnn.bfloat16,
+                                    layout=ttnn.TILE_LAYOUT, device=device, memory_config=gate_out_mem,
+                                    tile=out_tile, mesh_mapper=ttnn.ReplicateTensorToMesh(device))
 
         gate_out = DRAMStreamingExpertsMatmul.op(
             input_a=tok_hs, input_b=gate_expert_tensors[0], output_tensor=gate_out,
             fp32_dest_acc_en=False, math_fidelity=ttnn.MathFidelity.LoFi,
-            fused_activation="silu", index_tensor=idx_t,
+            fused_activation="silu", index_tensor=bufs["idx_t"],
             selected_experts_k=selected_experts_k, subblock_k=sk_gate,
-            working_buf_tensor=wb_gate,
+            working_buf_tensor=bufs["wb_gate"],
         )
 
         # Up + mul with gate
-        mm_out = ttnn.from_torch(torch.zeros(1, 1, 1, gate_n_total).bfloat16(), dtype=ttnn.bfloat16,
-                                  layout=ttnn.TILE_LAYOUT, device=device, memory_config=gate_out_mem, tile=out_tile,
-                                  mesh_mapper=ttnn.ReplicateTensorToMesh(device))
-        activated = ttnn.from_torch(torch.zeros(1, 1, 1, gate_n_total).bfloat16(), dtype=ttnn.bfloat16,
-                                     layout=ttnn.TILE_LAYOUT, device=device, memory_config=gate_out_mem, tile=out_tile,
-                                     mesh_mapper=ttnn.ReplicateTensorToMesh(device))
+        mm_out = ttnn.from_torch(torch.zeros(1, 1, 1, gate_n).bfloat16(), dtype=ttnn.bfloat16,
+                                  layout=ttnn.TILE_LAYOUT, device=device, memory_config=gate_out_mem,
+                                  tile=out_tile, mesh_mapper=ttnn.ReplicateTensorToMesh(device))
+        activated = ttnn.from_torch(torch.zeros(1, 1, 1, gate_n).bfloat16(), dtype=ttnn.bfloat16,
+                                     layout=ttnn.TILE_LAYOUT, device=device, memory_config=gate_out_mem,
+                                     tile=out_tile, mesh_mapper=ttnn.ReplicateTensorToMesh(device))
 
         activated = DRAMStreamingExpertsMatmul.op(
             input_a=tok_hs, input_b=up_expert_tensors[0], output_tensor=activated,
             fp32_dest_acc_en=False, math_fidelity=ttnn.MathFidelity.LoFi,
-            index_tensor=idx_t, selected_experts_k=selected_experts_k,
+            index_tensor=bufs["idx_t"], selected_experts_k=selected_experts_k,
             subblock_k=sk_gate, mul_tensor=gate_out, mm_out_tensor=mm_out,
-            working_buf_tensor=wb_gate,
+            working_buf_tensor=bufs["wb_gate"],
         )
         ttnn.deallocate(gate_out)
         ttnn.deallocate(mm_out)
         ttnn.deallocate(tok_hs)
 
-        # Down proj per expert
+        # Down proj: per-expert (different activations)
         act_i = ttnn.to_memory_config(activated, ttnn.L1_MEMORY_CONFIG)
         ttnn.deallocate(activated)
         act_i = ttnn.reshape(act_i, [selected_experts_k, 1, 1, intermediate_size])
@@ -202,35 +220,26 @@ def sparse_expert_forward(
             e_act_devs = ttnn.get_device_tensors(e_act)
             e_act_host = ttnn.to_torch(e_act_devs[0])
             ttnn.deallocate(e_act)
-            e_act_rep_host = e_act_host.repeat(1, 1, num_cores, 1)
-            in0_down_spec = ttnn.ShardSpec(cg, [1, intermediate_size], ttnn.ShardOrientation.ROW_MAJOR)
-            in0_down_mem = ttnn.MemoryConfig(ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, in0_down_spec)
-            e_act_hs = ttnn.from_torch(
-                e_act_rep_host.bfloat16(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-                device=device, memory_config=in0_down_mem, tile=in0_tile,
-                mesh_mapper=ttnn.ReplicateTensorToMesh(device),
-            )
-
-            e_idx_data = torch.zeros(num_cores, 16, dtype=torch.int32)
-            e_idx_data[:, 0] = e
-            e_idx = ttnn.from_torch(e_idx_data.to(torch.uint16), dtype=ttnn.uint16, layout=ttnn.TILE_LAYOUT,
-                                     device=device, memory_config=idx_mem, tile=idx_tile,
-                                     mesh_mapper=ttnn.ReplicateTensorToMesh(device))
+            e_act_rep = e_act_host.repeat(1, 1, num_cores, 1).bfloat16()
+            in0_d_spec = ttnn.ShardSpec(cg, [1, intermediate_size], ttnn.ShardOrientation.ROW_MAJOR)
+            in0_d_mem = ttnn.MemoryConfig(ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, in0_d_spec)
+            e_act_hs = ttnn.from_torch(e_act_rep, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                                        device=device, memory_config=in0_d_mem, tile=in0_tile,
+                                        mesh_mapper=ttnn.ReplicateTensorToMesh(device))
 
             d_out_spec = ttnn.ShardSpec(cg, [1, per_core_N_down], ttnn.ShardOrientation.ROW_MAJOR)
             d_out_mem = ttnn.MemoryConfig(ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.L1, d_out_spec)
             d_out = ttnn.from_torch(torch.zeros(1, 1, 1, N_down).bfloat16(), dtype=ttnn.bfloat16,
-                                     layout=ttnn.TILE_LAYOUT, device=device, memory_config=d_out_mem, tile=out_tile,
-                                     mesh_mapper=ttnn.ReplicateTensorToMesh(device))
+                                     layout=ttnn.TILE_LAYOUT, device=device, memory_config=d_out_mem,
+                                     tile=out_tile, mesh_mapper=ttnn.ReplicateTensorToMesh(device))
 
             d_out = DRAMStreamingExpertsMatmul.op(
                 input_a=e_act_hs, input_b=down_expert_tensors[0], output_tensor=d_out,
                 fp32_dest_acc_en=False, math_fidelity=ttnn.MathFidelity.HiFi2,
-                index_tensor=e_idx, selected_experts_k=1, subblock_k=sk_down,
-                working_buf_tensor=wb_down,
+                index_tensor=bufs["e_idxs"][e], selected_experts_k=1, subblock_k=sk_down,
+                working_buf_tensor=bufs["wb_down"],
             )
             ttnn.deallocate(e_act_hs)
-            ttnn.deallocate(e_idx)
             d_out_i = ttnn.to_memory_config(d_out, ttnn.L1_MEMORY_CONFIG)
             ttnn.deallocate(d_out)
             down_outputs.append(d_out_i)
@@ -255,16 +264,13 @@ def sparse_expert_forward(
         token_outputs.append(tok_out)
 
     ttnn.deallocate(x_rm)
-    ttnn.deallocate(idx_t)
-    ttnn.deallocate(wb_gate)
-    ttnn.deallocate(wb_down)
 
     if len(token_outputs) == 1:
         result = token_outputs[0]
     else:
         result = ttnn.concat(token_outputs, dim=2)
-        for t in token_outputs:
-            ttnn.deallocate(t)
+        for t_o in token_outputs:
+            ttnn.deallocate(t_o)
 
     result = ttnn.permute(result, (1, 0, 2, 3))
     return result
