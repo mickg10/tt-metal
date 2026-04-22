@@ -2629,12 +2629,13 @@ class DeepseekGenerator(WarmupForwardMixin):
                 and self._mtp_predict_trace_output is not None
             )
 
-            # Update hidden states: use device-to-device copy if possible (faster)
-            if is_device_tensor:
+            # Update hidden states
+            if is_device_tensor and hidden_states is self._mtp_predict_trace_hidden:
+                pass  # Shared buffer — decode trace already wrote hidden states here
+            elif is_device_tensor:
                 try:
                     ttnn.copy(hidden_states, self._mtp_predict_trace_hidden)
                 except Exception:
-                    # Fallback to host round-trip if shapes/layouts don't match
                     hidden_host = self._hidden_tt_to_host_for_mtp(hidden_states)
                     hidden_host = self._normalize_hidden_host_for_mtp(hidden_host)
                     host_hidden = self._tt_from_hidden_states_step(hidden_host, device=None)
@@ -2947,23 +2948,58 @@ class DeepseekGenerator(WarmupForwardMixin):
                 ),
             ).squeeze(0).squeeze(0)
 
-            # Skip MTP predict trace capture — D2D copy corrupts hidden states, eager predict works
-            if False and self._trace_hidden_output is not None and self._mtp_predict_trace_id is None:
+            # Capture MTP predict trace using decode trace's hidden output buffer DIRECTLY
+            # The predict trace reads from the SAME buffer the decode trace writes hidden states to
+            if self._trace_hidden_output is not None and self._mtp_predict_trace_id is None:
                 try:
                     main_out = logits.argmax(dim=-1).to(torch.int32) if logits.dim() >= 2 else tokens_1d
-                    # Convert hidden to host for trace buffer allocation
-                    hidden_host = self._hidden_tt_to_host_for_mtp(self._trace_hidden_output)
                     mtp_pt = self._get_mtp_page_table()
-                    self._capture_mtp_predict_trace(
-                        hidden_states=hidden_host,
+
+                    # Override: set the predict trace hidden buffer to decode trace's output
+                    # This way, the predict trace reads hidden states directly from decode output
+                    self._mtp_predict_trace_hidden = self._trace_hidden_output
+
+                    # Allocate other predict trace buffers (tokens, positions, rot_idxs)
+                    self._mtp_predict_trace_tokens = self._tt_from_tokens_step(main_out)
+                    self._mtp_predict_trace_positions = ttnn.from_torch(
+                        (positions_1d + 1).to(torch.int32),
+                        device=self.mesh_device,
+                        mesh_mapper=ttnn.ShardTensorToMesh(self.mesh_device, dim=0),
+                        dtype=ttnn.int32,
+                    )
+                    self._mtp_predict_trace_rot_idxs = self.rope_setup.get_rot_idxs(positions_1d + 1)
+                    self._mtp_predict_trace_page_table = mtp_pt
+
+                    # Warmup compile run (no trace)
+                    logger.info("Running MTP predict warmup (compile, no trace)...")
+                    _ = self._mtp_predict_logits(
+                        hidden_states=self._trace_hidden_output,
                         tokens_step=main_out,
                         positions=positions_1d + 1,
                         page_table=mtp_pt,
-                        compile_run=True,
+                        use_trace=False,
                     )
-                    logger.info("MTP predict trace captured for vLLM path")
+                    ttnn.synchronize_device(self.mesh_device)
+
+                    # Capture MTP predict trace
+                    self.ccl.reset_sem_counters()
+                    logger.info("Capturing MTP predict trace (shared hidden buffer)...")
+                    trace_id = ttnn.begin_trace_capture(self.mesh_device, cq_id=0)
+                    rope_tensors = self.rope_setup.get_rot_mats_from_rot_idxs(self._mtp_predict_trace_rot_idxs)
+                    self._mtp_predict_trace_output = RowBatchedModel.forward_mtp_decode(
+                        hidden_states=self._mtp_predict_trace_hidden,  # = self._trace_hidden_output
+                        token_ids=self._mtp_predict_trace_tokens,
+                        position_idxs=self._mtp_predict_trace_positions,
+                        cfg=self.model_run_config_decode,
+                        rope_tensors=rope_tensors,
+                        page_table=self._mtp_predict_trace_page_table,
+                    )
+                    ttnn.end_trace_capture(self.mesh_device, trace_id, cq_id=0)
+                    self._mtp_predict_trace_id = trace_id
+                    logger.info("MTP predict trace captured (shared hidden buffer with decode trace)")
                 except Exception as e:
                     logger.warning(f"Failed to capture MTP predict trace: {e}")
+                    import traceback; traceback.print_exc()
                     self._mtp_predict_trace_id = None
         else:
             # Replay standard decode trace
@@ -3008,9 +3044,8 @@ class DeepseekGenerator(WarmupForwardMixin):
                 # First, sample the main output token (greedy argmax)
                 main_output_tokens = logits.argmax(dim=-1).to(torch.int32) if logits.dim() >= 2 else tokens_1d
                 mtp_page_table = self._get_mtp_page_table()
-                # Traced predict gives 0% acceptance (D2D copy corrupts hidden states)
-                # Use eager predict which gives 50% acceptance
-                use_traced_predict = False
+                # Use traced predict with shared hidden buffer (no copy needed)
+                use_traced_predict = self._mtp_predict_trace_id is not None
                 draft_logits = self._mtp_predict_logits(
                     hidden_states=self._trace_hidden_output,  # ttnn tensor from trace
                     tokens_step=main_output_tokens,
