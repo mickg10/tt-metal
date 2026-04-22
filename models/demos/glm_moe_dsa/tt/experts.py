@@ -250,6 +250,47 @@ class Experts(AbstractModule):
             except Exception as exc:
                 logger.warning(f"DEBUG experts {name}: failed to extract stats: {exc}")
 
+        # SPARSE EXPERT: use pre-sliced per-expert weight tensors
+        sparse_expert_hack = os.getenv("GLM5_SPARSE_EXPERT_HACK") == "1"
+        if sparse_expert_hack:
+            # Pre-slice weights on FIRST call (cached in cfg for subsequent calls)
+            if "per_expert_w1" not in cfg:
+                logger.info("Pre-slicing expert weights (one-time cost)...")
+                w1_w = cfg["w1_experts"].input_tensor_b
+                w3_w = cfg["w3_experts"].input_tensor_b
+                w2_w = cfg["w2_experts"].input_tensor_b
+                num_e = cfg["num_experts_per_device"]
+                cfg["per_expert_w1"] = [ttnn.slice(w1_w, [0, e, 0, 0], [1, e+1, w1_w.shape[2], w1_w.shape[3]]) for e in range(num_e)]
+                cfg["per_expert_w3"] = [ttnn.slice(w3_w, [0, e, 0, 0], [1, e+1, w3_w.shape[2], w3_w.shape[3]]) for e in range(num_e)]
+                cfg["per_expert_w2"] = [ttnn.slice(w2_w, [0, e, 0, 0], [1, e+1, w2_w.shape[2], w2_w.shape[3]]) for e in range(num_e)]
+                logger.info(f"Pre-sliced {num_e} experts for w1, w3, w2")
+        per_expert_w1 = cfg.get("per_expert_w1")
+        per_expert_w3 = cfg.get("per_expert_w3")
+        per_expert_w2 = cfg.get("per_expert_w2")
+        if sparse_expert_hack and per_expert_w1 is not None:
+            # x is [1, 8, T, K] — slice input to expert 0 only
+            x_1 = ttnn.slice(x, [0, 0, 0, 0], [1, 1, x.shape[2], x.shape[3]])
+            # Use pre-sliced expert 0 weights (no DRAM copy!)
+            w1_out = ttnn.linear(x_1, input_tensor_b=per_expert_w1[0],
+                                  memory_config=cfg["w1_experts"].memory_config,
+                                  compute_kernel_config=cfg["w1_experts"].compute_kernel_config)
+            w3_out = ttnn.linear(x_1, input_tensor_b=per_expert_w3[0],
+                                  memory_config=cfg["w3_experts"].memory_config,
+                                  compute_kernel_config=cfg["w3_experts"].compute_kernel_config)
+            ttnn.deallocate(x_1)
+            activated = ttnn.mul(w1_out, w3_out, **cfg["mul_experts"])
+            ttnn.deallocate(w1_out)
+            ttnn.deallocate(w3_out)
+            output = ttnn.linear(activated, input_tensor_b=per_expert_w2[0],
+                                  memory_config=cfg["w2_experts"].memory_config,
+                                  compute_kernel_config=cfg["w2_experts"].compute_kernel_config)
+            ttnn.deallocate(activated)
+            # Repeat output to match expected [1, 8, T, hidden]
+            output = ttnn.repeat(output, ttnn.Shape((1, cfg["num_experts_per_device"], 1, 1)))
+            output = ttnn.permute(output, (1, 0, 2, 3))
+            output = ttnn.reshape(output, shape=(1, cfg["num_experts_per_device"], num_tokens, hidden_size))
+            return output
+
         # Gate and up projections
         w1_out = ttnn.linear(x, **cfg["w1_experts"])
         w3_out = ttnn.linear(x, **cfg["w3_experts"])
