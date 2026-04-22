@@ -141,12 +141,18 @@ def sparse_expert_forward(
     for t in range(total_tokens):
         # Extract token: [1, 1, 1, hidden]
         tok = ttnn.slice(x_rm, [0, 0, t, 0], [1, 1, t + 1, hidden_size])
-        tok_rep = ttnn.repeat(tok, ttnn.Shape((1, 1, num_cores, 1)))
+        # Convert token to HOST, then upload as HEIGHT_SHARDED with tiny tile
+        dev_tensors = ttnn.get_device_tensors(tok)
+        tok_host = ttnn.to_torch(dev_tensors[0])  # [1, 1, 1, hidden] from device 0
         ttnn.deallocate(tok)
+        tok_rep_host = tok_host.repeat(1, 1, num_cores, 1)  # [1, 1, num_cores, hidden]
         in0_spec = ttnn.ShardSpec(cg, [1, hidden_size], ttnn.ShardOrientation.ROW_MAJOR)
         in0_mem = ttnn.MemoryConfig(ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, in0_spec)
-        tok_hs = ttnn.to_memory_config(ttnn.to_layout(tok_rep, ttnn.TILE_LAYOUT, tile=in0_tile), in0_mem)
-        ttnn.deallocate(tok_rep)
+        tok_hs = ttnn.from_torch(
+            tok_rep_host.bfloat16(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            device=device, memory_config=in0_mem, tile=in0_tile,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(device),
+        )
 
         # Gate output
         gate_out_w = per_core_N_gate * selected_experts_k
@@ -193,12 +199,17 @@ def sparse_expert_forward(
         for e in range(selected_experts_k):
             e_act = ttnn.slice(act_i, [e, 0, 0, 0], [e + 1, 1, 1, intermediate_size])
             e_act = ttnn.reshape(e_act, [1, 1, 1, intermediate_size])
-            e_act_rep = ttnn.repeat(e_act, ttnn.Shape((1, 1, num_cores, 1)))
+            e_act_devs = ttnn.get_device_tensors(e_act)
+            e_act_host = ttnn.to_torch(e_act_devs[0])
             ttnn.deallocate(e_act)
+            e_act_rep_host = e_act_host.repeat(1, 1, num_cores, 1)
             in0_down_spec = ttnn.ShardSpec(cg, [1, intermediate_size], ttnn.ShardOrientation.ROW_MAJOR)
             in0_down_mem = ttnn.MemoryConfig(ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, in0_down_spec)
-            e_act_hs = ttnn.to_memory_config(ttnn.to_layout(e_act_rep, ttnn.TILE_LAYOUT, tile=in0_tile), in0_down_mem)
-            ttnn.deallocate(e_act_rep)
+            e_act_hs = ttnn.from_torch(
+                e_act_rep_host.bfloat16(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                device=device, memory_config=in0_down_mem, tile=in0_tile,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(device),
+            )
 
             e_idx_data = torch.zeros(num_cores, 16, dtype=torch.int32)
             e_idx_data[:, 0] = e
