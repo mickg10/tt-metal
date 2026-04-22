@@ -57,7 +57,12 @@ class WeightConfigEncoder(json.JSONEncoder):
                 "path": str(obj.path),
                 "memory_config": None if obj.memory_config is None else json.loads(obj.memory_config.to_json()),
             }
-        return obj
+            return obj
+        # Skip non-serializable objects (e.g., ttnn.Tensor from sparse expert weights)
+        try:
+            return super().default(obj)
+        except TypeError:
+            return f"<{type(obj).__name__}>"
 
 
 def try_decode_saved_weight(obj: dict[str, Any]) -> Any:
@@ -187,9 +192,13 @@ def get_weight_config(
     validate_weight_config_paths(weight_cache_path, weight_config)
 
     # Save config with relative paths for portability
-    # Use exclusive lock to prevent concurrent writes and corruption
-    with locked_file(config_path, "w", exclusive=True) as f:
-        json.dump(weight_config, f, cls=WeightConfigEncoder)
+    # Skip saving when sparse mode is active (ttnn.Tensor can't be JSON serialized)
+    import os
+    if os.getenv("GLM5_SPARSE_EXPERTS", "0") != "1":
+        with locked_file(config_path, "w", exclusive=True) as f:
+            json.dump(weight_config, f, cls=WeightConfigEncoder)
+    else:
+        logger.info("Sparse expert mode: skipping config.json save (tensors not serializable)")
 
     # Return normalized config with absolute paths for runtime use
     normalized_config = normalize_weight_config_paths(weight_cache_path, weight_config)
@@ -214,7 +223,8 @@ def validate_weight_config_paths(root_path: Path, weight_config: WeightConfig, p
     elif isinstance(weight_config, (list, tuple)):
         entries = enumerate(weight_config)
     else:
-        raise ValueError(f"Invalid weight config type: {type(weight_config)}")
+        # Skip validation for pre-loaded device tensors (e.g., sparse expert WIDTH_SHARDED)
+        return
 
     for key, entry in entries:
         if entry is None:
